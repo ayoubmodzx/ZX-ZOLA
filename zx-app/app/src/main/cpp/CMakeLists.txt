@@ -12,13 +12,14 @@ set(CMAKE_EXE_LINKER_FLAGS    "-pie -Wl,--gc-sections -Wl,--strip-all")
 add_library(zx_payload SHARED
     payload.cpp
     features.cpp
+    esp_renderer.cpp
     anosdk_bypass.cpp
     anti_detect.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
 )
 target_include_directories(zx_payload PRIVATE .)
-target_link_libraries(zx_payload log dl)
+target_link_libraries(zx_payload log dl GLESv3 EGL)
 
 # ── Standalone root injector binary ──────────────────────────────────────────
 add_executable(zx_injector

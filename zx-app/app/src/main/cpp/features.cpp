@@ -16,6 +16,7 @@
  */
 
 #include "features.hpp"
+#include "esp_renderer.hpp"
 #include "il2cpp_scanner.hpp"
 #include "dobby_stub.hpp"
 #include <android/log.h>
@@ -39,7 +40,6 @@ struct GameClasses {
     // Runtime-discovered via field pattern matching
     Il2CppClass *weaponFire   = nullptr;    // class with fireRate + recoil floats
     Il2CppClass *playerMove   = nullptr;    // class with moveSpeed + jumpForce floats
-    Il2CppClass *vehicleCtrl  = nullptr;    // class with maxSpeed float
     Il2CppClass *healthComp   = nullptr;    // class with maxHP + curHP floats
 
     // Field offsets cached after discovery
@@ -49,7 +49,6 @@ struct GameClasses {
     int32_t offSpread      = -1;
     int32_t offMoveSpeed   = -1;
     int32_t offJumpForce   = -1;
-    int32_t offVehicleSpeed= -1;
     int32_t offCurHP       = -1;
     int32_t offMaxHP       = -1;
 
@@ -63,25 +62,6 @@ static GameClasses g_cls;
 
 // Vec3 helper
 struct Vec3 { float x, y, z; };
-
-// CharacterController::Move_Injected(Vector3& motion, CollisionFlags& result)
-using FnCCMove = void(*)(void*, Vec3*, int*);
-static FnCCMove  g_origCCMove = nullptr;
-static std::atomic<float> g_speedMult{1.0f};
-static void hookCCMove(void *self, Vec3 *motion, int *result) {
-    float m = g_speedMult.load(std::memory_order_relaxed);
-    if (m != 1.0f && motion) { motion->x *= m; motion->z *= m; }
-    g_origCCMove(self, motion, result);
-}
-
-// CharacterController::SimpleMove_Injected(Vector3&)
-using FnCCSimple = bool(*)(void*, Vec3*);
-static FnCCSimple g_origCCSimple = nullptr;
-static bool hookCCSimple(void *self, Vec3 *v) {
-    float m = g_speedMult.load(std::memory_order_relaxed);
-    if (m != 1.0f && v) { v->x *= m; v->z *= m; }
-    return g_origCCSimple(self, v);
-}
 
 // Camera.fieldOfView set_fieldOfView: Camera::set_fieldOfView(float)
 using FnSetFOV = void(*)(void*, float);
@@ -265,18 +245,9 @@ static void discoverClasses() {
         g_cls.playerMove = findClassByFloatFields(pat, 2, "playerMove");
     }
 
-    // 5. Vehicle speed
-    static const char *kVehNames[][1] = {
-        {"maxSpeed"}, {"MaxSpeed"}, {"m_maxSpeed"}, {"topSpeed"}, {nullptr}
-    };
-    for (int i = 0; kVehNames[i][0] && !g_cls.vehicleCtrl; i++) {
-        FieldPattern pat[] = {{kVehNames[i][0], 10.f, 500.f, &g_cls.offVehicleSpeed}};
-        g_cls.vehicleCtrl = findClassByFloatFields(pat, 1, "vehicleCtrl");
-    }
-
     g_cls.ready = true;
-    LOG("Discovery done. playerState=%p healthComp=%p weaponFire=%p playerMove=%p veh=%p",
-        g_cls.playerState, g_cls.healthComp, g_cls.weaponFire, g_cls.playerMove, g_cls.vehicleCtrl);
+    LOG("Discovery done. playerState=%p healthComp=%p weaponFire=%p playerMove=%p",
+        g_cls.playerState, g_cls.healthComp, g_cls.weaponFire, g_cls.playerMove);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -291,24 +262,6 @@ static void hookUnityIcalls() {
     using FnResolveIcall = void*(*)(const char*);
     auto resolveIcall = (FnResolveIcall)dlsym(lib, "il2cpp_resolve_icall");
     if (!resolveIcall) { ERR("il2cpp_resolve_icall missing"); return; }
-
-    // CharacterController::Move
-    void *ccMove = resolveIcall(
-        "UnityEngine.CharacterController::Move_Injected(UnityEngine.Vector3&,UnityEngine.CollisionFlags&)");
-    if (!ccMove) ccMove = resolveIcall(
-        "UnityEngine.CharacterController::Move_Injected(UnityEngine.Vector3&)");
-    if (ccMove) {
-        DobbyHook(ccMove, (void*)hookCCMove, (void**)&g_origCCMove);
-        LOG("Hooked CharacterController::Move_Injected");
-    }
-
-    // CharacterController::SimpleMove
-    void *ccSimple = resolveIcall(
-        "UnityEngine.CharacterController::SimpleMove_Injected(UnityEngine.Vector3&)");
-    if (ccSimple) {
-        DobbyHook(ccSimple, (void*)hookCCSimple, (void**)&g_origCCSimple);
-        LOG("Hooked CharacterController::SimpleMove_Injected");
-    }
 
     // Camera.fieldOfView setter
     void *setFOV = resolveIcall("UnityEngine.Camera::set_fieldOfView(System.Single)");
@@ -468,26 +421,6 @@ static void aimAssist(bool on) {
     LOG("AimAssist %s (static field approach)", on?"ON":"OFF");
 }
 
-static void speedHack(bool on) {
-    // Primary: CharacterController hook scales velocity in-flight
-    g_speedMult.store(on ? 1.7f : 1.0f, std::memory_order_relaxed);
-
-    // Secondary: write to playerMove class fields if found
-    if (g_cls.playerMove) {
-        if (g_cls.offMoveSpeed > 0) {
-            Il2CppObject *player = getLocalPlayer();
-            if (player) Il2Cpp::writeField<float>(player, g_cls.offMoveSpeed, on ? 10.5f : 6.3f);
-        }
-        static const char *kS[] = {
-            "moveSpeed","MoveSpeed","runSpeed","m_moveSpeed","sprintSpeed",nullptr};
-        for (const char **n = kS; *n; n++) {
-            FieldInfo *f = Il2Cpp::getField(g_cls.playerMove, *n);
-            if (f) { Il2Cpp::setStaticFloat(f, on ? 10.5f : 6.3f); break; }
-        }
-    }
-    LOG("SpeedHack %s (mult=%.1f)", on?"ON":"OFF", on?1.7f:1.0f);
-}
-
 static void highJump(bool on) {
     if (g_cls.playerMove) {
         static const char *kJ[] = {
@@ -506,25 +439,6 @@ static void highJump(bool on) {
         }
     }
     LOG("HighJump %s", on?"ON":"OFF");
-}
-
-static void vehicleSpeed(bool on) {
-    if (g_cls.vehicleCtrl) {
-        if (g_cls.offVehicleSpeed > 0) {
-            // Find all vehicle instances and write directly
-            Il2Cpp::enumClasses([&](Il2CppClass *c) -> bool {
-                // We already found the class; skip searching
-                (void)c; return false;
-            });
-        }
-        static const char *kV[] = {
-            "maxSpeed","MaxSpeed","topSpeed","m_maxSpeed","engineForce",nullptr};
-        for (const char **n = kV; *n; n++) {
-            FieldInfo *f = Il2Cpp::getField(g_cls.vehicleCtrl, *n);
-            if (f) { Il2Cpp::setStaticFloat(f, on ? 220.f : 110.f); break; }
-        }
-    }
-    LOG("VehicleSpeed %s", on?"ON":"OFF");
 }
 
 static void widePov(bool on) {
@@ -611,17 +525,17 @@ void Features::apply(int cmd, bool enable) {
     if (!g_cls.ready) Features::init();  // lazy init guard
 
     switch (cmd) {
-        case CMD_ANTI_RECOIL:   antiRecoil(enable);    break;
-        case CMD_NO_SPREAD:     noSpread(enable);      break;
-        case CMD_RAPID_FIRE:    rapidFire(enable);     break;
-        case CMD_AIM_ASSIST:    aimAssist(enable);     break;
-        case CMD_SPEED_HACK:    speedHack(enable);     break;
-        case CMD_HIGH_JUMP:     highJump(enable);      break;
-        case CMD_VEHICLE_SPEED: vehicleSpeed(enable);  break;
-        case CMD_WIDE_POV:      widePov(enable);       break;
-        case CMD_NO_GRASS:      noGrass(enable);       break;
-        case CMD_MAX_HEALTH:    maxHealth(enable);     break;
-        case CMD_ANTI_DAMAGE:   antiDamage(enable);    break;
+        case CMD_ANTI_RECOIL:      antiRecoil(enable);             break;
+        case CMD_NO_SPREAD:        noSpread(enable);               break;
+        case CMD_RAPID_FIRE:       rapidFire(enable);              break;
+        case CMD_AIM_ASSIST:       aimAssist(enable);              break;
+        case CMD_HIGH_JUMP:        highJump(enable);               break;
+        case CMD_WIDE_POV:         widePov(enable);                break;
+        case CMD_NO_GRASS:         noGrass(enable);                break;
+        case CMD_MAX_HEALTH:       maxHealth(enable);              break;
+        case CMD_ANTI_DAMAGE:      antiDamage(enable);             break;
+        case CMD_ESP:              ESP::setEnabled(enable);        break;
+        case CMD_HEADSHOT_ASSIST:  ESP::setHeadshotAssist(enable); break;
         default: LOG("Unknown cmd: %d", cmd);
     }
 }

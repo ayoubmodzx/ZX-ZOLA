@@ -3,6 +3,7 @@
 #include "anti_detect.hpp"
 #include "il2cpp_scanner.hpp"
 #include "features.hpp"
+#include "esp_renderer.hpp"
 #include <android/log.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -27,6 +28,7 @@ static void *ctrl_loop(void *) {
     }
     LOG("Il2Cpp ready — starting class discovery + engine hooks");
     Features::init();
+    ESP::init();
     LOG("Payload ready");
 
     int last_cmd = 0;
