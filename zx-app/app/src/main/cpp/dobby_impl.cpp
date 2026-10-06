@@ -1,0 +1,181 @@
+// dobby_impl.cpp — Minimal ARM64 inline hook, DobbyHook API compatible
+// No external Dobby dependency needed — implements the subset used by ZX-ZOLA.
+
+#include "dobby_stub.hpp"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdint>
+#include <cerrno>
+#include <android/log.h>
+#include <vector>
+#include <mutex>
+
+#define DTAG "ZX-HOOK"
+#define DI(...) __android_log_print(ANDROID_LOG_INFO,  DTAG, __VA_ARGS__)
+#define DE(...) __android_log_print(ANDROID_LOG_ERROR, DTAG, __VA_ARGS__)
+
+// ── ARM64 16-byte absolute trampoline ─────────────────────────────────────────
+// Layout (16 bytes total):
+//   [0x00] 0x58000051  LDR X17, #8   — load 64-bit addr from PC+8
+//   [0x04] 0xD61F0220  BR  X17       — branch to loaded address
+//   [0x08] <8 bytes>   .quad target  — absolute 64-bit target address
+
+static constexpr size_t TRAMP = 16;
+
+static void write_jump(void *dst, const void *target) {
+    uint32_t t[4];
+    t[0] = 0x58000051u;
+    t[1] = 0xD61F0220u;
+    memcpy(&t[2], &target, 8);
+    memcpy(dst, t, TRAMP);
+    __builtin___clear_cache(dst, (char*)dst + TRAMP);
+}
+
+static bool set_rwx(void *p, size_t n) {
+    const size_t ps = (size_t)getpagesize();
+    uintptr_t base = (uintptr_t)p & ~(ps - 1);
+    size_t    sz   = (((uintptr_t)p + n + ps - 1) & ~(ps - 1)) - base;
+    return mprotect((void*)base, sz, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+}
+
+// ── Hook table ────────────────────────────────────────────────────────────────
+
+struct Slot { void *target; uint8_t saved[TRAMP]; void *page; };
+static std::vector<Slot> g_slots;
+static std::mutex        g_mu;
+
+int DobbyHook(void *addr, void *replace, void **origin) {
+    if (!addr || !replace) return -1;
+    std::lock_guard<std::mutex> lk(g_mu);
+
+    if (!set_rwx(addr, TRAMP)) {
+        DE("mprotect RWX failed @ %p: %s", addr, strerror(errno));
+        return -1;
+    }
+
+    Slot s{};
+    s.target = addr;
+    s.page   = nullptr;
+    memcpy(s.saved, addr, TRAMP);
+
+    if (origin) {
+        *origin = nullptr;
+        void *pg = mmap(nullptr, (size_t)getpagesize(),
+                        PROT_READ | PROT_WRITE | PROT_EXEC,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (pg != MAP_FAILED) {
+            memcpy(pg, s.saved, TRAMP);
+            write_jump((char*)pg + TRAMP, (char*)addr + TRAMP);
+            __builtin___clear_cache(pg, (char*)pg + TRAMP * 2);
+            s.page  = pg;
+            *origin = pg;
+        }
+    }
+
+    write_jump(addr, replace);
+    g_slots.push_back(s);
+    DI("hook %p -> %p (tramp=%p)", addr, replace, s.page);
+    return 0;
+}
+
+int DobbyDestroy(void *addr) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    for (auto it = g_slots.begin(); it != g_slots.end(); ++it) {
+        if (it->target != addr) continue;
+        set_rwx(addr, TRAMP);
+        memcpy(addr, it->saved, TRAMP);
+        __builtin___clear_cache(addr, (char*)addr + TRAMP);
+        if (it->page) munmap(it->page, (size_t)getpagesize());
+        g_slots.erase(it);
+        return 0;
+    }
+    return -1;
+}
+
+// ── DobbySymbolResolver — ELF .symtab scan ────────────────────────────────────
+
+struct PhdrQ { const char *name; uintptr_t base; const char *path; };
+
+static int phdr_cb(dl_phdr_info *i, size_t, void *d) {
+    auto *q = (PhdrQ*)d;
+    if (!i->dlpi_name || !strstr(i->dlpi_name, q->name)) return 0;
+    q->base = (uintptr_t)i->dlpi_addr;
+    q->path = i->dlpi_name;
+    return 1;
+}
+
+static void *elf_scan(const char *path, const char *sym, uintptr_t base) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return nullptr;
+
+    struct stat st; fstat(fd, &st);
+    const size_t fsz = (size_t)st.st_size;
+    void *m = mmap(nullptr, fsz, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return nullptr;
+
+    void *result = nullptr;
+    auto *eh = (Elf64_Ehdr*)m;
+    if (fsz < sizeof(Elf64_Ehdr) || memcmp(eh->e_ident, ELFMAG, 4) != 0) goto done;
+    if (eh->e_shoff == 0 || eh->e_shnum == 0) goto done;
+
+    {
+        auto *sh  = (Elf64_Shdr*)((uint8_t*)m + eh->e_shoff);
+        if ((uintptr_t)(sh + eh->e_shnum) > (uintptr_t)m + fsz) goto done;
+        if (eh->e_shstrndx >= eh->e_shnum) goto done;
+
+        for (uint16_t i = 0; i < eh->e_shnum && !result; i++) {
+            if (sh[i].sh_type != SHT_SYMTAB && sh[i].sh_type != SHT_DYNSYM) continue;
+            if (sh[i].sh_link >= eh->e_shnum) continue;
+
+            auto *syms = (Elf64_Sym*)((uint8_t*)m + sh[i].sh_offset);
+            int   cnt  = (int)(sh[i].sh_size / sizeof(Elf64_Sym));
+            auto *sstr = (const char*)m + sh[sh[i].sh_link].sh_offset;
+
+            for (int j = 0; j < cnt && !result; j++) {
+                if (!syms[j].st_value) continue;
+                char name[256];
+                strncpy(name, sstr + syms[j].st_name, 255);
+                name[255] = 0;
+                char *at = strchr(name, '@');
+                if (at) *at = 0;
+                if (strcmp(name, sym) == 0)
+                    result = (void*)(base + syms[j].st_value);
+            }
+        }
+    }
+
+done:
+    munmap(m, fsz);
+    return result;
+}
+
+void *DobbySymbolResolver(const char *lib, const char *sym) {
+    void *h = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+    if (h) {
+        void *a = dlsym(h, sym);
+        if (a) return a;
+        char buf[256]; snprintf(buf, sizeof(buf), "%s@@ANO", sym);
+        a = dlsym(h, buf);
+        if (a) return a;
+    }
+
+    PhdrQ q{lib, 0, nullptr};
+    dl_iterate_phdr(phdr_cb, &q);
+    if (!q.base || !q.path) {
+        DE("DobbySymbolResolver: '%s' not in memory", lib);
+        return nullptr;
+    }
+
+    void *a = elf_scan(q.path, sym, q.base);
+    if (a) DI("resolved %s::%s @ %p", lib, sym, a);
+    else   DE("DobbySymbolResolver: '%s' not found in '%s'", sym, lib);
+    return a;
+}

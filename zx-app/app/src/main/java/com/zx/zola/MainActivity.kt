@@ -16,7 +16,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        ZxEngine.init(filesDir)
+        ZxEngine.init(this)
 
         val statusTv    = findViewById<TextView>(R.id.tv_status)
         val activateBtn = findViewById<Button>(R.id.btn_activate)

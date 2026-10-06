@@ -82,7 +82,7 @@ class ZxOverlayService : Service() {
         // Feature list
         val featureContainer = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL
-            id = android.R.id.content + 1
+            tag = "features"
         }
 
         var lastCategory = ""

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <libgen.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ptrace.h>
@@ -143,7 +144,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
 
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: zx_injector <pid> <cmd> <0|1>\n");
+        fprintf(stderr, "Usage: zx_injector <pid> <cmd> <0|1> [payload_path]\n");
         return 1;
     }
 
@@ -164,10 +165,19 @@ int main(int argc, char *argv[]) {
 
     if (!payload_base) {
         // First activation — inject the payload
-        char payload_path[256];
-        // Derive path from our own binary location
-        snprintf(payload_path, sizeof(payload_path),
-                 "%s/../libzx_payload.so", dirname(argv[0]));
+        char payload_path[512];
+        if (argc >= 5 && argv[4][0] != '\0') {
+            // Payload path passed explicitly from ZxEngine (preferred)
+            strncpy(payload_path, argv[4], sizeof(payload_path) - 1);
+            payload_path[sizeof(payload_path) - 1] = '\0';
+        } else {
+            // Fallback: derive from our own binary location
+            char argv0[512];
+            strncpy(argv0, argv[0], sizeof(argv0) - 1);
+            argv0[sizeof(argv0) - 1] = '\0';
+            snprintf(payload_path, sizeof(payload_path),
+                     "%s/libzx_payload.so", dirname(argv0));
+        }
 
         LOG("Injecting payload from %s", payload_path);
 
