@@ -24,6 +24,8 @@ static void *ctrl_loop(void *) {
         LOG("Il2Cpp init failed");
         return nullptr;
     }
+    LOG("Il2Cpp ready — starting class discovery + engine hooks");
+    Features::init();
     LOG("Payload ready");
 
     int last_cmd = 0;

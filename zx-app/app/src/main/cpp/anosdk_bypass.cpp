@@ -1,43 +1,89 @@
-// AnoSDK bypass — inside the payload, kills reporting from within FF process
+/*
+ * AnoSDK bypass — confirmed from real libanogs.so (5.3 MB, arm64)
+ *
+ * Real exports found via nm -D:
+ *   AnoSDKIoctl@@ANO, AnoSDKGetReportData@@ANO, AnoSDKGetReportData2@@ANO,
+ *   AnoSDKGetReportData3@@ANO, AnoSDKGetReportData4@@ANO
+ *   AnoSDKInit@@ANO, AnoSDKSetUserInfo@@ANO, AnoSDKOnPause@@ANO, AnoSDKOnResume@@ANO
+ *   AnoSDKDelReportData@@ANO (v3/v4 variants)
+ *
+ * ms_scan_start is NOT exported — it's an internal symbol (confirmed via strings).
+ * We therefore hook inline_hook_opcode_dismatch (also internal) using DobbySymbolResolver.
+ *
+ * dlsym(h, "AnoSDKIoctl") resolves AnoSDKIoctl@@ANO correctly (default version).
+ */
 #include "dobby_stub.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
 #include <cstring>
 
 #define TAG "ZX-ANO"
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOG(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define ERR(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-static int   (*orig_AnoSDKIoctl)(int cmd, void *data, int len)       = nullptr;
-static void *(*orig_AnoSDKGetReportData)(int *len)                   = nullptr;
-static void *(*orig_AnoSDKGetReportData2)(int t, int *len)           = nullptr;
-static void *(*orig_AnoSDKGetReportData3)(int t, int *len, int f)    = nullptr;
-static void *(*orig_AnoSDKGetReportData4)(int t, int *len, int f, int e) = nullptr;
-static int   (*orig_ms_scan_start)(int type, void *p)                = nullptr;
+// Original function pointers
+static int   (*orig_Ioctl)(int,void*,int)            = nullptr;
+static void *(*orig_GetData)(int*)                   = nullptr;
+static void *(*orig_GetData2)(int,int*)              = nullptr;
+static void *(*orig_GetData3)(int,int*,int)          = nullptr;
+static void *(*orig_GetData4)(int,int*,int,int)      = nullptr;
+static void *(*orig_InlineCheck)(void*,void*,int)    = nullptr; // inline_hook_opcode_dismatch
 
-static int   hook_AnoSDKIoctl(int cmd, void *data, int len) {
-    if (cmd < 0x10 && orig_AnoSDKIoctl) return orig_AnoSDKIoctl(cmd, data, len);
+// Hooks — silently discard all report data and scanning
+static int   hook_Ioctl(int cmd, void *data, int len) {
+    // Pass through low-valued cmds (init/heartbeat), block all scanning cmds (>=0x10)
+    if (cmd < 0x10 && orig_Ioctl) return orig_Ioctl(cmd, data, len);
     return 0;
 }
-static void *hook_GetReport(int *len)              { if(len)*len=0; return nullptr; }
-static void *hook_GetReport2(int,int *len)         { if(len)*len=0; return nullptr; }
-static void *hook_GetReport3(int,int *len,int)     { if(len)*len=0; return nullptr; }
-static void *hook_GetReport4(int,int *len,int,int) { if(len)*len=0; return nullptr; }
-static int   hook_ms_scan(int, void*)              { return 0; }
+static void *hook_GetData (int *len)               { if(len)*len=0; return nullptr; }
+static void *hook_GetData2(int,int *len)           { if(len)*len=0; return nullptr; }
+static void *hook_GetData3(int,int *len,int)       { if(len)*len=0; return nullptr; }
+static void *hook_GetData4(int,int *len,int,int)   { if(len)*len=0; return nullptr; }
+
+// inline_hook_opcode_dismatch — AnoSDK's internal Dobby detector
+// Returns non-zero to trigger alert; we return 0 (no mismatch seen)
+static void *hook_InlineCheck(void *a, void *b, int c) {
+    (void)a; (void)b; (void)c;
+    return nullptr;
+}
 
 __attribute__((constructor))
 static void install_ano_bypass() {
+    // Try both symbol names in case of version suffix variation
     void *h = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
     if (!h) h = dlopen("libanogs.so", RTLD_LAZY);
-    if (!h) { LOG("libanogs.so not found"); return; }
+    if (!h) { ERR("libanogs.so not found"); return; }
 
-    auto sym = [&](const char *name) { return dlsym(h, name); };
+    // Helper: resolve sym, hook if found
+    auto hook = [&](const char *sym, void *replacement, void **orig) {
+        void *addr = dlsym(h, sym);
+        if (!addr) {
+            // Try with @@ANO suffix explicitly (some dlopen impls don't strip it)
+            char buf[128];
+            snprintf(buf, sizeof(buf), "%s@@ANO", sym);
+            addr = dlsym(h, buf);
+        }
+        if (!addr) {
+            // Last resort: DobbySymbolResolver (searches all ELF sections)
+            addr = DobbySymbolResolver("libanogs.so", sym);
+        }
+        if (addr) DobbyHook(addr, replacement, orig);
+        else ERR("sym not found: %s", sym);
+    };
 
-    DobbyHook(sym("AnoSDKIoctl"),          (void*)hook_AnoSDKIoctl,  (void**)&orig_AnoSDKIoctl);
-    DobbyHook(sym("AnoSDKGetReportData"),  (void*)hook_GetReport,    (void**)&orig_AnoSDKGetReportData);
-    DobbyHook(sym("AnoSDKGetReportData2"), (void*)hook_GetReport2,   (void**)&orig_AnoSDKGetReportData2);
-    DobbyHook(sym("AnoSDKGetReportData3"), (void*)hook_GetReport3,   (void**)&orig_AnoSDKGetReportData3);
-    DobbyHook(sym("AnoSDKGetReportData4"), (void*)hook_GetReport4,   (void**)&orig_AnoSDKGetReportData4);
-    DobbyHook(sym("ms_scan_start"),        (void*)hook_ms_scan,      (void**)&orig_ms_scan_start);
+    hook("AnoSDKIoctl",          (void*)hook_Ioctl,     (void**)&orig_Ioctl);
+    hook("AnoSDKGetReportData",  (void*)hook_GetData,   (void**)&orig_GetData);
+    hook("AnoSDKGetReportData2", (void*)hook_GetData2,  (void**)&orig_GetData2);
+    hook("AnoSDKGetReportData3", (void*)hook_GetData3,  (void**)&orig_GetData3);
+    hook("AnoSDKGetReportData4", (void*)hook_GetData4,  (void**)&orig_GetData4);
 
-    LOG("AnoSDK bypass installed");
+    // Hook internal Dobby-detection function (internal symbol, use DobbySymbolResolver)
+    void *inlineCheck = DobbySymbolResolver("libanogs.so", "inline_hook_opcode_dismatch");
+    if (!inlineCheck) inlineCheck = DobbySymbolResolver("libanogs.so", "set_inline_hook_error");
+    if (inlineCheck) {
+        DobbyHook(inlineCheck, (void*)hook_InlineCheck, (void**)&orig_InlineCheck);
+        LOG("Hooked inline_hook detector");
+    }
+
+    LOG("AnoSDK bypass installed (libanogs.so @ %p)", h);
 }

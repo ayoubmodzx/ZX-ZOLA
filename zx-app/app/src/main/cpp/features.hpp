@@ -1,6 +1,5 @@
 #pragma once
 
-// Feature commands — matches Cmd in ZxEngine.kt + injector.cpp
 enum FeatureCmd {
     CMD_ANTI_RECOIL   = 1, CMD_NO_SPREAD    = 2,
     CMD_RAPID_FIRE    = 3, CMD_AIM_ASSIST   = 4,
@@ -11,5 +10,6 @@ enum FeatureCmd {
 };
 
 namespace Features {
+    void init();              // discover classes + install engine hooks (called once)
     void apply(int cmd, bool enable);
 }
