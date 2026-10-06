@@ -26,7 +26,7 @@
  */
 
 #include "stealth_ext.hpp"
-#include "stealth_ext2.hpp"
+#include "stealth_ext2.hpp"   // stx2_register_rwx for new trampoline pages
 #include "dobby_stub.hpp"
 #include "anti_detect.hpp"
 #include <android/log.h>
@@ -39,6 +39,10 @@
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
+#ifndef __NR_openat
+#define __NR_openat 56
+#endif
 #include <pthread.h>
 #include <cstring>
 #include <cstdio>
@@ -494,17 +498,29 @@ static void *watchdog_fn(void*) {
         ticks++;
 
         // Re-apply MADV_DONTDUMP on any new anonymous rwxp pages
+        // Also register them with stx2 so mincore spoof stays accurate
         {
-            FILE *f = fopen("/proc/self/maps", "r");
-            if (f) {
-                char line[256];
-                while (fgets(line, sizeof(line), f)) {
-                    if (!strstr(line, "rwxp") || strchr(line, '/')) continue;
-                    uintptr_t s = 0, e = 0;
-                    if (sscanf(line, "%lx-%lx", &s, &e) == 2 && s && e > s)
-                        madvise((void*)s, e - s, MADV_DONTDUMP);
+            // Use raw syscall to bypass Layer 2 proc hider — we need to see
+            // ALL anonymous rwxp pages, not just the unfiltered subset
+            int fd = (int)syscall(__NR_openat, AT_FDCWD,
+                                  "/proc/self/maps", O_RDONLY | O_CLOEXEC, 0);
+            if (fd >= 0) {
+                char buf[4096]; char line[256]; int ll = 0;
+                ssize_t n;
+                while ((n = read(fd, buf, sizeof(buf))) > 0) {
+                    for (ssize_t i = 0; i < n; i++) {
+                        char c = buf[i];
+                        if (c != '\n' && ll < (int)sizeof(line)-1) { line[ll++]=c; continue; }
+                        line[ll] = '\0'; ll = 0;
+                        if (!strstr(line, "rwxp") || strchr(line, '/')) continue;
+                        uintptr_t s = 0, e = 0;
+                        if (sscanf(line, "%lx-%lx", &s, &e) == 2 && s && e > s) {
+                            madvise((void*)s, e - s, MADV_DONTDUMP);
+                            stx2_register_rwx((void*)s, e - s);
+                        }
+                    }
                 }
-                fclose(f);
+                close(fd);
             }
         }
 
