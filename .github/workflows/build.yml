@@ -18,15 +18,11 @@ jobs:
           java-version: "17"
           distribution: "temurin"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          accept-android-sdk-licenses: true
-
-      - name: Install NDK and CMake
+      - name: Install NDK and CMake via sdkmanager
         run: |
-          sdkmanager --install "ndk;27.2.12479018" "cmake;3.22.1"
-          echo "NDK_VERSION=27.2.12479018" >> $GITHUB_ENV
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "y" | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;27.2.12479018" "cmake;3.22.1"
 
       - name: Write local.properties
         run: |
