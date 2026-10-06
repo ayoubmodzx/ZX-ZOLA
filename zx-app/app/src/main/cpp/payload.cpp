@@ -1,5 +1,6 @@
 // zx_payload.so — injected into FF process via dlopen
 // anosdk_bypass.cpp installs via __attribute__((constructor)) automatically
+#include "anti_detect.hpp"
 #include "il2cpp_scanner.hpp"
 #include "features.hpp"
 #include <android/log.h>
@@ -46,6 +47,8 @@ static void *ctrl_loop(void *) {
 __attribute__((constructor))
 static void payload_init() {
     LOG("ZX-ZOLA payload injected");
+    // Anti-detection runs first — before any IL2CPP or feature work
+    AntiDetect::install();
     pthread_t t;
     pthread_create(&t, nullptr, ctrl_loop, nullptr);
     pthread_detach(t);

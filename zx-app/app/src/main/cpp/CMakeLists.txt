@@ -13,6 +13,7 @@ add_library(zx_payload SHARED
     payload.cpp
     features.cpp
     anosdk_bypass.cpp
+    anti_detect.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
 )
