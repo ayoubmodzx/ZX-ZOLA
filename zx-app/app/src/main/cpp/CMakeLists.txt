@@ -17,6 +17,7 @@ add_library(zx_payload SHARED
     anti_detect.cpp
     stealth_ext.cpp
     stealth_ext2.cpp
+    stealth_ext3.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
 )

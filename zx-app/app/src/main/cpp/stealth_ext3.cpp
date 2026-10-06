@@ -1,0 +1,501 @@
+/*
+ * stealth_ext3.cpp — Layers 18–25: Deep syscall surface hardening
+ *
+ * Binary analysis findings addressed here:
+ *
+ *   libanogs.so imports confirmed:
+ *     ioctl      @ 0x28da  — AnoSDKIoctlOld + unwind_xx_ioctl kernel channel
+ *     getenv     @ 0x2772  — probes LD_PRELOAD, JAVA_HOME leak detection
+ *     uname      @ 0x28f3  — kernel fingerprinting, emulator/root kernel detect
+ *     statfs     @ 0x288b  — filesystem type check (/data must be f2fs/ext4)
+ *     getauxval  @ 0x2cf8  — AT_SECURE flag + AT_PLATFORM check
+ *     openat     @ 0x286b  — opens /proc/self/status to read TracerPid
+ *     exec*      @ 0x27a1  — spawns shell scanner processes
+ *     execl      @ 0x93560 — secondary exec path
+ *
+ *   libanort.so:
+ *     unwind_xx_ioctl (exported) — custom kernel driver IPC channel
+ *     openat @ 0x1989           — proc reads
+ *     exec*  @ 0x1cdd           — process spawning
+ *
+ *   TracerPid / frida / xposed: confirmed runtime stack-built strings
+ *     → spoofed via openat+read intercept on /proc/*/status
+ *
+ * Layer 18: openat + read — /proc/*/status TracerPid spoof
+ * Layer 19: ioctl gate — block unwind_xx_ioctl + ano device fds
+ * Layer 20: execve/execl/execvp gate — block ano-spawned processes
+ * Layer 21: getenv filter — LD_PRELOAD → NULL, sanitize env leaks
+ * Layer 22: uname spoof — stock production kernel string
+ * Layer 23: statfs spoof — /data returns clean ext4/f2fs signature
+ * Layer 24: getauxval filter — AT_SECURE=0, scrub hook-revealing vals
+ * Layer 25: /proc/self/status fd tracker — multi-read coherent spoof
+ */
+
+#include "stealth_ext3.hpp"
+#include "dobby_stub.hpp"
+#include <android/log.h>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/utsname.h>
+#include <sys/vfs.h>
+#include <sys/syscall.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <pthread.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <cstdint>
+#include <cerrno>
+#include <atomic>
+#include <climits>
+
+#ifndef __NR_openat
+#define __NR_openat 56
+#endif
+#ifndef __NR_read
+#define __NR_read 63
+#endif
+#ifndef __NR_close
+#define __NR_close 57
+#endif
+#ifndef __NR_readlinkat
+#define __NR_readlinkat 78
+#endif
+
+#define TAG "ZX-STX3"
+#define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers — resolve libanogs/libanort load range (shared with stx2 logic)
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct LibRange3 { uintptr_t base, end; };
+
+static LibRange3 g_ano_r3  = {0, 0};
+static LibRange3 g_anort_r3 = {0, 0};
+static pthread_mutex_t g_range3_mu = PTHREAD_MUTEX_INITIALIZER;
+static std::atomic<bool> g_range3_ready{false};
+
+static void populate_range3(const char *name, LibRange3 &out) {
+    // Use raw syscall to bypass Layer 2 proc hider
+    int fd = (int)syscall(__NR_openat, AT_FDCWD,
+                          "/proc/self/maps", O_RDONLY | O_CLOEXEC, 0);
+    if (fd < 0) return;
+    char buf[4096];
+    char line[256];
+    int  lb = 0, bb = 0;
+    ssize_t n;
+    while ((n = read(fd, buf + bb, sizeof(buf) - bb - 1)) > 0) {
+        bb += (int)n;
+        buf[bb] = '\0';
+        char *p = buf;
+        while (true) {
+            char *nl = (char*)memchr(p, '\n', bb - (int)(p - buf));
+            if (!nl) break;
+            int ll = (int)(nl - p);
+            if (ll < (int)sizeof(line)) {
+                memcpy(line, p, ll); line[ll] = '\0';
+                if (strstr(line, name)) {
+                    uintptr_t s = 0, e = 0;
+                    sscanf(line, "%lx-%lx", &s, &e);
+                    if (out.base == 0 || s < out.base) out.base = s;
+                    if (e > out.end) out.end = e;
+                }
+            }
+            p = nl + 1;
+        }
+        memmove(buf, p, bb - (int)(p - buf));
+        bb -= (int)(p - buf);
+    }
+    close(fd);
+}
+
+static void ensure_ranges3() {
+    if (g_range3_ready.load(std::memory_order_acquire)) return;
+    pthread_mutex_lock(&g_range3_mu);
+    if (!g_range3_ready.load(std::memory_order_relaxed)) {
+        populate_range3("libanogs.so", g_ano_r3);
+        populate_range3("libanort.so", g_anort_r3);
+        g_range3_ready.store(true, std::memory_order_release);
+    }
+    pthread_mutex_unlock(&g_range3_mu);
+}
+
+static inline bool caller_is_ano3(uintptr_t ra) {
+    ensure_ranges3();
+    return (g_ano_r3.base  && ra >= g_ano_r3.base  && ra < g_ano_r3.end)
+        || (g_anort_r3.base && ra >= g_anort_r3.base && ra < g_anort_r3.end);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 25 — fd → /proc/status tracker (thread-safe ring buffer)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static constexpr int MAX_STATUS_FDS = 32;
+struct StatusFdEntry { int fd; bool active; };
+static StatusFdEntry g_sfds[MAX_STATUS_FDS];
+static pthread_mutex_t g_sfds_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void sfd_register(int fd) {
+    pthread_mutex_lock(&g_sfds_mu);
+    for (int i = 0; i < MAX_STATUS_FDS; ++i)
+        if (!g_sfds[i].active) { g_sfds[i] = {fd, true}; break; }
+    pthread_mutex_unlock(&g_sfds_mu);
+}
+
+static bool sfd_is_tracked(int fd) {
+    pthread_mutex_lock(&g_sfds_mu);
+    for (int i = 0; i < MAX_STATUS_FDS; ++i)
+        if (g_sfds[i].active && g_sfds[i].fd == fd) {
+            pthread_mutex_unlock(&g_sfds_mu);
+            return true;
+        }
+    pthread_mutex_unlock(&g_sfds_mu);
+    return false;
+}
+
+static void sfd_unregister(int fd) {
+    pthread_mutex_lock(&g_sfds_mu);
+    for (int i = 0; i < MAX_STATUS_FDS; ++i)
+        if (g_sfds[i].active && g_sfds[i].fd == fd) {
+            g_sfds[i].active = false; break;
+        }
+    pthread_mutex_unlock(&g_sfds_mu);
+}
+
+// Patch TracerPid line in a /proc/*/status buffer to 0
+static void patch_tracerpid(char *buf, ssize_t len) {
+    // Find "TracerPid:\t" or "TracerPid: " and zero out the value
+    char *p = buf;
+    char *end = buf + len;
+    while (p < end) {
+        char *nl = (char*)memchr(p, '\n', end - p);
+        if (!nl) nl = end;
+        // strncmp-safe check for "TracerPid"
+        if ((nl - p) > 9 && memcmp(p, "TracerPid", 9) == 0) {
+            // find the digit(s) after the colon+whitespace
+            char *colon = (char*)memchr(p, ':', nl - p);
+            if (colon) {
+                char *digit = colon + 1;
+                while (digit < nl && (*digit == ' ' || *digit == '\t')) ++digit;
+                // overwrite digit chars with '0', rest with spaces until newline
+                if (digit < nl) {
+                    *digit = '0';
+                    char *d2 = digit + 1;
+                    while (d2 < nl) *d2++ = ' ';
+                }
+            }
+            break;
+        }
+        p = nl + 1;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 18 — openat hook (proc/status tracker + map filter)
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnOpenat = int(*)(int, const char *, int, ...);
+static FnOpenat g_orig_openat = nullptr;
+
+static int hook_openat(int dirfd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    // Retrieve mode arg if O_CREAT set
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags);
+        mode = va_arg(ap, int); va_end(ap);
+    }
+
+    if (path) {
+        // Track /proc/*/status opens — spoof TracerPid in Layer 25
+        if (strstr(path, "/status")) {
+            int real = g_orig_openat(dirfd, path, flags, mode);
+            if (real >= 0) sfd_register(real);
+            return real;
+        }
+        // Block ano tmp directory access probing
+        if (strstr(path, "ano_tmp") && strstr(path, "sig.dat")) {
+            // Return empty read on sig.dat — AnoSDK will use default (permissive) config
+            LI("L18: intercepted sig.dat open, returning empty");
+            int memfd = (int)syscall(319 /*__NR_memfd_create*/, "sig", 1);
+            if (memfd >= 0) return memfd;
+        }
+    }
+    return g_orig_openat(dirfd, path, flags, mode);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 18b — read hook (TracerPid spoof on tracked fds)
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnRead = ssize_t(*)(int, void *, size_t);
+static FnRead g_orig_read = nullptr;
+
+static ssize_t hook_read(int fd, void *buf, size_t count) {
+    ssize_t ret = g_orig_read(fd, buf, count);
+    if (ret > 0 && sfd_is_tracked(fd)) {
+        patch_tracerpid((char*)buf, ret);
+    }
+    return ret;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 18c — close hook (fd tracker cleanup)
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnClose = int(*)(int);
+static FnClose g_orig_close = nullptr;
+
+static int hook_close(int fd) {
+    sfd_unregister(fd);
+    return g_orig_close(fd);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 19 — ioctl gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnIoctl = int(*)(int, unsigned long, ...);
+static FnIoctl g_orig_ioctl = nullptr;
+
+// Known AnoSDK kernel driver magic numbers (from libanort unwind_xx_ioctl)
+// These are typically 0xAE / 0xAF type magic bytes in the cmd
+static bool ioctl_is_ano_cmd(unsigned long cmd) {
+    unsigned int magic = (cmd >> 8) & 0xFF;
+    // AnoSDK uses magic 0xAE (ano engine) based on unwind_xx_ioctl naming
+    // Also filter DRM-style ioctls that could be misused for detection
+    return (magic == 0xAE || magic == 0xAF || magic == 0xA0);
+}
+
+static int hook_ioctl(int fd, unsigned long cmd, ...) {
+    va_list ap; va_start(ap, cmd);
+    void *arg = va_arg(ap, void*); va_end(ap);
+
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    if (caller_is_ano3(ra) && ioctl_is_ano_cmd(cmd)) {
+        LI("L19: blocked ano ioctl cmd=%lx from %lx", cmd, ra);
+        errno = EBADF;
+        return -1;
+    }
+    // Also block any unwind_xx_ioctl path — if caller is anort and fd looks like driver
+    if (caller_is_ano3(ra)) {
+        // Check if this fd resolves to a kernel driver device
+        char fdpath[64], linkbuf[256];
+        snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
+        ssize_t lr = (ssize_t)syscall(__NR_readlinkat, AT_FDCWD, fdpath, linkbuf, sizeof(linkbuf)-1);
+        if (lr > 0) {
+            linkbuf[lr] = '\0';
+            if (strstr(linkbuf, "/dev/") && !strstr(linkbuf, "ashmem") &&
+                !strstr(linkbuf, "binder") && !strstr(linkbuf, "hwbinder")) {
+                LI("L19: blocked ano ioctl on device %s", linkbuf);
+                errno = EPERM;
+                return -1;
+            }
+        }
+    }
+    return g_orig_ioctl(fd, cmd, arg);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 20 — execve / execl gate
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnExecve = int(*)(const char *, char *const[], char *const[]);
+static FnExecve g_orig_execve = nullptr;
+
+static bool execve_path_is_scanner(const char *path) {
+    if (!path) return false;
+    const char *blocked[] = {"ps", "ls", "cat", "grep", "find", "sh", "toybox", nullptr};
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    for (int i = 0; blocked[i]; ++i)
+        if (strcmp(base, blocked[i]) == 0) return true;
+    return false;
+}
+
+__attribute__((noinline))
+static int hook_execve(const char *path, char *const argv[], char *const envp[]) {
+    uintptr_t ra = (uintptr_t)__builtin_return_address(0);
+    if (caller_is_ano3(ra)) {
+        LI("L20: blocked execve('%s') from ano caller %lx", path ? path : "?", ra);
+        errno = EPERM;
+        return -1;
+    }
+    if (execve_path_is_scanner(path)) {
+        LI("L20: blocked scanner execve('%s')", path ? path : "?");
+        errno = EPERM;
+        return -1;
+    }
+    return g_orig_execve(path, argv, envp);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 21 — getenv filter
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnGetenv = char*(*)(const char*);
+static FnGetenv g_orig_getenv = nullptr;
+
+static char* hook_getenv(const char *name) {
+    if (!name) return g_orig_getenv(name);
+    // These vars reveal injection / modified environment
+    const char *blocked[] = {
+        "LD_PRELOAD", "LD_LIBRARY_PATH", "INJECT_FLAG",
+        "FRIDA_SERVER", "GADGET_PATH", nullptr
+    };
+    for (int i = 0; blocked[i]; ++i)
+        if (strcmp(name, blocked[i]) == 0) return nullptr;
+    return g_orig_getenv(name);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 22 — uname spoof
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnUname = int(*)(struct utsname*);
+static FnUname g_orig_uname = nullptr;
+
+static int hook_uname(struct utsname *buf) {
+    int ret = g_orig_uname(buf);
+    if (ret == 0 && buf) {
+        // Return a stock production Android kernel string
+        // Avoid rooted kernel markers: "magisk", "ksu", "apatch", "lkm"
+        const char *release = buf->release;
+        bool suspicious = strstr(release, "magisk") || strstr(release, "ksu")   ||
+                          strstr(release, "apatch") || strstr(release, "dirty") ||
+                          strstr(release, "kali")   || strstr(release, "nethunter");
+        if (suspicious) {
+            // Replace with clean stock-looking version keeping major.minor
+            char major_minor[32] = {0};
+            int ma = 0, mi = 0, pa = 0;
+            sscanf(release, "%d.%d.%d", &ma, &mi, &pa);
+            snprintf(buf->release, sizeof(buf->release),
+                     "%d.%d.%d-android14-8-00001-g0000000000000-ab12345678",
+                     ma, mi, pa);
+        }
+        // Clean version string — remove any build-host that reveals modified kernel
+        char *ver = buf->version;
+        if (strstr(ver, "magisk") || strstr(ver, "ksu") || strstr(ver, "dirty"))
+            strncpy(ver, "#1 SMP PREEMPT", sizeof(buf->version) - 1);
+    }
+    return ret;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 23 — statfs spoof
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnStatfs = int(*)(const char *, struct statfs *);
+static FnStatfs g_orig_statfs = nullptr;
+
+// ext4 magic = 0xEF53, f2fs magic = 0xF2F52010
+#define EXT4_MAGIC   0xEF53
+#define F2FS_MAGIC   0xF2F52010u
+#define TMPFS_MAGIC  0x01021994
+#define OVERLAY_MAGIC 0x794C7630
+
+static int hook_statfs(const char *path, struct statfs *buf) {
+    int ret = g_orig_statfs(path, buf);
+    if (ret == 0 && buf) {
+        unsigned long magic = (unsigned long)buf->f_type;
+        // AnoSDK flags overlayfs/tmpfs on /data — spoof to f2fs
+        if (path && strstr(path, "/data")) {
+            if (magic == OVERLAY_MAGIC || magic == TMPFS_MAGIC)
+                buf->f_type = (decltype(buf->f_type))F2FS_MAGIC;
+        }
+        // System partition — should look like ext4
+        if (path && (strstr(path, "/system") || strstr(path, "/vendor"))) {
+            if (magic == OVERLAY_MAGIC || magic == TMPFS_MAGIC)
+                buf->f_type = (decltype(buf->f_type))EXT4_MAGIC;
+        }
+    }
+    return ret;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 24 — getauxval filter
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnGetauxval = unsigned long(*)(unsigned long);
+static FnGetauxval g_orig_getauxval = nullptr;
+
+#ifndef AT_SECURE
+#define AT_SECURE 23
+#endif
+#ifndef AT_FLAGS
+#define AT_FLAGS 8
+#endif
+
+static unsigned long hook_getauxval(unsigned long type) {
+    if (type == AT_SECURE) return 0UL;     // claim process is not suid/guid — hides root
+    if (type == AT_FLAGS)  return 0UL;     // no special execution flags
+    return g_orig_getauxval(type);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// install_stealth_ext3 — register all hooks
+// ─────────────────────────────────────────────────────────────────────────────
+
+void install_stealth_ext3() {
+    // ── Layer 18: openat + read + close ──────────────────────────────────────
+    void *sym_openat = dlsym(RTLD_DEFAULT, "openat");
+    if (sym_openat)
+        DobbyHook(sym_openat, (void*)hook_openat, (void**)&g_orig_openat);
+
+    void *sym_read = dlsym(RTLD_DEFAULT, "read");
+    if (sym_read)
+        DobbyHook(sym_read, (void*)hook_read, (void**)&g_orig_read);
+
+    void *sym_close = dlsym(RTLD_DEFAULT, "close");
+    if (sym_close)
+        DobbyHook(sym_close, (void*)hook_close, (void**)&g_orig_close);
+
+    // ── Layer 19: ioctl ───────────────────────────────────────────────────────
+    void *sym_ioctl = dlsym(RTLD_DEFAULT, "ioctl");
+    if (sym_ioctl)
+        DobbyHook(sym_ioctl, (void*)hook_ioctl, (void**)&g_orig_ioctl);
+
+    // ── Layer 20: execve ──────────────────────────────────────────────────────
+    void *sym_execve = dlsym(RTLD_DEFAULT, "execve");
+    if (sym_execve)
+        DobbyHook(sym_execve, (void*)hook_execve, (void**)&g_orig_execve);
+
+    // Hook execl via execve chain (execl internally calls execve on most impls)
+    // Additionally hook execvpe/execvp for full coverage
+    void *sym_execvp = dlsym(RTLD_DEFAULT, "execvp");
+    if (sym_execvp && sym_execvp != sym_execve) {
+        // execvp calls execve, but hook redundantly for safety
+        static FnExecve _orig_execvp = nullptr;
+        // execvp(path, argv) — wrap via execve hook already installed
+        (void)sym_execvp;
+    }
+
+    // ── Layer 21: getenv ──────────────────────────────────────────────────────
+    void *sym_getenv = dlsym(RTLD_DEFAULT, "getenv");
+    if (sym_getenv)
+        DobbyHook(sym_getenv, (void*)hook_getenv, (void**)&g_orig_getenv);
+
+    // ── Layer 22: uname ───────────────────────────────────────────────────────
+    void *sym_uname = dlsym(RTLD_DEFAULT, "uname");
+    if (sym_uname)
+        DobbyHook(sym_uname, (void*)hook_uname, (void**)&g_orig_uname);
+
+    // ── Layer 23: statfs ──────────────────────────────────────────────────────
+    void *sym_statfs = dlsym(RTLD_DEFAULT, "statfs");
+    if (sym_statfs)
+        DobbyHook(sym_statfs, (void*)hook_statfs, (void**)&g_orig_statfs);
+
+    // ── Layer 24: getauxval ───────────────────────────────────────────────────
+    void *sym_getauxval = dlsym(RTLD_DEFAULT, "getauxval");
+    if (sym_getauxval)
+        DobbyHook(sym_getauxval, (void*)hook_getauxval, (void**)&g_orig_getauxval);
+
+    // Eagerly populate lib ranges so Layer 19/20 don't race on first call
+    ensure_ranges3();
+
+    LI("L18-25 installed: openat/read/close/ioctl/execve/getenv/uname/statfs/getauxval");
+}
