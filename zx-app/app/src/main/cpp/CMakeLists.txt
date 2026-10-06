@@ -15,6 +15,7 @@ add_library(zx_payload SHARED
     esp_renderer.cpp
     anosdk_bypass.cpp
     anti_detect.cpp
+    stealth_ext.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
 )
