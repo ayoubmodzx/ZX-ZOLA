@@ -303,12 +303,12 @@ static void hook_OnPostRender(void *cam) {
         else if (e.dist < 80.f)  box_col = { 1.0f, 0.55f, 0.0f,  1.0f }; // orange
         else                     box_col = { 0.0f, 0.95f, 1.0f,  1.0f }; // cyan
 
-        // Corner box (ZOLAM style)
+        // Full outline box around body (ZOLAM style — solid rectangle with neon glow)
         if (has_head && has_feet) {
             float box_w = fabsf(feet_s.y - head_s.y) * 0.38f;
             Vec2 tl = { head_s.x - box_w, head_s.y - 4.f };
             Vec2 br = { head_s.x + box_w, feet_s.y + 4.f };
-            draw_corner_box(tl, br, box_col);
+            draw_box_neon(tl, br, box_col);
         }
 
         // Skeleton
