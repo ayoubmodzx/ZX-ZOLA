@@ -26,6 +26,7 @@
  */
 
 #include "stealth_ext.hpp"
+#include "stealth_ext2.hpp"
 #include "dobby_stub.hpp"
 #include "anti_detect.hpp"
 #include <android/log.h>
@@ -485,6 +486,8 @@ void stx_watchdog_register(void *addr, void *hook) {
 static std::atomic<bool> g_watchdog_run{false};
 
 static void *watchdog_fn(void*) {
+    // Disguise this thread as a kernel worker — hides from AnoSDK ps -T scan
+    prctl(PR_SET_NAME, "kworker/0:2H", 0, 0, 0);
     int ticks = 0;
     while (g_watchdog_run.load()) {
         sleep(5);

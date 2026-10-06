@@ -24,6 +24,7 @@
 
 #include "anti_detect.hpp"
 #include "stealth_ext.hpp"
+#include "stealth_ext2.hpp"
 #include "dobby_stub.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
@@ -475,6 +476,7 @@ void AntiDetect::install() {
     // Layer 5 (RWX tracker) is passive — populated by dobby_impl.cpp
     // Layer 6 (string obfuscation) is passive — compile-time only
     install_stealth_ext();      // Layers 7-12
+    install_stealth_ext2();     // Layers 13-17
 
-    LI("AntiDetect: all 12 layers active");
+    LI("AntiDetect: all 17 layers active");
 }
