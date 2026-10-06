@@ -31,8 +31,8 @@ static void *(*orig_InlineCheck)(void*,void*,int)    = nullptr; // inline_hook_o
 
 // Hooks — silently discard all report data and scanning
 static int   hook_Ioctl(int cmd, void *data, int len) {
-    // Pass through low-valued cmds (init/heartbeat), block all scanning cmds (>=0x10)
-    if (cmd < 0x10 && orig_Ioctl) return orig_Ioctl(cmd, data, len);
+    // Block ALL commands — no heartbeat, no init, no scan
+    (void)cmd; (void)data; (void)len;
     return 0;
 }
 static void *hook_GetData (int *len)               { if(len)*len=0; return nullptr; }

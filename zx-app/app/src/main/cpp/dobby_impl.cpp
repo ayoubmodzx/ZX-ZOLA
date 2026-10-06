@@ -2,6 +2,7 @@
 // No external Dobby dependency needed — implements the subset used by ZX-ZOLA.
 
 #include "dobby_stub.hpp"
+#include "anti_detect.hpp"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -76,6 +77,10 @@ int DobbyHook(void *addr, void *replace, void **origin) {
             __builtin___clear_cache(pg, (char*)pg + TRAMP * 2);
             s.page  = pg;
             *origin = pg;
+            // Register with Layer 5: RWX page tracker so maps hider filters it
+            zx_track_rwx_page(pg, (size_t)getpagesize());
+            // Register with Layer 4: scrub target for signature rewrite
+            zx_register_scrub_target(pg);
         }
     }
 

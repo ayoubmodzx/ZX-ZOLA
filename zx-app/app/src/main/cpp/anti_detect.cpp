@@ -1,27 +1,29 @@
 /*
- * anti_detect.cpp — Multi-layer anti-detection for ZX-ZOLA
+ * anti_detect.cpp — Ultra-hardened 6-layer anti-detection for ZX-ZOLA
  *
- * Layer 1: libffutil.so bypass
- *   Hooks ffutil_UnmapAddr/Size/Unmap/SetUnmapTarget so FF cannot
- *   use the kernel-level page hiding to expose our injected pages.
- *
- * Layer 2: /proc/self/maps sanitisation
- *   Hooks openat() + read() so any caller (AnoSDK, libanogs scanner)
- *   that reads /proc/self/maps sees a cleaned version with our .so names
- *   stripped out.
- *
- * Layer 3: AnoSDK extended hooks
- *   AnoSDKDelReportData variants, AnoSDKOnPause/Resume intercept,
- *   and the AnoSDK poll-timer stub (ano_timer / set_check_period).
- *
- * Layer 4: Dobby signature scrub
- *   Overwrites the visible LDR X17 / BR X17 header bytes of our
- *   trampolines with a semantically equivalent but differently-encoded
- *   sequence so AnoSDK's byte-pattern scanner does not flag them.
+ * Layer 1  libffutil.so page-hiding bypass
+ * Layer 2  /proc sanitisation
+ *            /proc/self/maps    — strip our .so names + our RWX trampoline pages
+ *            /proc/self/smaps   — same, block-aware (header + detail lines)
+ *            /proc/self/status  — zero TracerPid field
+ *            /proc/<pid>/*      — same for numeric PID paths
+ * Layer 3  AnoSDK full neutralisation
+ *            AnoSDKInit         — prevent scanner thread from spawning
+ *            AnoSDKIoctl        — block ALL commands (was partial before)
+ *            GetReportData/2/3/4 — empty
+ *            DelReportData/2    — empty
+ *            OnPause/Resume     — suppressed (no scan restart)
+ *            SetUserInfo        — suppressed
+ *            inline_hook_opcode_dismatch + 8 internal scanner symbols
+ * Layer 4  Dobby trampoline signature scrub (LDR X17 → LDR X16)
+ * Layer 5  Anonymous RWX page tracker
+ *            Trampoline pages filtered from maps/smaps output
+ * Layer 6  Compile-time XOR string obfuscation
+ *            Our library names never appear as plain ASCII in .rodata
  */
 
-#include "dobby_stub.hpp"
 #include "anti_detect.hpp"
+#include "dobby_stub.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -36,296 +38,441 @@
 #include <atomic>
 #include <pthread.h>
 
-// arm64: memfd_create is syscall 279
+// arm64 syscall numbers
 #ifndef __NR_memfd_create
 #define __NR_memfd_create 279
+#endif
+#ifndef __NR_openat
+#define __NR_openat 56
+#endif
+#ifndef __NR_close
+#define __NR_close 57
 #endif
 
 #define TAG "ZX-ADET"
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 6 — Compile-time XOR string obfuscation
+// Library names are never stored as plain ASCII in .rodata.
+// The XOR key 0x5A is applied at compile time; decode happens in a
+// thread-local buffer at runtime, so the plaintext is never a global.
+// ═════════════════════════════════════════════════════════════════════════════
+
+static constexpr uint8_t XK = 0x5Au;
+
+template<size_t N>
+struct Obf {
+    char data[N]{};
+    constexpr explicit Obf(const char (&s)[N]) {
+        for (size_t i = 0; i < N; i++) data[i] = (char)(s[i] ^ XK);
+    }
+    void decode(char (&out)[N]) const {
+        for (size_t i = 0; i < N; i++) out[i] = (char)(data[i] ^ XK);
+    }
+};
+
+// Decode into a function-local static buffer — NOT a global plaintext.
+#define OBF_DECODE(var, lit)                                \
+    char var[sizeof(lit)];                                  \
+    do {                                                    \
+        static constexpr Obf<sizeof(lit)> _o(lit);         \
+        _o.decode(var);                                     \
+    } while(0)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 5 — Anonymous RWX page tracker
+// dobby_impl.cpp calls zx_track_rwx_page() after every trampoline mmap.
+// The hider in Layer 2 consults this list to filter those pages from output.
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct RwxPage { uintptr_t start; uintptr_t end; };
+static constexpr int      MAX_RWX = 128;
+static RwxPage            g_rwx[MAX_RWX];
+static int                g_rwx_n = 0;
+static pthread_mutex_t    g_rwx_mu = PTHREAD_MUTEX_INITIALIZER;
+
+void zx_track_rwx_page(void *p, size_t sz) {
+    if (!p || sz == 0) return;
+    pthread_mutex_lock(&g_rwx_mu);
+    if (g_rwx_n < MAX_RWX)
+        g_rwx[g_rwx_n++] = { (uintptr_t)p, (uintptr_t)p + sz };
+    pthread_mutex_unlock(&g_rwx_mu);
+}
+
+static bool addr_is_ours(uintptr_t a) {
+    pthread_mutex_lock(&g_rwx_mu);
+    bool found = false;
+    for (int i = 0; i < g_rwx_n && !found; i++)
+        found = (a >= g_rwx[i].start && a < g_rwx[i].end);
+    pthread_mutex_unlock(&g_rwx_mu);
+    return found;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Layer 1 — libffutil.so bypass
-// Confirmed exports: ffutil_UnmapAddr, ffutil_UnmapSize, ffutil_Unmap,
-//                   ffutil_SetUnmapTarget
-// These let FF mark pages as "owned by game" to hide them from AnoSDK scans.
-// We pass through the originals for FF's own pages; we just don't want our
-// payload pages registered there.
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
 
-static int  (*orig_ffutil_UnmapAddr)(uintptr_t addr, size_t len) = nullptr;
-static int  (*orig_ffutil_UnmapSize)(size_t len)                 = nullptr;
-static int  (*orig_ffutil_Unmap)(void *ctx)                      = nullptr;
-static int  (*orig_ffutil_SetUnmapTarget)(void *ctx, int flag)   = nullptr;
+static int (*orig_ffutil_UnmapAddr)(uintptr_t, size_t) = nullptr;
+static int (*orig_ffutil_UnmapSize)(size_t)             = nullptr;
+static int (*orig_ffutil_Unmap)(void*)                  = nullptr;
+static int (*orig_ffutil_SetUnmapTarget)(void*, int)    = nullptr;
 
-// We block any attempt to un-hide / re-expose pages in the ZX-ZOLA range.
-// Everything else passes through transparently.
-static int hook_ffutil_UnmapAddr(uintptr_t addr, size_t len) {
-    // If caller is trying to unmap pages that don't belong to us, pass through
-    if (orig_ffutil_UnmapAddr) return orig_ffutil_UnmapAddr(addr, len);
-    return 0;
+static int hook_ffutil_UnmapAddr(uintptr_t a, size_t l) {
+    return orig_ffutil_UnmapAddr ? orig_ffutil_UnmapAddr(a, l) : 0;
 }
-static int hook_ffutil_UnmapSize(size_t len) {
-    if (orig_ffutil_UnmapSize) return orig_ffutil_UnmapSize(len);
-    return 0;
+static int hook_ffutil_UnmapSize(size_t l) {
+    return orig_ffutil_UnmapSize ? orig_ffutil_UnmapSize(l) : 0;
 }
-static int hook_ffutil_Unmap(void *ctx) {
-    if (orig_ffutil_Unmap) return orig_ffutil_Unmap(ctx);
-    return 0;
+static int hook_ffutil_Unmap(void *c) {
+    return orig_ffutil_Unmap ? orig_ffutil_Unmap(c) : 0;
 }
-static int hook_ffutil_SetUnmapTarget(void *ctx, int flag) {
-    if (orig_ffutil_SetUnmapTarget) return orig_ffutil_SetUnmapTarget(ctx, flag);
-    return 0;
+static int hook_ffutil_SetUnmapTarget(void *c, int f) {
+    return orig_ffutil_SetUnmapTarget ? orig_ffutil_SetUnmapTarget(c, f) : 0;
 }
 
 static void install_ffutil_bypass() {
-    void *h = dlopen("libffutil.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!h) h = dlopen("libffutil.so", RTLD_LAZY);
-    if (!h) { LI("libffutil.so not loaded, skipping"); return; }
+    OBF_DECODE(libname, "libffutil.so");
+    void *h = dlopen(libname, RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = dlopen(libname, RTLD_LAZY);
+    if (!h) { LI("ffutil: not loaded"); return; }
 
-    auto hook = [&](const char *sym, void *rep, void **orig) {
+    auto hk = [&](const char *sym, void *rep, void **orig) {
         void *a = dlsym(h, sym);
-        if (!a) a = DobbySymbolResolver("libffutil.so", sym);
+        if (!a) a = DobbySymbolResolver(libname, sym);
         if (a) DobbyHook(a, rep, orig);
-        else   LI("ffutil: sym not found: %s", sym);
     };
-
-    hook("ffutil_UnmapAddr",      (void*)hook_ffutil_UnmapAddr,
-         (void**)&orig_ffutil_UnmapAddr);
-    hook("ffutil_UnmapSize",      (void*)hook_ffutil_UnmapSize,
-         (void**)&orig_ffutil_UnmapSize);
-    hook("ffutil_Unmap",          (void*)hook_ffutil_Unmap,
-         (void**)&orig_ffutil_Unmap);
-    hook("ffutil_SetUnmapTarget", (void*)hook_ffutil_SetUnmapTarget,
-         (void**)&orig_ffutil_SetUnmapTarget);
-    LI("libffutil.so bypass installed");
+    hk("ffutil_UnmapAddr",      (void*)hook_ffutil_UnmapAddr,      (void**)&orig_ffutil_UnmapAddr);
+    hk("ffutil_UnmapSize",      (void*)hook_ffutil_UnmapSize,      (void**)&orig_ffutil_UnmapSize);
+    hk("ffutil_Unmap",          (void*)hook_ffutil_Unmap,          (void**)&orig_ffutil_Unmap);
+    hk("ffutil_SetUnmapTarget", (void*)hook_ffutil_SetUnmapTarget, (void**)&orig_ffutil_SetUnmapTarget);
+    LI("L1 libffutil bypass OK");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Layer 2 — /proc/self/maps sanitisation
-//
-// Strategy: hook __openat (libc) and read().
-//   • When /proc/<pid>/maps or /proc/self/maps is opened, we create a
-//     memfd, read the real maps into it, filter out lines that contain
-//     our payload library names, seek to 0, and return the memfd fd.
-//   • All other fds pass through the original read() unchanged.
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 2 — /proc filesystem sanitisation
+// ═════════════════════════════════════════════════════════════════════════════
 
-static const char *k_hidden_libs[] = {
-    "libzx_payload.so",
-    "zx_payload",
-    "zx_injector",
-    nullptr
-};
+static constexpr int   MAX_FAKE_FDS = 32;
+static std::atomic<int> g_fds[MAX_FAKE_FDS];
 
-static bool should_hide_line(const char *line) {
-    for (int i = 0; k_hidden_libs[i]; i++)
-        if (strstr(line, k_hidden_libs[i])) return true;
-    return false;
-}
-
-static bool is_maps_path(const char *path) {
-    if (!path) return false;
-    // /proc/self/maps  or  /proc/<number>/maps
-    if (strncmp(path, "/proc/", 6) != 0) return false;
-    return strstr(path, "/maps") != nullptr;
-}
-
-// Set of fds we replaced with sanitised memfds
-static constexpr int MAX_FAKE_FDS = 16;
-static std::atomic<int> g_fake_fds[MAX_FAKE_FDS];
-static void add_fake_fd(int fd) {
+static void fd_add(int fd) {
     for (int i = 0; i < MAX_FAKE_FDS; i++) {
         int exp = -1;
-        if (g_fake_fds[i].compare_exchange_strong(exp, fd)) return;
+        if (g_fds[i].compare_exchange_strong(exp, fd)) return;
     }
 }
-static bool is_fake_fd(int fd) {
-    for (int i = 0; i < MAX_FAKE_FDS; i++)
-        if (g_fake_fds[i].load() == fd) return true;
-    return false;
-}
-static void remove_fake_fd(int fd) {
+static void fd_del(int fd) {
     for (int i = 0; i < MAX_FAKE_FDS; i++) {
         int exp = fd;
-        g_fake_fds[i].compare_exchange_strong(exp, -1);
+        g_fds[i].compare_exchange_strong(exp, -1);
     }
 }
 
-static int (*orig_openat)(int, const char *, int, ...) = nullptr;
-static int (*orig_close)(int)                          = nullptr;
-static ssize_t (*orig_read)(int, void *, size_t)       = nullptr;
+enum PType { P_NONE, P_MAPS, P_SMAPS, P_STATUS };
 
-static int hook_openat(int dirfd, const char *path, int flags, ...) {
-    int real_fd;
-    // call original first
-    if (orig_openat) {
-        // pass mode if O_CREAT set
-        if (flags & O_CREAT) {
-            va_list ap; va_start(ap, flags);
-            mode_t mode = va_arg(ap, mode_t); va_end(ap);
-            real_fd = orig_openat(dirfd, path, flags, mode);
-        } else {
-            real_fd = orig_openat(dirfd, path, flags);
-        }
-    } else {
-        real_fd = (int)syscall(__NR_openat, dirfd, path, flags);
+static PType classify(const char *path) {
+    if (!path || strncmp(path, "/proc/", 6) != 0) return P_NONE;
+    // Accept both /proc/self/X and /proc/<number>/X
+    const char *tail = path + 6;
+    if (strncmp(tail, "self/", 5) == 0) tail += 5;
+    else {
+        // skip numeric pid
+        while (*tail >= '0' && *tail <= '9') tail++;
+        if (*tail != '/') return P_NONE;
+        tail++;
     }
+    if (strcmp(tail, "maps")   == 0) return P_MAPS;
+    if (strcmp(tail, "smaps")  == 0 ||
+        strcmp(tail, "smaps_rollup") == 0) return P_SMAPS;
+    if (strcmp(tail, "status") == 0) return P_STATUS;
+    return P_NONE;
+}
 
-    if (real_fd < 0 || !is_maps_path(path)) return real_fd;
+// Returns true if a maps/smaps header line should be completely hidden.
+// Criteria: contains our lib name, or is an anonymous rwxp page we own.
+static bool hide_maps_line(const char *line) {
+    OBF_DECODE(pay,  "libzx_payload.so");
+    OBF_DECODE(inj,  "zx_injector");
+    OBF_DECODE(pfx,  "zx_payload");
+    if (strstr(line, pay) || strstr(line, inj) || strstr(line, pfx))
+        return true;
+    // Anonymous rwxp pages that belong to our trampoline pool
+    if (strstr(line, "rwxp") && !strchr(line, '/')) {
+        uintptr_t start = (uintptr_t)strtoull(line, nullptr, 16);
+        if (start && addr_is_ours(start)) return true;
+    }
+    return false;
+}
 
-    // Build sanitised version in a memfd
-    int mfd = (int)syscall(__NR_memfd_create, "maps_clean", 0);
-    if (mfd < 0) return real_fd;
+// Zero out TracerPid in a /proc/status line (in-place).
+static void zero_tracer(char *line) {
+    if (strncmp(line, "TracerPid:", 10) != 0) return;
+    char *p = line + 10;
+    while (*p == '\t' || *p == ' ') p++;
+    // Overwrite the numeric value with '0'
+    char *q = p;
+    while (*q >= '0' && *q <= '9') *q++ = '0';
+    // Collapse to single '0'
+    if (q > p + 1) {
+        p[0] = '0'; p[1] = '\n'; p[2] = '\0';
+    } else {
+        p[0] = '0';
+    }
+}
 
-    char line[512];
+static int build_fake_maps(int real_fd) {
+    int mfd = (int)syscall(__NR_memfd_create, "zxm", 0);
+    if (mfd < 0) return -1;
     FILE *f = fdopen(dup(real_fd), "r");
     close(real_fd);
     if (!f) { close(mfd); return -1; }
 
-    while (fgets(line, sizeof(line), f)) {
-        if (!should_hide_line(line))
+    char line[1024];
+    while (fgets(line, sizeof(line), f))
+        if (!hide_maps_line(line))
             write(mfd, line, strlen(line));
+    fclose(f);
+    lseek(mfd, 0, SEEK_SET);
+    return mfd;
+}
+
+static int build_fake_smaps(int real_fd) {
+    int mfd = (int)syscall(__NR_memfd_create, "zxs", 0);
+    if (mfd < 0) return -1;
+    FILE *f = fdopen(dup(real_fd), "r");
+    close(real_fd);
+    if (!f) { close(mfd); return -1; }
+
+    char line[1024];
+    bool skip = false;
+    while (fgets(line, sizeof(line), f)) {
+        // A smaps header line: "aaaa-bbbb perms offset dev ino [path]"
+        // Identified by 'p' or '-' permission char after the address range
+        bool is_hdr = (line[0] >= '0' && line[0] <= '9') ||
+                      (line[0] >= 'a' && line[0] <= 'f');
+        if (is_hdr) skip = hide_maps_line(line);
+        if (!skip)  write(mfd, line, strlen(line));
     }
     fclose(f);
-
     lseek(mfd, 0, SEEK_SET);
-    add_fake_fd(mfd);
+    return mfd;
+}
+
+static int build_fake_status(int real_fd) {
+    int mfd = (int)syscall(__NR_memfd_create, "zxt", 0);
+    if (mfd < 0) return -1;
+    FILE *f = fdopen(dup(real_fd), "r");
+    close(real_fd);
+    if (!f) { close(mfd); return -1; }
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        zero_tracer(line);
+        write(mfd, line, strlen(line));
+    }
+    fclose(f);
+    lseek(mfd, 0, SEEK_SET);
+    return mfd;
+}
+
+static int (*orig_openat)(int, const char*, int, ...) = nullptr;
+static int (*orig_close)(int)                         = nullptr;
+
+static int hook_openat(int dirfd, const char *path, int flags, ...) {
+    int rfd;
+    if (orig_openat) {
+        if (flags & O_CREAT) {
+            va_list ap; va_start(ap, flags);
+            mode_t m = va_arg(ap, mode_t); va_end(ap);
+            rfd = orig_openat(dirfd, path, flags, m);
+        } else {
+            rfd = orig_openat(dirfd, path, flags);
+        }
+    } else {
+        rfd = (int)syscall(__NR_openat, dirfd, path, flags);
+    }
+    if (rfd < 0) return rfd;
+
+    int mfd = -1;
+    switch (classify(path)) {
+        case P_MAPS:   mfd = build_fake_maps(rfd);   break;
+        case P_SMAPS:  mfd = build_fake_smaps(rfd);  break;
+        case P_STATUS: mfd = build_fake_status(rfd); break;
+        default: return rfd;
+    }
+    if (mfd < 0) return -1;
+    fd_add(mfd);
     return mfd;
 }
 
 static int hook_close(int fd) {
-    remove_fake_fd(fd);
-    if (orig_close) return orig_close(fd);
-    return (int)syscall(__NR_close, fd);
+    fd_del(fd);
+    return orig_close ? orig_close(fd) : (int)syscall(__NR_close, fd);
 }
 
-// read() hook is not strictly needed since we return a proper memfd —
-// but we keep it as a safety net for direct syscall readers
-static ssize_t hook_read(int fd, void *buf, size_t count) {
-    if (orig_read) return orig_read(fd, buf, count);
-    return (ssize_t)syscall(__NR_read, fd, buf, count);
+static void install_proc_hider() {
+    for (int i = 0; i < MAX_FAKE_FDS; i++) g_fds[i].store(-1);
+
+    OBF_DECODE(libc, "libc.so");
+    void *h = dlopen(libc, RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = dlopen(libc, RTLD_LAZY);
+    if (!h) { LE("L2: libc not found"); return; }
+
+    void *fn_oa = dlsym(h, "openat");
+    void *fn_cl = dlsym(h, "close");
+    if (fn_oa) DobbyHook(fn_oa, (void*)hook_openat, (void**)&orig_openat);
+    if (fn_cl) DobbyHook(fn_cl, (void*)hook_close,  (void**)&orig_close);
+    LI("L2 /proc hider OK (maps+smaps+status, TracerPid=0)");
 }
 
-static void install_maps_hider() {
-    for (int i = 0; i < MAX_FAKE_FDS; i++) g_fake_fds[i].store(-1);
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 3 — AnoSDK full neutralisation
+//
+// NOTE: anosdk_bypass.cpp installs early hooks via __attribute__((constructor)).
+// This layer adds what's missing there:
+//   • AnoSDKInit  — blocks scanner thread from ever spawning
+//   • AnoSDKOnPause/Resume — suppressed so scan can never restart
+//   • AnoSDKSetUserInfo — suppressed (no real binding)
+//   • Ioctl re-hook to block ALL commands (overrides partial hook)
+//   • 8 internal scanner symbols via DobbySymbolResolver
+// ═════════════════════════════════════════════════════════════════════════════
 
-    void *libc = dlopen("libc.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!libc) libc = dlopen("libc.so", RTLD_LAZY);
-    if (!libc) { LE("maps hider: libc not found"); return; }
+static int  (*orig_AnoInit)(int, void*, int)       = nullptr;
+static void (*orig_AnoOnPause)()                   = nullptr;
+static void (*orig_AnoOnResume)()                  = nullptr;
+static int  (*orig_AnoSetUser)(int,const char*,int)= nullptr;
+static int  (*orig_AnoIoctl)(int,void*,int)        = nullptr;
+static int  (*orig_SetPeriod)(int)                 = nullptr;
 
-    void *fn_openat = dlsym(libc, "openat");
-    void *fn_close  = dlsym(libc, "close");
-
-    if (fn_openat) DobbyHook(fn_openat, (void*)hook_openat, (void**)&orig_openat);
-    if (fn_close)  DobbyHook(fn_close,  (void*)hook_close,  (void**)&orig_close);
-    LI("maps hider installed (openat=%p close=%p)", fn_openat, fn_close);
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Layer 3 — AnoSDK extended hooks
-// ─────────────────────────────────────────────────────────────────────────────
-
-static int (*orig_DelReportData)(int, int*) = nullptr;
-static int (*orig_DelReportData2)(int, int*, int) = nullptr;
-
-// These are called by AnoSDK to free/clear report buffers.
-// Returning 0 with zeroed length is correct — nothing to free.
-static int hook_DelReportData(int type, int *len) {
-    (void)type; if (len) *len = 0; return 0;
-}
-static int hook_DelReportData2(int type, int *len, int flag) {
-    (void)type; (void)flag; if (len) *len = 0; return 0;
-}
-
-// AnoSDK's internal check-period setter — set a very long interval
-// so scans happen once every ~24h instead of every few seconds
-static int (*orig_set_check_period)(int ms) = nullptr;
-static int hook_set_check_period(int ms) {
-    (void)ms;
-    // Return success but set the period to 86400000ms (24 hours)
-    if (orig_set_check_period) return orig_set_check_period(86400000);
+// Prevent scanner thread from ever starting
+static int hook_AnoInit(int id, void *d, int l) {
+    (void)id; (void)d; (void)l;
     return 0;
 }
-
-static void install_ano_extended(void *h) {
-    if (!h) return;
-
-    auto try_hook = [&](const char *sym, void *rep, void **orig) {
-        void *a = dlsym(h, sym);
-        if (!a) a = DobbySymbolResolver("libanogs.so", sym);
-        if (a) DobbyHook(a, rep, orig);
-    };
-
-    try_hook("AnoSDKDelReportData",  (void*)hook_DelReportData,
-             (void**)&orig_DelReportData);
-    try_hook("AnoSDKDelReportData2", (void*)hook_DelReportData2,
-             (void**)&orig_DelReportData2);
-    try_hook("set_check_period",     (void*)hook_set_check_period,
-             (void**)&orig_set_check_period);
-    try_hook("ano_set_check_period", (void*)hook_set_check_period, nullptr);
-    LI("AnoSDK extended hooks installed");
+// Block ALL Ioctl commands — no heartbeat, no init, no scan
+static int hook_AnoIoctl(int cmd, void *d, int l) {
+    (void)cmd; (void)d; (void)l;
+    return 0;
+}
+// Prevent scan from resuming after app comes back from background
+static void hook_AnoOnPause()  {}
+static void hook_AnoOnResume() {}
+// Prevent user binding
+static int hook_AnoSetUser(int t, const char *u, int l) {
+    (void)t; (void)u; (void)l; return 0;
+}
+// Push scan interval to max int — effectively never fires
+static int hook_SetPeriod(int ms) {
+    (void)ms;
+    return orig_SetPeriod ? orig_SetPeriod(0x7FFFFFFF) : 0;
+}
+// Generic nullifier for internal scanner/detector functions
+static void *hook_ScanNullify(void *a, void *b, int c) {
+    (void)a; (void)b; (void)c; return nullptr;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Layer 4 — Dobby trampoline signature scrub
-//
-// Our trampolines start with: 51 00 00 58  20 02 1F D6  (LDR X17 + BR X17)
-// AnoSDK pattern-scans for this exact 8-byte signature.
-// We overwrite the header with a different but equivalent encoding using
-// the MOV X17, X17 + ... no-op chain that still jumps correctly.
-// (We only scrub the visible header; the payload address stays intact.)
-// ─────────────────────────────────────────────────────────────────────────────
+static void install_anosdk_extended(void *h) {
+    if (!h) return;
+    OBF_DECODE(lib, "libanogs.so");
 
-// Replacement 8-byte preamble that is functionally equivalent but
-// does NOT match the AnoSDK pattern:
-//   LDR  X16, #8    (0x58000050 — same offset but X16 instead of X17)
-//   BR   X16        (0xD61F0200)
-// AnoSDK scans for the X17-register variant specifically.
+    auto try_hk = [&](const char *sym, void *rep, void **orig) -> bool {
+        void *a = dlsym(h, sym);
+        if (!a) {
+            char buf[128]; snprintf(buf, sizeof(buf), "%s@@ANO", sym);
+            a = dlsym(h, buf);
+        }
+        if (!a) a = DobbySymbolResolver(lib, sym);
+        if (a) { DobbyHook(a, rep, orig); return true; }
+        return false;
+    };
+
+    // Exported symbols missing from anosdk_bypass.cpp
+    try_hk("AnoSDKInit",       (void*)hook_AnoInit,     (void**)&orig_AnoInit);
+    try_hk("AnoSDKOnPause",    (void*)hook_AnoOnPause,  (void**)&orig_AnoOnPause);
+    try_hk("AnoSDKOnResume",   (void*)hook_AnoOnResume, (void**)&orig_AnoOnResume);
+    try_hk("AnoSDKSetUserInfo",(void*)hook_AnoSetUser,  (void**)&orig_AnoSetUser);
+
+    // Re-hook Ioctl to block ALL commands (overrides the cmd<0x10 pass-through
+    // left by anosdk_bypass.cpp's constructor hook)
+    try_hk("AnoSDKIoctl", (void*)hook_AnoIoctl, (void**)&orig_AnoIoctl);
+
+    // Check-period hooks
+    try_hk("set_check_period",     (void*)hook_SetPeriod, (void**)&orig_SetPeriod);
+    try_hk("ano_set_check_period", (void*)hook_SetPeriod, nullptr);
+
+    // Internal scanner / hook-detector symbols (best-effort via ELF scan)
+    static const char *k_internal[] = {
+        "inline_hook_opcode_dismatch",
+        "set_inline_hook_error",
+        "ms_scan_start",
+        "scan_memory_region",
+        "check_module_integrity",
+        "scan_for_hooks",
+        "verify_code_section",
+        "ptimer_start",
+        "ptimer_create",
+        nullptr
+    };
+    int found = 0;
+    for (int i = 0; k_internal[i]; i++) {
+        void *a = DobbySymbolResolver(lib, k_internal[i]);
+        if (a) {
+            DobbyHook(a, (void*)hook_ScanNullify, nullptr);
+            found++;
+            LI("L3 internal hook: %s", k_internal[i]);
+        }
+    }
+    LI("L3 AnoSDK extended OK (%d internal hooks)", found);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 4 — Dobby trampoline signature scrub
+// dobby_impl.cpp writes LDR X17, #8 (0x58000051) + BR X17 (0xD61F0220).
+// AnoSDK byte-pattern scans for that exact 8-byte sequence.
+// We overwrite it with the X16 variant — same semantics, different encoding.
+// ═════════════════════════════════════════════════════════════════════════════
+
 static const uint8_t k_clean_hdr[8] = {
-    0x50, 0x00, 0x00, 0x58,  // LDR X16, #8
-    0x00, 0x02, 0x1F, 0xD6,  // BR  X16
+    0x50, 0x00, 0x00, 0x58,   // LDR X16, #8
+    0x00, 0x02, 0x1F, 0xD6,   // BR  X16
 };
 
-// Called after all hooks installed — walks g_slots and patches headers.
-// Declared extern so dobby_impl.cpp can expose the slot list.
-extern void zx_scrub_trampolines();
+static void *k_scrub[128];
+static int   k_scrub_n = 0;
 
-// (Implemented inline here; dobby_impl.cpp doesn't expose internals —
-//  so we do a second pass over known hook addresses instead.)
-static void *k_scrub_targets[64];
-static int   k_scrub_count = 0;
-
-void zx_register_scrub_target(void *hook_addr) {
-    if (k_scrub_count < 64)
-        k_scrub_targets[k_scrub_count++] = hook_addr;
+void zx_register_scrub_target(void *addr) {
+    if (k_scrub_n < 128) k_scrub[k_scrub_n++] = addr;
 }
 
 void zx_scrub_trampolines() {
-    for (int i = 0; i < k_scrub_count; i++) {
-        void *p = k_scrub_targets[i];
+    size_t ps = (size_t)getpagesize();
+    for (int i = 0; i < k_scrub_n; i++) {
+        void *p = k_scrub[i];
         if (!p) continue;
-        // Make writable
-        uintptr_t page = (uintptr_t)p & ~((uintptr_t)getpagesize()-1);
-        mprotect((void*)page, getpagesize(), PROT_READ|PROT_WRITE|PROT_EXEC);
+        uintptr_t pg = (uintptr_t)p & ~(ps - 1);
+        mprotect((void*)pg, ps, PROT_READ | PROT_WRITE | PROT_EXEC);
         memcpy(p, k_clean_hdr, 8);
         __builtin___clear_cache(p, (char*)p + 8);
     }
-    LI("Scrubbed %d trampoline headers", k_scrub_count);
+    LI("L4 scrubbed %d trampoline headers", k_scrub_n);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Public install — called from payload_init after AnoSDK bypass runs
-// ─────────────────────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Public install
+// ═════════════════════════════════════════════════════════════════════════════
 
 void AntiDetect::install() {
-    void *ano = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
+    OBF_DECODE(anolib, "libanogs.so");
+    void *ano = dlopen(anolib, RTLD_LAZY | RTLD_NOLOAD);
 
-    install_ffutil_bypass();
-    install_maps_hider();
-    install_ano_extended(ano);
-    zx_scrub_trampolines();
+    install_ffutil_bypass();    // Layer 1
+    install_proc_hider();       // Layer 2
+    install_anosdk_extended(ano); // Layer 3
+    zx_scrub_trampolines();     // Layer 4
+    // Layer 5 (RWX tracker) is passive — populated by dobby_impl.cpp
+    // Layer 6 (string obfuscation) is passive — compile-time only
 
-    LI("AntiDetect fully installed");
+    LI("AntiDetect: all 6 layers active");
 }
