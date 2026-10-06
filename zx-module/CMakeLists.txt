@@ -14,6 +14,8 @@ add_library(zx_zola SHARED
     zygisk/hook_engine.cpp
     zygisk/async_worker.cpp
     zygisk/feature_engine.cpp
+    zygisk/anosdk_bypass.cpp
+    zygisk/memory_guard.cpp
 )
 
 target_include_directories(zx_zola PRIVATE include)
