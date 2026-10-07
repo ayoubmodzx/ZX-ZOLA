@@ -11,6 +11,7 @@
 #include <dlfcn.h>
 #include <atomic>
 #include <cstring>
+#include <cmath>
 
 #define TAG "ZX-FEAT"
 #ifndef ZX_RELEASE
@@ -878,6 +879,25 @@ void Features::apply(int cmd, bool enable) {
         case CMD_AIM_FOV:
         case CMD_AIM_SMOOTH:
             break; // these are intensity-only, handled by applyIntensity
+        case CMD_GOD_MODE:        g_godMode.store(enable);        break;
+        case CMD_INFINITE_AMMO:   g_infiniteAmmo.store(enable);   break;
+        case CMD_NO_RELOAD:       g_noReload.store(enable);       break;
+        case CMD_NOCLIP:          g_noclip.store(enable);         break;
+        case CMD_TELEPORT:
+            g_teleport.store(enable);
+            if (enable) g_teleportPending.store(true);
+            break;
+        case CMD_TELEPORT_SAVE: {
+            // Save local player position as teleport target
+            // Will be populated from UI via applyIntensity with encoded coords
+            break;
+        }
+        case CMD_SILENT_AIM:      g_silentAim.store(enable);      break;
+        case CMD_AUTO_HEADSHOT:   g_autoHeadshot.store(enable);   break;
+        case CMD_FULL_AIMBOT:     g_fullAimbot.store(enable);     break;
+        case CMD_ANTI_AIM:        g_antiAim.store(enable);        break;
+        case CMD_AUTO_REVIVE:     g_autoRevive.store(enable);     break;
+        case CMD_WALL_SHOOT:      g_wallShoot.store(enable);      break;
         default: LOG("Unknown cmd: %d", cmd);
     }
 }
