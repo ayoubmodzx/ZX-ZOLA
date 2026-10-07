@@ -28,6 +28,7 @@
 #include "stealth_ext3.hpp"
 #include "stealth_ext4.hpp"
 #include "stealth_ext5.hpp"
+#include "stealth_ext6.hpp"
 #include "dobby_stub.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
@@ -490,6 +491,7 @@ void AntiDetect::install() {
     install_stealth_ext3();     // Layers 18-26
     install_stealth_ext4();     // Layers 27-43
     install_stealth_ext5();     // Layers 44-48
+    install_stealth_ext6();     // Layers 49-53
 
-    LI("AntiDetect: all 48 layers active");
+    LI("AntiDetect: all 53 layers active");
 }

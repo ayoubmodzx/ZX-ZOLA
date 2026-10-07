@@ -20,6 +20,7 @@ add_library(zx_payload SHARED
     stealth_ext3.cpp
     stealth_ext4.cpp
     stealth_ext5.cpp
+    stealth_ext6.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
 )
