@@ -483,7 +483,6 @@ void AntiDetect::install() {
     install_ffutil_bypass();    // Layer 1
     install_proc_hider();       // Layer 2
     install_anosdk_extended(ano); // Layer 3
-    zx_scrub_trampolines();     // Layer 4
     // Layer 5 (RWX tracker) is passive — populated by dobby_impl.cpp
     // Layer 6 (string obfuscation) is passive — compile-time only
     install_stealth_ext();      // Layers 7-12
@@ -492,6 +491,7 @@ void AntiDetect::install() {
     install_stealth_ext4();     // Layers 27-43
     install_stealth_ext5();     // Layers 44-48
     install_stealth_ext6();     // Layers 49-53
+    zx_scrub_trampolines();     // Layer 4 — scrub ALL 53 layers' trampolines at once
 
     LI("AntiDetect: all 53 layers active");
 }

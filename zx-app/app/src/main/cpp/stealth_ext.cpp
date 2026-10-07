@@ -116,22 +116,43 @@ using FnPhdrCb   = int(*)(dl_phdr_info*, size_t, void*);
 using FnIterPhdr = int(*)(FnPhdrCb, void*);
 static FnIterPhdr g_orig_iter_phdr = nullptr;
 
-struct PhdrWrap { FnPhdrCb real_cb; void *real_data; };
+// libanogs range for caller-aware hiding (same logic as ext5/ext6)
+static uintptr_t s_stx_ano_base = 0;
+static uintptr_t s_stx_ano_end  = 0;
+
+static int phdr_find_anogs_stx(dl_phdr_info *info, size_t /*sz*/, void * /*d*/) {
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_LOAD) {
+            uintptr_t se = base + ph.p_vaddr + ph.p_memsz;
+            if (se > end) end = se;
+        }
+    }
+    s_stx_ano_base = base; s_stx_ano_end = end; return 1;
+}
+
+struct PhdrWrap { FnPhdrCb real_cb; void *real_data; bool from_anogs; };
 
 static int zx_phdr_filter(dl_phdr_info *info, size_t sz, void *data) {
     auto *w = static_cast<PhdrWrap*>(data);
-    if (info && info->dlpi_name) {
+    // Only hide from libanogs callers — IL2CPP exception unwinder must see our
+    // .eh_frame or it crashes when unwinding through our hook stack frames
+    if (w->from_anogs && info && info->dlpi_name) {
         const char *n = info->dlpi_name;
-        // Hide our modules — short prefix check avoids OBF_DECODE in callback
         if (strstr(n, "zx_") || strstr(n, "ZX_"))
             return 0;
     }
     return w->real_cb(info, sz, w->real_data);
 }
 
-static int hook_dl_iterate_phdr(FnPhdrCb cb, void *data) {
+static int __attribute__((noinline)) hook_dl_iterate_phdr(FnPhdrCb cb, void *data) {
     if (!g_orig_iter_phdr || !cb) return 0;
-    PhdrWrap w{ cb, data };
+    uintptr_t lr = (uintptr_t)__builtin_return_address(0);
+    if (!s_stx_ano_base) g_orig_iter_phdr(phdr_find_anogs_stx, nullptr);
+    bool from_ano = (s_stx_ano_base && lr >= s_stx_ano_base && lr < s_stx_ano_end);
+    PhdrWrap w{ cb, data, from_ano };
     return g_orig_iter_phdr(zx_phdr_filter, &w);
 }
 
@@ -436,8 +457,13 @@ static void rotate_trampolines() {
     const size_t ps = (size_t)getpagesize();
 
     // Scan all anonymous rwxp pages and rewrite the trampoline header
-    FILE *f = fopen("/proc/self/maps", "r");
-    if (!f) return;
+    // Use raw syscall to bypass Layer 2's hook_openat filter (which hides our
+    // trampoline pages from regular fopen callers, making rotation never fire)
+    int raw_fd = (int)syscall(__NR_openat, AT_FDCWD, "/proc/self/maps",
+                              O_RDONLY | O_CLOEXEC, 0);
+    if (raw_fd < 0) return;
+    FILE *f = fdopen(raw_fd, "r");
+    if (!f) { close(raw_fd); return; }
 
     char line[256];
     int cnt = 0;
