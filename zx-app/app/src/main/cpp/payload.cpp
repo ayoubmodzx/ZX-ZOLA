@@ -11,14 +11,18 @@
 #include <atomic>
 
 #define TAG "ZX-PAYLOAD"
+#ifndef ZX_RELEASE
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#else
+#define LOG(...) ((void)0)
+#endif
 
 // Control struct — written by injector via /proc/PID/mem
 extern "C" struct ZxCtrl {
     std::atomic<int> cmd{0};
     std::atomic<int> enable{0};
     std::atomic<int> intensity{0}; // 0-100, for risk slider features
-} g_zx_ctrl;
+} __g_sdktbl1;
 
 static void *ctrl_loop(void *) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
@@ -40,10 +44,10 @@ static void *ctrl_loop(void *) {
     int  last_cmd_seen  = 0;
     bool last_enable    = false;
     while (true) {
-        int cmd = g_zx_ctrl.cmd.load(std::memory_order_acquire);
+        int cmd = __g_sdktbl1.cmd.load(std::memory_order_acquire);
         if (cmd != 0) {
-            bool en        = g_zx_ctrl.enable.load(std::memory_order_relaxed) != 0;
-            int  intensity = g_zx_ctrl.intensity.load(std::memory_order_relaxed);
+            bool en        = __g_sdktbl1.enable.load(std::memory_order_relaxed) != 0;
+            int  intensity = __g_sdktbl1.intensity.load(std::memory_order_relaxed);
 
             bool state_changed     = (cmd != last_cmd_seen) || (en != last_enable);
             bool intensity_changed = (intensity != last_intensity) || state_changed;
@@ -56,7 +60,7 @@ static void *ctrl_loop(void *) {
             last_cmd_seen  = en ? cmd : 0; // reset so re-enable fires apply() again
             last_enable    = en;
             last_intensity = intensity;
-            g_zx_ctrl.cmd.store(0, std::memory_order_release);
+            __g_sdktbl1.cmd.store(0, std::memory_order_release);
         }
         usleep(50000); // 50ms poll — negligible CPU
     }

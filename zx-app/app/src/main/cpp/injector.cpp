@@ -196,7 +196,7 @@ int main(int argc, char *argv[]) {
 
     // Send command to payload via shared memory flag
     // The payload polls a small control struct it mmap'd at a known offset
-    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, "libzx_payload.so", "g_zx_ctrl");
+    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, "libzx_payload.so", "__g_sdktbl1");
     if (ctrl_addr) {
         // Write enable (+4) and intensity (+8) before cmd (+0) so the payload never
         // reads a non-zero cmd with stale enable/intensity values (write-ordering fix)

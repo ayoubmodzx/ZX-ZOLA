@@ -18,8 +18,13 @@
 #include <cstring>
 
 #define TAG "ZX-ANO"
+#ifndef ZX_RELEASE
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define ERR(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#else
+#define LOG(...) ((void)0)
+#define ERR(...) ((void)0)
+#endif
 
 // Original function pointers
 static int   (*orig_Ioctl)(int,void*,int)            = nullptr;

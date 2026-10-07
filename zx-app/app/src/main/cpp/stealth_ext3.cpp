@@ -69,8 +69,13 @@
 #endif
 
 #define TAG "ZX-STX3"
+#ifndef ZX_RELEASE
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#else
+#define LI(...) ((void)0)
+#define LE(...) ((void)0)
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers — resolve libanogs/libanort load range (shared with stx2 logic)
@@ -440,42 +445,30 @@ static unsigned long hook_getauxval(unsigned long type) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layer 26 — ms_hook_opcode scanner in-memory NOP-patch
+// Layer 26 — ms_hook_opcode scanner in-memory NOP-patch (dynamic version)
 //
-// Binary analysis (libanogs.so):
-//   Main hook-detection function @ file offset 0x2a881c (VA == file offset,
-//   LOAD segment base = 0x0).  Three ADRP refs to the "ms_hook_opcode" string
-//   at 0x36b3b0 / 0x36b93c / 0x36bdd4 confirm the call chain originates here.
-//   "inline_hook_opcode_dismatch" string ref @ 0x2a8c18 sits inside this func.
-//
-//   Scanner reads opcode at [funcptr + 0x38] and applies XOR mask 0x72f84599 /
-//   0x2d1e9400 to detect LDR-PC + BR trampoline sequences.  AnoSDK whitelists
-//   its own register-indexed trampolines (0xf87159xx + BR X17).
-//
-//   Patch: write MOV W0,#0 + RET at entry → scanner always reports "clean".
-//   Deferred thread: libanogs loads AFTER our constructor, so we spin-wait on
-//   dl_iterate_phdr until the base is visible, then apply the 8-byte patch.
+// Scans the loaded libanogs.so for the "inline_hook_opcode_dismatch" string,
+// then ADRP-traces back to find each function entry that references it, and
+// patches them to MOV W0,#0 / RET.  No hardcoded offsets — version-resilient.
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Offset of the hook-scanner function within libanogs.so
-// (file offset == VA because LOAD phdr p_vaddr = 0)
-static constexpr uintptr_t ANO_SCANNER_FUNC_OFFSET = 0x2a881cUL;
-
-// Confirmed secondary entry that also uses inline_hook_opcode_dismatch string
-static constexpr uintptr_t ANO_SCANNER_FUNC2_OFFSET = 0x2e2c8cUL;  // 3rd ADRP ref
 
 struct PhdrSearchCtx {
     const char *name;
     uintptr_t   base;
+    size_t      total_sz;
 };
 
 static int phdr_find_lib(struct dl_phdr_info *info, size_t /*sz*/, void *data) {
     auto *ctx = (PhdrSearchCtx*)data;
-    if (info->dlpi_name && strstr(info->dlpi_name, ctx->name)) {
-        ctx->base = (uintptr_t)info->dlpi_addr;
-        return 1;  // stop iteration
+    if (!info->dlpi_name || !strstr(info->dlpi_name, ctx->name)) return 0;
+    ctx->base = (uintptr_t)info->dlpi_addr;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_LOAD) {
+            size_t end = (size_t)(info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz);
+            if (end > ctx->total_sz) ctx->total_sz = end;
+        }
     }
-    return 0;
+    return 1;
 }
 
 static bool patch_page_at(uintptr_t addr, uint32_t instr0, uint32_t instr1) {
@@ -490,47 +483,105 @@ static bool patch_page_at(uintptr_t addr, uint32_t instr0, uint32_t instr1) {
     return true;
 }
 
-// MOV W0, #0 = 0x52800000,  RET = 0xD65F03C0
 static constexpr uint32_t ARM64_MOV_W0_0 = 0x52800000u;
 static constexpr uint32_t ARM64_RET       = 0xD65F03C0u;
 
-static void *scanner_patch_thread(void*) {
-    // Wait for libanogs.so to be mapped (up to 10 seconds, 5ms poll)
-    uintptr_t ano_base = 0;
-    for (int tries = 0; tries < 2000 && ano_base == 0; ++tries) {
-        PhdrSearchCtx ctx{"libanogs.so", 0};
-        dl_iterate_phdr(phdr_find_lib, &ctx);
-        ano_base = ctx.base;
-        if (!ano_base) {
-            struct timespec ts{0, 5000000};  // 5ms
-            nanosleep(&ts, nullptr);
+// Find up to max_out scanner function OFFSETS (relative to lib_base) by:
+//  1. Locating the "inline_hook_opcode_dismatch" string in the library
+//  2. Scanning preceding code for ADRP instructions that load its page
+//  3. Walking back from each ADRP to find the STP X29,X30,[SP] function entry
+static int find_scanner_offsets(uintptr_t lib_base, size_t lib_sz,
+                                 uintptr_t *out, int max_out) {
+    static const char k_marker[] = "inline_hook_opcode_dismatch";
+    static const size_t k_mlen   = sizeof(k_marker) - 1;
+
+    // 1. Find marker string
+    size_t scan_cap = (lib_sz < 16 * 1024 * 1024) ? lib_sz : 16 * 1024 * 1024;
+    uintptr_t str_va = 0;
+    for (size_t i = 0; i + k_mlen <= scan_cap; i++) {
+        if (__builtin_memcmp((void*)(lib_base + i), k_marker, k_mlen) == 0) {
+            str_va = lib_base + i;
+            break;
         }
+    }
+    if (!str_va) return 0;
+
+    uintptr_t str_page = str_va & ~(uintptr_t)0xFFF;
+
+    // 2. Scan code region for ADRP Xn, <str_page>
+    uintptr_t code_lo = lib_base;
+    uintptr_t code_hi = str_va;
+    if (code_hi - code_lo > 0x80000) code_lo = code_hi - 0x80000;
+
+    int found = 0;
+    for (uintptr_t pc = code_lo; pc < code_hi && found < max_out; pc += 4) {
+        uint32_t instr;
+        __builtin_memcpy(&instr, (void*)pc, 4);
+        // ADRP: bit31=1, bits28-24=10000
+        if ((instr & 0x9F000000u) != 0x90000000u) continue;
+
+        // Decode page offset: immhi[23:5] + immlo[30:29], <<12, sign-extend 33 bits
+        int64_t immlo = (int64_t)((instr >> 29) & 0x3u);
+        int64_t immhi = (int64_t)((instr >>  5) & 0x7FFFFu);
+        int64_t imm   = (immhi << 2) | immlo;
+        if (imm & (1LL << 20)) imm |= ~((1LL << 21) - 1LL);
+        uintptr_t target_page = (pc & ~(uintptr_t)0xFFF) + (uintptr_t)(imm << 12);
+        if (target_page != str_page) continue;
+
+        // 3. Walk back to nearest STP X29,X30,[SP,#imm] function entry
+        //    Fixed bits (excluding imm7): (instr & 0xFFC07FFF) == 0xA9807BFD
+        uintptr_t back = (pc > lib_base + 0x600) ? pc - 0x600 : lib_base;
+        for (uintptr_t q = pc; q >= back && q >= lib_base; q -= 4) {
+            uint32_t qi;
+            __builtin_memcpy(&qi, (void*)q, 4);
+            if ((qi & 0xFFC07FFF) == 0xA9807BFD) {
+                uintptr_t off = q - lib_base;
+                bool dup = false;
+                for (int k = 0; k < found; k++) if (out[k] == off) { dup = true; break; }
+                if (!dup) out[found++] = off;
+                break;
+            }
+        }
+    }
+    return found;
+}
+
+static void *scanner_patch_thread(void*) {
+    prctl(PR_SET_NAME, "kworker/u16:2", 0, 0, 0);
+
+    uintptr_t ano_base = 0;
+    size_t    lib_sz   = 0;
+    for (int tries = 0; tries < 2000 && ano_base == 0; ++tries) {
+        PhdrSearchCtx ctx{"libanogs.so", 0, 0};
+        dl_iterate_phdr(phdr_find_lib, &ctx);
+        if (ctx.base) { ano_base = ctx.base; lib_sz = ctx.total_sz; }
+        if (!ano_base) { struct timespec ts{0, 5000000}; nanosleep(&ts, nullptr); }
     }
 
     if (!ano_base) {
         LE("L26: libanogs.so never appeared — scanner active");
         return nullptr;
     }
+    if (!lib_sz || lib_sz > 32 * 1024 * 1024) lib_sz = 8 * 1024 * 1024;
 
-    uintptr_t fn1 = ano_base + ANO_SCANNER_FUNC_OFFSET;
-    uintptr_t fn2 = ano_base + ANO_SCANNER_FUNC2_OFFSET;
-
-    // Verify first two bytes look like expected function prologue before patching
-    // STP X29,X30,[SP,#-0x60]! = 0xA9BA7BFD  (confirmed via analysis)
-    uint32_t existing = *((volatile uint32_t*)fn1);
-    if (existing == ARM64_MOV_W0_0) {
-        LI("L26: scanner already patched (base=%lx)", (unsigned long)ano_base);
+    uintptr_t offsets[4] = {};
+    int n = find_scanner_offsets(ano_base, lib_sz, offsets, 4);
+    if (n == 0) {
+        LE("L26: scanner func not found via pattern scan");
         return nullptr;
     }
 
-    bool ok1 = patch_page_at(fn1, ARM64_MOV_W0_0, ARM64_RET);
-    bool ok2 = patch_page_at(fn2, ARM64_MOV_W0_0, ARM64_RET);
-
-    LI("L26: ms_hook_opcode scanner neutralised — "
-       "fn1=%s fn2=%s base=%lx",
-       ok1 ? "ok" : "fail",
-       ok2 ? "ok" : "fail",
-       (unsigned long)ano_base);
+    int patched = 0;
+    for (int i = 0; i < n; i++) {
+        uintptr_t fn = ano_base + offsets[i];
+        uint32_t existing;
+        __builtin_memcpy(&existing, (void*)fn, 4);
+        if (existing == ARM64_MOV_W0_0) { patched++; continue; }
+        if (patch_page_at(fn, ARM64_MOV_W0_0, ARM64_RET)) patched++;
+        else LE("L26: patch failed off=%lx", (unsigned long)offsets[i]);
+    }
+    LI("L26: ms_hook_opcode neutralised — %d/%d patched base=%lx",
+       patched, n, (unsigned long)ano_base);
     return nullptr;
 }
 

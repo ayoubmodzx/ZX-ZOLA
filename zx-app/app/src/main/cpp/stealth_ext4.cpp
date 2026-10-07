@@ -51,8 +51,13 @@
 #include <link.h>
 
 #define TAG "ZX-STH4"
+#ifndef ZX_RELEASE
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#else
+#define LI(...) ((void)0)
+#define LE(...) ((void)0)
+#endif
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer 27 — clock_gettime CLOCK_BOOTTIME / CLOCK_MONOTONIC_RAW spoof

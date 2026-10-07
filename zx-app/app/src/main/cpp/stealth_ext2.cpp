@@ -35,8 +35,13 @@
 #include <atomic>
 
 #define TAG "ZX-STX2"
+#ifndef ZX_RELEASE
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#else
+#define LI(...) ((void)0)
+#define LE(...) ((void)0)
+#endif
 
 // ARM64 syscall numbers
 #ifndef __NR_ptrace
