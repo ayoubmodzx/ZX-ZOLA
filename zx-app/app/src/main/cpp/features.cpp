@@ -400,106 +400,6 @@ static void hookAntiDamage() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HEAD bone fix: override the hit-bone ID at damage-processing level.
-//
-// Writing boneIndex to AimController only moves the magnetism target visually.
-// The game's hit registration picks the bone from the PhysicsRaycastHit normal
-// (which body part the bullet actually grazed). To guarantee the damage engine
-// records a headshot we must intercept the hit-processing call and clamp the
-// bone argument to HEAD (Unity HumanBodyBones.Head = 5) whenever HEAD mode is on.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Signature covers the most common patterns seen in FF IL2CPP builds:
-//   OnBulletHit(self, hitContext, boneId, damage, extra?)
-// We intercept all overloads via separate typed wrappers so we match any arity.
-
-static constexpr int kHumanBoneHead = 5; // Unity HumanBodyBones.Head
-
-// 5-arg variant: (self, ctx, bone, dmg, extra)
-using FnHit5 = void(*)(void*, void*, int, float, void*);
-static FnHit5 g_origHit5 = nullptr;
-static void hookHit5(void *self, void *ctx, int bone, float dmg, void *extra) {
-    if (g_aimEnabled && g_aimBone.load(std::memory_order_relaxed) == 2)
-        bone = kHumanBoneHead;
-    if (g_origHit5) g_origHit5(self, ctx, bone, dmg, extra);
-}
-
-// 4-arg variant: (self, ctx, bone, dmg)
-using FnHit4 = void(*)(void*, void*, int, float);
-static FnHit4 g_origHit4 = nullptr;
-static void hookHit4(void *self, void *ctx, int bone, float dmg) {
-    if (g_aimEnabled && g_aimBone.load(std::memory_order_relaxed) == 2)
-        bone = kHumanBoneHead;
-    if (g_origHit4) g_origHit4(self, ctx, bone, dmg);
-}
-
-// 3-arg variant: (self, bone, dmg)
-using FnHit3 = void(*)(void*, int, float);
-static FnHit3 g_origHit3 = nullptr;
-static void hookHit3(void *self, int bone, float dmg) {
-    if (g_aimEnabled && g_aimBone.load(std::memory_order_relaxed) == 2)
-        bone = kHumanBoneHead;
-    if (g_origHit3) g_origHit3(self, bone, dmg);
-}
-
-static bool g_headBoneHooked = false;
-
-static void hookHeadBoneFix() {
-    // Candidate (class, method) pairs — searched in order, first match wins.
-    // Free Fire builds are partially obfuscated but these class/method names
-    // have stayed stable across multiple patches.
-    static const struct { const char *cls; const char *meth; } kTargets[] = {
-        {"CSPlayerState",    "OnBulletHit"},
-        {"CSPlayerState",    "ProcessHit"},
-        {"CSPlayerState",    "TakeHit"},
-        {"CSPlayerState",    "OnBulletHitBody"},
-        {"BulletHitHandler", "Process"},
-        {"BulletHitHandler", "OnHit"},
-        {"HitProcessor",     "OnHit"},
-        {"HitProcessor",     "Process"},
-        {"DamageReceiver",   "OnHit"},
-        {"DamageReceiver",   "ProcessHit"},
-        {"PlayerDamage",     "OnReceiveDamage"},
-        {"PlayerDamage",     "ApplyDamage"},
-        {"BodyPartDamage",   "OnHit"},
-        {nullptr, nullptr}
-    };
-
-    for (int i = 0; kTargets[i].cls; i++) {
-        Il2CppClass *c = Il2Cpp::cls(kTargets[i].cls);
-        if (!c) continue;
-
-        // Try to find the method; -1 for parameter count = match any arity
-        MethodInfo *m = Il2Cpp::getMethod(c, kTargets[i].meth, -1);
-        if (!m || !m->methodPointer) continue;
-
-        // parameters_count does NOT include implicit `this`. Pick closest wrapper.
-        uint32_t pcount = m->parameters_count;
-        bool ok = false;
-        void *orig = nullptr;
-
-        if (pcount >= 4) {       // self + ctx + bone + dmg + [extra]
-            ok = DobbyHook(m->methodPointer, (void*)hookHit5, &orig) == 0;
-            g_origHit5 = (FnHit5)orig;
-        } else if (pcount == 3) { // self + ctx + bone + dmg
-            ok = DobbyHook(m->methodPointer, (void*)hookHit4, &orig) == 0;
-            g_origHit4 = (FnHit4)orig;
-        } else {                  // self + bone + dmg
-            ok = DobbyHook(m->methodPointer, (void*)hookHit3, &orig) == 0;
-            g_origHit3 = (FnHit3)orig;
-        }
-
-        if (ok) {
-            g_headBoneHooked = true;
-            LOG("HEAD bone fix hooked: %s::%s arity=%u @ %p",
-                kTargets[i].cls, kTargets[i].meth, pcount, m->methodPointer);
-            return;
-        }
-    }
-    LOG("HEAD bone fix: no suitable hit method found — fallback: bone-index write only");
-}
-
 static void hookRiskFeatures() {
     discoverRiskClasses();
     if (g_risk.playerMove) {
@@ -542,7 +442,6 @@ void Features::init() {
     hookWeaponFire();
     hookRiskFeatures();
     hookAimSystem();
-    hookHeadBoneFix();
     hookNoGrass();
     hookAntiDamage();
 }
