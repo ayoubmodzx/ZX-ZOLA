@@ -19,11 +19,15 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install NDK r25c
-        run: sdkmanager "ndk;25.2.9519653"
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager | head -1)
+          fi
+          echo "y" | "$SDKMANAGER" "ndk;25.2.9519653" --sdk_root="$ANDROID_SDK_ROOT"
+          echo "sdk.dir=$ANDROID_SDK_ROOT"   > zx-app/local.properties
+          echo "ndk.dir=$ANDROID_SDK_ROOT/ndk/25.2.9519653" >> zx-app/local.properties
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -39,9 +43,7 @@ jobs:
 
       - name: Build Debug APK
         working-directory: zx-app
-        run: ./gradlew assembleDebug --no-daemon
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
