@@ -42,6 +42,16 @@ static std::atomic<bool>  g_noSpread{false};
 static std::atomic<bool>  g_rapidFire{false};
 static std::atomic<float> g_fovOverride{0.f};
 
+// Risk feature state
+static std::atomic<bool>  g_speedHack{false};
+static std::atomic<float> g_speedMult{1.f};      // 1.0 = normal, up to 3.0
+static std::atomic<bool>  g_highJump{false};
+static std::atomic<float> g_jumpMult{1.f};
+static std::atomic<bool>  g_vehicleSpeed{false};
+static std::atomic<float> g_vehicleMult{1.f};
+static std::atomic<bool>  g_rapidFireRisk{false};
+static std::atomic<float> g_rapidIntensity{0.02f}; // fire interval: lower = faster
+
 static void *g_origFireMethod = nullptr;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -158,8 +168,92 @@ static void hookFireWeapon(void *self, void *a, void *b) {
         Il2Cpp::writeField<float>(self, g_cls.offSpread, 0.f);
     if (g_rapidFire && g_cls.offFireRate > 0)
         Il2Cpp::writeField<float>(self, g_cls.offFireRate, 0.02f);
+    if (g_rapidFireRisk && g_cls.offFireRate > 0)
+        Il2Cpp::writeField<float>(self, g_cls.offFireRate,
+            g_rapidIntensity.load(std::memory_order_relaxed));
     if (!g_origFire) return;
     g_origFire(self, a, b);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Risk: speed + jump hooks via IL2CPP move-speed / jump-force fields
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct RiskClasses {
+    Il2CppClass *playerMove  = nullptr;
+    int32_t offMoveSpeed     = -1;
+    int32_t offJumpForce     = -1;
+    Il2CppClass *vehicleCls  = nullptr;
+    int32_t offVehicleSpeed  = -1;
+};
+static RiskClasses g_risk;
+
+static void discoverRiskClasses() {
+    static const char *kMoveNames[][2] = {
+        {"moveSpeed", "jumpForce"}, {"MoveSpeed", "JumpForce"},
+        {"m_moveSpeed", "m_jumpForce"}, {"speed", "jumpHeight"},
+        {nullptr, nullptr}
+    };
+    for (int i = 0; kMoveNames[i][0] && !g_risk.playerMove; i++) {
+        FieldPattern pat[] = {
+            {kMoveNames[i][0], &g_risk.offMoveSpeed},
+            {kMoveNames[i][1], &g_risk.offJumpForce},
+        };
+        g_risk.playerMove = findClassByFields(pat, 2, "playerMove");
+    }
+
+    static const char *kVeh[][2] = {
+        {"maxSpeed","enginePower"}, {"MaxSpeed","EnginePower"},
+        {"vehicleSpeed","vehicleAccel"}, {nullptr, nullptr}
+    };
+    for (int i = 0; kVeh[i][0] && !g_risk.vehicleCls; i++) {
+        FieldPattern pat[] = {
+            {kVeh[i][0], &g_risk.offVehicleSpeed},
+            {kVeh[i][1], nullptr},
+        };
+        g_risk.vehicleCls = findClassByFields(pat, 2, "vehicleCls");
+    }
+}
+
+using FnMoveUpdate = void(*)(void*);
+static FnMoveUpdate g_origMoveUpdate = nullptr;
+static void hookMoveUpdate(void *self) {
+    if (g_speedHack && g_risk.offMoveSpeed > 0) {
+        float base = Il2Cpp::readField<float>(self, g_risk.offMoveSpeed);
+        float target = base * g_speedMult.load(std::memory_order_relaxed);
+        Il2Cpp::writeField<float>(self, g_risk.offMoveSpeed, target);
+    }
+    if (g_highJump && g_risk.offJumpForce > 0) {
+        float base = Il2Cpp::readField<float>(self, g_risk.offJumpForce);
+        float target = base * g_jumpMult.load(std::memory_order_relaxed);
+        Il2Cpp::writeField<float>(self, g_risk.offJumpForce, target);
+    }
+    if (g_origMoveUpdate) g_origMoveUpdate(self);
+}
+
+static void hookVehicleUpdate(void *self) { // patched in separately
+    if (g_vehicleSpeed && g_risk.offVehicleSpeed > 0) {
+        float base = Il2Cpp::readField<float>(self, g_risk.offVehicleSpeed);
+        Il2Cpp::writeField<float>(self, g_risk.offVehicleSpeed,
+            base * g_vehicleMult.load(std::memory_order_relaxed));
+    }
+}
+
+static void hookRiskFeatures() {
+    discoverRiskClasses();
+    if (g_risk.playerMove) {
+        static const char *kUpd[] = {"Update","FixedUpdate","Move","OnMove",nullptr};
+        for (const char **mn = kUpd; *mn; mn++) {
+            MethodInfo *m = Il2Cpp::getMethod(g_risk.playerMove, *mn, -1);
+            if (m && m->methodPointer) {
+                void *orig = nullptr;
+                DobbyHook(m->methodPointer, (void*)hookMoveUpdate, &orig);
+                g_origMoveUpdate = (FnMoveUpdate)orig;
+                LOG("Hooked move/jump: %s @ %p", *mn, m->methodPointer);
+                break;
+            }
+        }
+    }
 }
 
 static void hookWeaponFire() {
@@ -185,6 +279,7 @@ void Features::init() {
     discoverClasses();
     hookUnityIcalls();
     hookWeaponFire();
+    hookRiskFeatures();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,6 +349,51 @@ void Features::apply(int cmd, bool enable) {
         case CMD_WIDE_POV:        widePov(enable);                 break;
         case CMD_ESP:             ESP::setEnabled(enable);         break;
         case CMD_HEADSHOT_ASSIST: ESP::setHeadshotAssist(enable);  break;
+        case CMD_SPEED_HACK:
+            g_speedHack = enable;
+            if (!enable) g_speedMult.store(1.f, std::memory_order_relaxed);
+            LOG("SpeedHack %s", enable ? "ON" : "OFF");
+            break;
+        case CMD_HIGH_JUMP:
+            g_highJump = enable;
+            if (!enable) g_jumpMult.store(1.f, std::memory_order_relaxed);
+            LOG("HighJump %s", enable ? "ON" : "OFF");
+            break;
+        case CMD_VEHICLE_SPEED:
+            g_vehicleSpeed = enable;
+            if (!enable) g_vehicleMult.store(1.f, std::memory_order_relaxed);
+            LOG("VehicleSpeed %s", enable ? "ON" : "OFF");
+            break;
+        case CMD_RAPID_FIRE_RISK:
+            g_rapidFireRisk = enable;
+            if (!enable) g_rapidIntensity.store(0.02f, std::memory_order_relaxed);
+            LOG("RapidFireRisk %s", enable ? "ON" : "OFF");
+            break;
         default: LOG("Unknown cmd: %d", cmd);
+    }
+}
+
+void Features::applyIntensity(int cmd, int intensity) {
+    // intensity 0-100 → scale feature multiplier
+    float t = intensity / 100.f; // 0.0 to 1.0
+    switch (cmd) {
+        case CMD_SPEED_HACK:
+            // 0% = normal (1.0), 100% = 3x speed
+            g_speedMult.store(1.f + t * 2.f, std::memory_order_relaxed);
+            break;
+        case CMD_HIGH_JUMP:
+            // 0% = normal (1.0), 100% = 4x jump
+            g_jumpMult.store(1.f + t * 3.f, std::memory_order_relaxed);
+            break;
+        case CMD_VEHICLE_SPEED:
+            // 0% = normal (1.0), 100% = 3.5x vehicle speed
+            g_vehicleMult.store(1.f + t * 2.5f, std::memory_order_relaxed);
+            break;
+        case CMD_RAPID_FIRE_RISK:
+            // 0% = stock interval, 100% = near-instant (0.001)
+            // fireRate interval: lower = faster. 0.02 is stock
+            g_rapidIntensity.store(0.02f - t * 0.019f, std::memory_order_relaxed);
+            break;
+        default: break;
     }
 }

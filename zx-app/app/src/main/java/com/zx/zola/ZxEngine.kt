@@ -13,8 +13,10 @@ private const val FF_PKG2 = "com.dts.freefiremax"
 object Cmd {
     const val ANTI_RECOIL    = 1;  const val NO_SPREAD      = 2
     const val RAPID_FIRE     = 3;  const val AIM_ASSIST     = 4
-    const val WIDE_POV       = 5;  const val ESP            = 6
-    const val HEADSHOT_ASSIST= 7
+    const val ESP            = 5;  const val HEADSHOT_ASSIST= 6
+    const val WIDE_POV       = 7;  const val SPEED_HACK     = 8
+    const val HIGH_JUMP      = 9;  const val VEHICLE_SPEED  = 10
+    const val RAPID_FIRE_RISK= 11
 }
 
 object ZxEngine {
@@ -36,8 +38,16 @@ object ZxEngine {
                 Log.e(TAG, "FF not running"); return@launch
             }
             val flag = if (enable) 1 else 0
-            val out  = runRoot("$injPath $pid $cmd $flag $payloadLib")
+            val out  = runRoot("$injPath $pid $cmd $flag $payloadLib 0")
             Log.i(TAG, "toggle cmd=$cmd enable=$enable => $out")
+        }
+    }
+
+    fun setIntensity(cmd: Int, intensity: Int) {
+        scope.launch {
+            val pid = findFfPid() ?: return@launch
+            val out = runRoot("$injPath $pid $cmd 1 $payloadLib $intensity")
+            Log.i(TAG, "intensity cmd=$cmd intensity=$intensity => $out")
         }
     }
 

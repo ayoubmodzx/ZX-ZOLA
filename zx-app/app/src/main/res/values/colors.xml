@@ -15,5 +15,7 @@
     <color name="zx_inactive">#1E1E30</color>
     <color name="zx_border">#1E1E35</color>
     <color name="zx_red">#EF4444</color>
+    <color name="zx_amber">#F59E0B</color>
+    <color name="zx_amber_dim">#3A2800</color>
     <color name="zx_green">#22C55E</color>
 </resources>

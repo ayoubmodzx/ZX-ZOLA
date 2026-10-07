@@ -16,4 +16,19 @@
         <item name="thumbTint">@color/zx_switch_thumb</item>
         <item name="trackTint">@color/zx_switch_track</item>
     </style>
+
+    <!-- Risk slider: amber thumb + track -->
+    <style name="ZxSlider" parent="Widget.Material3.Slider">
+        <item name="thumbColor">@color/zx_amber</item>
+        <item name="trackColorActive">@color/zx_amber</item>
+        <item name="trackColorInactive">@color/zx_text_muted</item>
+        <item name="labelStyle">@style/ZxSliderLabel</item>
+        <item name="thumbRadius">8dp</item>
+        <item name="trackHeight">3dp</item>
+        <item name="haloRadius">16dp</item>
+    </style>
+    <style name="ZxSliderLabel" parent="Widget.Material3.Tooltip">
+        <item name="android:textColor">#FFFFFF</item>
+        <item name="backgroundTint">@color/zx_amber</item>
+    </style>
 </resources>

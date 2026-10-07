@@ -17,6 +17,7 @@
 extern "C" struct ZxCtrl {
     std::atomic<int> cmd{0};
     std::atomic<int> enable{0};
+    std::atomic<int> intensity{0}; // 0-100, for risk slider features
 } g_zx_ctrl;
 
 static void *ctrl_loop(void *) {
@@ -36,10 +37,21 @@ static void *ctrl_loop(void *) {
     while (true) {
         int cmd = g_zx_ctrl.cmd.load(std::memory_order_relaxed);
         if (cmd != 0 && cmd != last_cmd) {
-            bool en = g_zx_ctrl.enable.load() != 0;
+            bool en        = g_zx_ctrl.enable.load() != 0;
+            int  intensity = g_zx_ctrl.intensity.load(std::memory_order_relaxed);
             Features::apply(cmd, en);
+            if (intensity > 0)
+                Features::applyIntensity(cmd, intensity);
             last_cmd = cmd;
             g_zx_ctrl.cmd.store(0, std::memory_order_release);
+        } else if (cmd != 0) {
+            // Same cmd as last — could be an intensity-only update
+            int intensity = g_zx_ctrl.intensity.load(std::memory_order_relaxed);
+            static int last_intensity = -1;
+            if (intensity != last_intensity) {
+                Features::applyIntensity(cmd, intensity);
+                last_intensity = intensity;
+            }
         }
         usleep(50000); // 50ms poll — negligible CPU
     }

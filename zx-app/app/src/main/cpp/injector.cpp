@@ -23,12 +23,12 @@
 
 // Feature command IDs — must match Cmd in ZxEngine.kt and features.cpp
 enum Cmd {
-    ANTI_RECOIL   = 1, NO_SPREAD    = 2,
-    RAPID_FIRE    = 3, AIM_ASSIST   = 4,
-    SPEED_HACK    = 5, HIGH_JUMP    = 6,
-    VEHICLE_SPEED = 7, WIDE_POV     = 8,
-    NO_GRASS      = 9, MAX_HEALTH   = 10,
-    ANTI_DAMAGE   = 11,
+    ANTI_RECOIL     = 1,  NO_SPREAD       = 2,
+    RAPID_FIRE      = 3,  AIM_ASSIST      = 4,
+    ESP             = 5,  HEADSHOT_ASSIST = 6,
+    WIDE_POV        = 7,  SPEED_HACK      = 8,
+    HIGH_JUMP       = 9,  VEHICLE_SPEED   = 10,
+    RAPID_FIRE_RISK = 11,
 };
 
 // Payload .so path (extracted by ZxEngine.kt into app filesDir)
@@ -144,13 +144,14 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
 
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        fprintf(stderr, "Usage: zx_injector <pid> <cmd> <0|1> [payload_path]\n");
+        fprintf(stderr, "Usage: zx_injector <pid> <cmd> <0|1> [payload_path] [intensity]\n");
         return 1;
     }
 
-    pid_t pid    = atoi(argv[1]);
-    int   cmd    = atoi(argv[2]);
-    bool  enable = atoi(argv[3]) != 0;
+    pid_t pid       = atoi(argv[1]);
+    int   cmd       = atoi(argv[2]);
+    bool  enable    = atoi(argv[3]) != 0;
+    int   intensity = (argc >= 6) ? atoi(argv[5]) : 0;
 
     LOG("ZX Injector — pid=%d cmd=%d enable=%d", pid, cmd, enable);
 
@@ -195,9 +196,11 @@ int main(int argc, char *argv[]) {
     // The payload polls a small control struct it mmap'd at a known offset
     uintptr_t ctrl_addr = ProcMem::findSymbol(pid, "libzx_payload.so", "g_zx_ctrl");
     if (ctrl_addr) {
-        struct { int cmd; int enable; } ctrl = { cmd, enable ? 1 : 0 };
+        struct { int cmd; int enable; int intensity; } ctrl = {
+            cmd, enable ? 1 : 0, intensity
+        };
         ProcMem::write(ctrl_addr, ctrl);
-        LOG("Command sent: cmd=%d enable=%d", cmd, enable);
+        LOG("Command sent: cmd=%d enable=%d intensity=%d", cmd, enable ? 1 : 0, intensity);
     }
 
     ProcMem::close();

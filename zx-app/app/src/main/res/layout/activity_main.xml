@@ -317,6 +317,277 @@
             </LinearLayout>
         </LinearLayout>
 
+        <!-- ══ RISK SECTION ══════════════════════════════════════════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:text="  RISK ZONE"
+                android:textColor="@color/zx_amber"
+                android:textSize="10sp"
+                android:letterSpacing="0.5"
+                android:textStyle="bold"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"/>
+
+            <TextView
+                android:text="⚠ HIGH RISK"
+                android:textColor="@color/zx_amber"
+                android:textSize="9sp"
+                android:letterSpacing="0.2"
+                android:background="@drawable/bg_risk_badge"
+                android:paddingStart="7dp"
+                android:paddingEnd="7dp"
+                android:paddingTop="3dp"
+                android:paddingBottom="3dp"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"/>
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_card_risk"
+            android:layout_marginBottom="24dp">
+
+            <!-- ── Speed Hack ── -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_speed"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <LinearLayout android:layout_width="wrap_content" android:layout_height="wrap_content" android:orientation="horizontal" android:gravity="center_vertical">
+                        <TextView android:text="Speed Hack" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                        <TextView android:text=" HIGH RISK" android:textColor="@color/zx_amber" android:textSize="9sp" android:layout_width="wrap_content" android:layout_height="wrap_content" android:layout_marginStart="6dp"/>
+                    </LinearLayout>
+                    <TextView android:text="Player movement multiplier" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_speed_hack"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+            <!-- Speed slider row (hidden by default) -->
+            <LinearLayout
+                android:id="@+id/row_speed_slider"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="52dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="10dp"
+                android:visibility="gone">
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/sl_speed"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:valueFrom="0"
+                    android:valueTo="100"
+                    android:value="15"
+                    android:stepSize="1"
+                    style="@style/ZxSlider"/>
+                <TextView
+                    android:id="@+id/tv_speed_val"
+                    android:text="15%"
+                    android:textColor="@color/zx_amber"
+                    android:textSize="11sp"
+                    android:textStyle="bold"
+                    android:fontFamily="monospace"
+                    android:layout_width="36dp"
+                    android:layout_height="wrap_content"
+                    android:gravity="end"/>
+            </LinearLayout>
+
+            <View android:layout_width="match_parent" android:layout_height="1dp" android:background="#1AF59E0B" android:marginStart="54dp"/>
+
+            <!-- ── Rapid Fire Intensity ── -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_zx"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="Rapid Fire Rate" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Fire rate intensity boost" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_rapid_fire_risk"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+            <LinearLayout
+                android:id="@+id/row_rapid_slider"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="52dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="10dp"
+                android:visibility="gone">
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/sl_rapid"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:valueFrom="0"
+                    android:valueTo="100"
+                    android:value="50"
+                    android:stepSize="1"
+                    style="@style/ZxSlider"/>
+                <TextView
+                    android:id="@+id/tv_rapid_val"
+                    android:text="50%"
+                    android:textColor="@color/zx_amber"
+                    android:textSize="11sp"
+                    android:textStyle="bold"
+                    android:fontFamily="monospace"
+                    android:layout_width="36dp"
+                    android:layout_height="wrap_content"
+                    android:gravity="end"/>
+            </LinearLayout>
+
+            <View android:layout_width="match_parent" android:layout_height="1dp" android:background="#1AF59E0B" android:marginStart="54dp"/>
+
+            <!-- ── Vehicle Speed ── -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_speed"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="Vehicle Speed" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Vehicle movement multiplier" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_vehicle_speed"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+            <LinearLayout
+                android:id="@+id/row_vehicle_slider"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="52dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="10dp"
+                android:visibility="gone">
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/sl_vehicle"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:valueFrom="0"
+                    android:valueTo="100"
+                    android:value="30"
+                    android:stepSize="1"
+                    style="@style/ZxSlider"/>
+                <TextView
+                    android:id="@+id/tv_vehicle_val"
+                    android:text="30%"
+                    android:textColor="@color/zx_amber"
+                    android:textSize="11sp"
+                    android:textStyle="bold"
+                    android:fontFamily="monospace"
+                    android:layout_width="36dp"
+                    android:layout_height="wrap_content"
+                    android:gravity="end"/>
+            </LinearLayout>
+
+            <View android:layout_width="match_parent" android:layout_height="1dp" android:background="#1AF59E0B" android:marginStart="54dp"/>
+
+            <!-- ── High Jump ── -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_aim"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="High Jump" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Jump height multiplier" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_high_jump"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+            <LinearLayout
+                android:id="@+id/row_jump_slider"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="52dp"
+                android:paddingEnd="14dp"
+                android:paddingBottom="10dp"
+                android:visibility="gone">
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/sl_jump"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:valueFrom="0"
+                    android:valueTo="100"
+                    android:value="40"
+                    android:stepSize="1"
+                    style="@style/ZxSlider"/>
+                <TextView
+                    android:id="@+id/tv_jump_val"
+                    android:text="40%"
+                    android:textColor="@color/zx_amber"
+                    android:textSize="11sp"
+                    android:textStyle="bold"
+                    android:fontFamily="monospace"
+                    android:layout_width="36dp"
+                    android:layout_height="wrap_content"
+                    android:gravity="end"/>
+            </LinearLayout>
+
+        </LinearLayout>
+
         <!-- ══ ACTION BUTTONS ══════════════════════════════════════════════ -->
         <Button
             android:id="@+id/btn_activate"
