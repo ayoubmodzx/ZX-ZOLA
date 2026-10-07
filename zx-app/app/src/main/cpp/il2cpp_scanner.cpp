@@ -4,6 +4,7 @@
 #include <android/log.h>
 #include <unordered_map>
 #include <string>
+#include <pthread.h>
 
 #define TAG "ZX-IL2"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -40,6 +41,7 @@ static Il2CppObject* (*p_object_new)(Il2CppClass*)                              
 static Il2CppImage *g_img    = nullptr;
 static Il2CppImage *g_unity  = nullptr;  // UnityEngine.CoreModule
 static std::unordered_map<std::string, Il2CppClass*> g_cls_cache;
+static pthread_mutex_t g_cls_mu = PTHREAD_MUTEX_INITIALIZER;
 
 // ── bind macro ───────────────────────────────────────────────────────────────
 
@@ -79,8 +81,10 @@ bool Il2Cpp::init() {
     BIND_OPT(p_object_new,    "il2cpp_object_new")
 
     Il2CppDomain *dom = p_domain_get();
+    if (!dom) { ERR("il2cpp domain not ready"); return false; }
     size_t n = 0;
     const Il2CppAssembly **asms = p_domain_assemblies(dom, &n);
+    if (!asms) { ERR("no assemblies"); return false; }
 
     for (size_t i = 0; i < n; i++) {
         Il2CppImage *img = p_asm_image(asms[i]);
@@ -101,14 +105,29 @@ bool Il2Cpp::init() {
 Il2CppImage *Il2Cpp::mainImage() { return g_img; }
 
 Il2CppClass *Il2Cpp::cls(const char *name, const char *ns) {
+    if (!ns) ns = "";
     std::string key = std::string(ns) + "::" + name;
+
+    pthread_mutex_lock(&g_cls_mu);
     auto it = g_cls_cache.find(key);
-    if (it != g_cls_cache.end()) return it->second;
+    if (it != g_cls_cache.end()) {
+        Il2CppClass *cached = it->second;
+        pthread_mutex_unlock(&g_cls_mu);
+        return cached;
+    }
+    pthread_mutex_unlock(&g_cls_mu);
+
     if (!g_img || !p_class_from_name) return nullptr;
     Il2CppClass *c = p_class_from_name(g_img, ns, name);
     if (!c && g_unity) c = p_class_from_name(g_unity, ns, name);
-    if (c) g_cls_cache[key] = c;
-    else ERR("class not found: %s::%s", ns, name);
+
+    if (c) {
+        pthread_mutex_lock(&g_cls_mu);
+        g_cls_cache[key] = c;
+        pthread_mutex_unlock(&g_cls_mu);
+    } else {
+        ERR("class not found: %s::%s", ns, name);
+    }
     return c;
 }
 
@@ -180,5 +199,7 @@ Il2CppObject *Il2Cpp::findObject(Il2CppClass *klass) {
 Il2CppObject *Il2Cpp::invoke0(MethodInfo *m, Il2CppObject *obj) {
     if (!m || !p_runtime_invoke) return nullptr;
     void *exc = nullptr;
-    return p_runtime_invoke(m, obj, nullptr, &exc);
+    Il2CppObject *result = p_runtime_invoke(m, obj, nullptr, &exc);
+    if (exc) { ERR("invoke0 exception on %s", m->name ? m->name : "?"); return nullptr; }
+    return result;
 }

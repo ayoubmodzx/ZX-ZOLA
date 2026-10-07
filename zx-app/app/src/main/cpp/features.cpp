@@ -158,6 +158,7 @@ static void hookFireWeapon(void *self, void *a, void *b) {
         Il2Cpp::writeField<float>(self, g_cls.offSpread, 0.f);
     if (g_rapidFire && g_cls.offFireRate > 0)
         Il2Cpp::writeField<float>(self, g_cls.offFireRate, 0.02f);
+    if (!g_origFire) return;
     g_origFire(self, a, b);
 }
 
@@ -192,42 +193,19 @@ void Features::init() {
 
 static void antiRecoil(bool on) {
     g_noRecoil = on;
-    if (g_cls.weaponFire) {
-        static const char *kH[] = {"recoilX","recoilH","kickH","m_recoilH",nullptr};
-        static const char *kV[] = {"recoilY","recoilV","kickV","m_recoilV",nullptr};
-        for (const char **n = kH; *n; n++) {
-            FieldInfo *f = Il2Cpp::getField(g_cls.weaponFire, *n);
-            if (f) { Il2Cpp::setStaticFloat(f, on ? 0.f : 1.f); break; }
-        }
-        for (const char **n = kV; *n; n++) {
-            FieldInfo *f = Il2Cpp::getField(g_cls.weaponFire, *n);
-            if (f) { Il2Cpp::setStaticFloat(f, on ? 0.f : 1.f); break; }
-        }
-    }
+    // hookFireWeapon writes correct per-instance offsets on every fire event.
+    // setStaticFloat on these fields is wrong (they are instance fields) and
+    // triggers IL2CPP metadata mismatch detectable by anti-cheat.
     LOG("AntiRecoil %s", on ? "ON" : "OFF");
 }
 
 static void noSpread(bool on) {
     g_noSpread = on;
-    if (g_cls.weaponFire) {
-        static const char *kS[] = {"spread","Spread","bulletSpread","disperseAngle",nullptr};
-        for (const char **n = kS; *n; n++) {
-            FieldInfo *f = Il2Cpp::getField(g_cls.weaponFire, *n);
-            if (f) { Il2Cpp::setStaticFloat(f, on ? 0.f : 1.f); break; }
-        }
-    }
     LOG("NoSpread %s", on ? "ON" : "OFF");
 }
 
 static void rapidFire(bool on) {
     g_rapidFire = on;
-    if (g_cls.weaponFire) {
-        static const char *kR[] = {"fireRate","FireRate","fireInterval","m_fireRate",nullptr};
-        for (const char **n = kR; *n; n++) {
-            FieldInfo *f = Il2Cpp::getField(g_cls.weaponFire, *n);
-            if (f) { Il2Cpp::setStaticFloat(f, on ? 0.01f : 0.3f); break; }
-        }
-    }
     LOG("RapidFire %s", on ? "ON" : "OFF");
 }
 
@@ -263,7 +241,10 @@ static void widePov(bool on) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void Features::apply(int cmd, bool enable) {
-    if (!g_cls.ready) Features::init();
+    static std::atomic<bool> g_init_done{false};
+    if (!g_init_done.exchange(true)) {
+        Features::init();
+    }
 
     switch (cmd) {
         case CMD_ANTI_RECOIL:     antiRecoil(enable);              break;

@@ -26,6 +26,7 @@
 #include "stealth_ext.hpp"
 #include "stealth_ext2.hpp"
 #include "stealth_ext3.hpp"
+#include "stealth_ext4.hpp"
 #include "dobby_stub.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
@@ -478,7 +479,8 @@ void AntiDetect::install() {
     // Layer 6 (string obfuscation) is passive — compile-time only
     install_stealth_ext();      // Layers 7-12
     install_stealth_ext2();     // Layers 13-17
-    install_stealth_ext3();     // Layers 18-25
+    install_stealth_ext3();     // Layers 18-26
+    install_stealth_ext4();     // Layers 27-42
 
-    LI("AntiDetect: all 25 layers active");
+    LI("AntiDetect: all 42 layers active");
 }

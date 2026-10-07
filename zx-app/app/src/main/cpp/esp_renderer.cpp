@@ -131,21 +131,24 @@ static bool w2s(void *cam, Vec3 world, Vec2 &out) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static inline Vec2 ndc(float sx, float sy) {
-    return { (sx / (float)g_sw) * 2.f - 1.f,
-             1.f - (sy / (float)g_sh) * 2.f };
+    float sw = (g_sw > 0) ? (float)g_sw : 1.f;
+    float sh = (g_sh > 0) ? (float)g_sh : 1.f;
+    return { (sx / sw) * 2.f - 1.f,
+             1.f - (sy / sh) * 2.f };
 }
 
 static void draw_line_neon(Vec2 a, Vec2 b, Color col) {
     if (!g_glBegin || !g_glEnd || !g_glVertex3 || !g_glColor) return;
 
-    static const float widths[3]  = { 5.f, 3.f, 1.5f };
-    static const float alphas[3]  = { 0.10f, 0.30f, 1.0f };
+    // GLES3 only mandates lineWidth = 1.0; any other value generates
+    // GL_INVALID_VALUE which anti-cheat GL error polling can detect.
+    // Simulate glow by drawing 3 alpha passes at width 1.0 with additive blending.
+    static const float alphas[3] = { 0.10f, 0.30f, 1.0f };
 
     Vec2 an = ndc(a.x, a.y);
     Vec2 bn = ndc(b.x, b.y);
 
     for (int p = 0; p < 3; p++) {
-        glLineWidth(widths[p]);
         Color c = { col.r, col.g, col.b, col.a * alphas[p] };
         g_glColor(&c);
         g_glBegin(UNITY_GL_LINES);
@@ -261,68 +264,80 @@ static void hook_OnPostRender(void *cam) {
     if (g_origOnPostRender) g_origOnPostRender(cam);
     if (!g_esp_on.load(std::memory_order_relaxed)) return;
 
-    // Refresh screen size
-    if (g_getW) g_sw = g_getW();
-    if (g_getH) g_sh = g_getH();
+    // Refresh screen size — guard against 0 during early frames
+    if (g_getW) { int w = g_getW(); if (w > 0) g_sw = w; }
+    if (g_getH) { int h = g_getH(); if (h > 0) g_sh = h; }
 
     // Save GL state
     GlSave saved;
     gl_save(saved);
 
+    // All 3 matrix icalls must be available — partial state corrupts Unity's GL stack
+    if (!g_glPush || !g_glOrtho || !g_glPop) goto skip_draw;
+
     // Setup for transparent overdraw
-    glDisable(GL_DEPTH_TEST);   // see through walls — key for wallhack
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);  // additive = real neon glow look
 
-    // Enter Unity 2D ortho space
-    if (g_glPush) g_glPush();
-    if (g_glOrtho) g_glOrtho();
+    // Enter Unity 2D ortho space — Push BEFORE disabling depth test so Unity
+    // shadow state stays consistent with raw GL state we are about to change.
+    g_glPush();
+    g_glOrtho();
 
-    // Read cached enemies
-    pthread_mutex_lock(&g_mu);
-    EnemyData snap[MAX_ENM];
-    int n = g_cache_n;
-    memcpy(snap, g_cache, sizeof(EnemyData) * (size_t)n);
-    pthread_mutex_unlock(&g_mu);
+    // Disable depth test AFTER Unity's PushMatrix so Unity can see the state change
+    glDisable(GL_DEPTH_TEST);
 
-    for (int i = 0; i < n; i++) {
-        const EnemyData &e = snap[i];
-        if (!e.valid) continue;
+    {
+        // Read cached enemies
+        pthread_mutex_lock(&g_mu);
+        EnemyData snap[MAX_ENM];
+        int n = g_cache_n;
+        memcpy(snap, g_cache, sizeof(EnemyData) * (size_t)n);
+        pthread_mutex_unlock(&g_mu);
 
-        Vec2 head_s, feet_s;
-        bool has_head  = w2s(cam, e.head,  head_s);
-        bool has_feet  = w2s(cam, e.lfoot, feet_s);
-        if (!has_head && !has_feet) continue;
+        for (int i = 0; i < n; i++) {
+            const EnemyData &e = snap[i];
+            if (!e.valid) continue;
 
-        // Distance-based color:
-        //   <30m  → bright red neon
-        //   30-80m → orange neon
-        //   >80m  → cyan neon
-        Color box_col;
-        if (e.dist < 30.f)       box_col = { 1.0f, 0.15f, 0.15f, 1.0f }; // red
-        else if (e.dist < 80.f)  box_col = { 1.0f, 0.55f, 0.0f,  1.0f }; // orange
-        else                     box_col = { 0.0f, 0.95f, 1.0f,  1.0f }; // cyan
+            Vec2 head_s, feet_s;
+            bool has_head  = w2s(cam, e.head,  head_s);
+            bool has_feet  = w2s(cam, e.lfoot, feet_s);
+            if (!has_head && !has_feet) continue;
 
-        // Full outline box around body (ZOLAM style — solid rectangle with neon glow)
-        if (has_head && has_feet) {
-            float box_w = fabsf(feet_s.y - head_s.y) * 0.38f;
-            Vec2 tl = { head_s.x - box_w, head_s.y - 4.f };
-            Vec2 br = { head_s.x + box_w, feet_s.y + 4.f };
-            draw_box_neon(tl, br, box_col);
+            // Distance-based color:
+            //   <30m  → bright red neon
+            //   30-80m → orange neon
+            //   >80m  → cyan neon
+            Color box_col;
+            if (e.dist < 30.f)       box_col = { 1.0f, 0.15f, 0.15f, 1.0f }; // red
+            else if (e.dist < 80.f)  box_col = { 1.0f, 0.55f, 0.0f,  1.0f }; // orange
+            else                     box_col = { 0.0f, 0.95f, 1.0f,  1.0f }; // cyan
+
+            // Full outline box around body (ZOLAM style — solid rectangle with neon glow)
+            if (has_head && has_feet) {
+                float box_w = fabsf(feet_s.y - head_s.y) * 0.38f;
+                Vec2 tl = { head_s.x - box_w, head_s.y - 4.f };
+                Vec2 br = { head_s.x + box_w, feet_s.y + 4.f };
+                draw_box_neon(tl, br, box_col);
+            }
+
+            // Skeleton
+            draw_skeleton(cam, e);
+
+            // Headshot target indicator (shown only when headshot assist is on)
+            if (g_hs_on.load(std::memory_order_relaxed) && has_head) {
+                Color hs_col = { 1.0f, 1.0f, 0.0f, 1.0f }; // yellow crosshair on head
+                draw_head_dot(head_s, 6.f, hs_col);
+            }
         }
 
-        // Skeleton
-        draw_skeleton(cam, e);
-
-        // Headshot target indicator (shown only when headshot assist is on)
-        if (g_hs_on.load(std::memory_order_relaxed) && has_head) {
-            Color hs_col = { 1.0f, 1.0f, 0.0f, 1.0f }; // yellow crosshair on head
-            draw_head_dot(head_s, 6.f, hs_col);
-        }
+        // Update headshot assist target using current valid camera
+        update_hs_target(cam);
     }
 
-    if (g_glPop) g_glPop();
+    g_glPop();
 
+skip_draw:
     // Restore exactly what was there before we touched anything
     gl_restore(saved);
 }
@@ -504,6 +519,9 @@ bool ESP::hasHeadTarget()  { return g_hs_target_valid.load(); }
 // ─────────────────────────────────────────────────────────────────────────────
 
 void ESP::init() {
+    static std::atomic<bool> s_done{false};
+    if (s_done.exchange(true)) return;
+
     void *lib = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD);
     if (!lib) { LE("libil2cpp not loaded"); return; }
 
