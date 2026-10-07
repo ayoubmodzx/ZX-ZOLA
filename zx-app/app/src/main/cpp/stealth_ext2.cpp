@@ -267,7 +267,6 @@ static pid_t hook_fork() {
     ensure_ranges();
     uintptr_t ra = (uintptr_t)__builtin_return_address(0);
     if (caller_in_ano(ra)) {
-        LI("L14 blocked fork() caller=%p", (void*)ra);
         errno = EPERM;
         return (pid_t)-1;
     }

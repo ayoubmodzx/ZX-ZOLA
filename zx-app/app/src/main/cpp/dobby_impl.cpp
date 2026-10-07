@@ -19,8 +19,13 @@
 #include <mutex>
 
 #define DTAG "ZX-HOOK"
+#if defined(ZX_DEBUG_HOOK)
 #define DI(...) __android_log_print(ANDROID_LOG_INFO,  DTAG, __VA_ARGS__)
 #define DE(...) __android_log_print(ANDROID_LOG_ERROR, DTAG, __VA_ARGS__)
+#else
+#define DI(...) ((void)0)
+#define DE(...) ((void)0)
+#endif
 
 // ── ARM64 16-byte absolute trampoline ─────────────────────────────────────────
 // Layout (16 bytes total):
@@ -56,6 +61,10 @@ int DobbyHook(void *addr, void *replace, void **origin) {
     if (!addr || !replace) return -1;
     std::lock_guard<std::mutex> lk(g_mu);
 
+    // Dedup guard — re-hooking an already-hooked address corrupts the trampoline chain
+    for (auto &s : g_slots)
+        if (s.target == addr) return -1;
+
     if (!set_rwx(addr, TRAMP)) {
         DE("mprotect RWX failed @ %p: %s", addr, strerror(errno));
         return -1;
@@ -77,16 +86,15 @@ int DobbyHook(void *addr, void *replace, void **origin) {
             __builtin___clear_cache(pg, (char*)pg + TRAMP * 2);
             s.page  = pg;
             *origin = pg;
-            // Register with Layer 5: RWX page tracker so maps hider filters it
             zx_track_rwx_page(pg, (size_t)getpagesize());
-            // Register with Layer 4: scrub target for signature rewrite
             zx_register_scrub_target(pg);
         }
+        // Abort if trampoline allocation failed — write_jump with null origin crashes
+        if (!(*origin)) return -1;
     }
 
     write_jump(addr, replace);
     g_slots.push_back(s);
-    DI("hook %p -> %p (tramp=%p)", addr, replace, s.page);
     return 0;
 }
 

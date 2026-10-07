@@ -276,7 +276,7 @@ static ssize_t hook_readlink(const char *path, char *buf, size_t sz) {
     if (!g_orig_readlink) return -1;
     ssize_t r = g_orig_readlink(path, buf, sz);
     if (r > 0 && path && strstr(path, "/proc/") && strstr(path, "/fd/")) {
-        buf[r] = 0;
+        if ((size_t)r < sz) buf[r] = 0;
         if (strstr(buf, "zx_") || strstr(buf, "memfd:zx")) {
             // Return /dev/null as the fake path — looks like a closed anonymous fd
             static constexpr char kFake[] = "/dev/null";
@@ -303,7 +303,7 @@ using FnInotifyAddWatch = int(*)(int, const char*, uint32_t);
 static FnInotifyInit     g_orig_inotify_init = nullptr;
 static FnInotifyAddWatch g_orig_inotify_add  = nullptr;
 
-static int hook_inotify_init()  { return -1; }
+static int hook_inotify_init()  { errno = EPERM; return -1; }
 static int hook_inotify_add(int fd, const char *path, uint32_t mask) {
     (void)fd; (void)path; (void)mask; return -1;
 }
@@ -535,8 +535,8 @@ static void *watchdog_fn(void*) {
             for (int j = 0; j < N_VARIANTS; j++)
                 if (insn == k_variants[j].ldr) { ok = true; break; }
             if (!ok) {
+                DobbyDestroy(p);
                 DobbyHook(p, g_wd[i].hook, nullptr);
-                LI("L12b re-hooked %p (was 0x%08X)", p, insn);
             }
         }
         pthread_mutex_unlock(&g_wd_mu);

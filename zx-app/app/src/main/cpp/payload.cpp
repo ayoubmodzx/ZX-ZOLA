@@ -7,6 +7,7 @@
 #include <android/log.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 #include <atomic>
 
 #define TAG "ZX-PAYLOAD"
@@ -19,7 +20,7 @@ extern "C" struct ZxCtrl {
 } g_zx_ctrl;
 
 static void *ctrl_loop(void *) {
-    // Wait for il2cpp to fully init
+    prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
     sleep(3);
 
     if (!Il2Cpp::init()) {

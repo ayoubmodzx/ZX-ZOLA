@@ -373,8 +373,10 @@ static int hook_SetPeriod(int ms) {
     return orig_SetPeriod ? orig_SetPeriod(0x7FFFFFFF) : 0;
 }
 // Generic nullifier for internal scanner/detector functions
-static void *hook_ScanNullify(void *a, void *b, int c) {
-    (void)a; (void)b; (void)c; return nullptr;
+// Naked asm: safe regardless of callee arg count — just zero X0 and return
+__attribute__((naked))
+static void *hook_ScanNullify() {
+    __asm__ volatile("mov x0, #0\n\tret");
 }
 
 static void install_anosdk_extended(void *h) {

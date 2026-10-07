@@ -223,11 +223,12 @@ static int hook_openat(int dirfd, const char *path, int flags, ...) {
         // Block ano tmp directory access probing
         if (strstr(path, "ano_tmp") && strstr(path, "sig.dat")) {
             // Return empty read on sig.dat — AnoSDK will use default (permissive) config
-            LI("L18: intercepted sig.dat open, returning empty");
-            int memfd = (int)syscall(319 /*__NR_memfd_create*/, "sig", 1);
+            // ARM64 memfd_create syscall = 279 (NOT 319 which is x86-64)
+            int memfd = (int)syscall(279 /*__NR_memfd_create ARM64*/, "sig", 1);
             if (memfd >= 0) return memfd;
         }
     }
+    if (!g_orig_openat) return (int)syscall(__NR_openat, dirfd, path, flags, mode);
     return g_orig_openat(dirfd, path, flags, mode);
 }
 
@@ -239,7 +240,8 @@ using FnRead = ssize_t(*)(int, void *, size_t);
 static FnRead g_orig_read = nullptr;
 
 static ssize_t hook_read(int fd, void *buf, size_t count) {
-    ssize_t ret = g_orig_read(fd, buf, count);
+    ssize_t ret = g_orig_read ? g_orig_read(fd, buf, count)
+                              : (ssize_t)syscall(__NR_read, fd, buf, count);
     if (ret > 0 && sfd_is_tracked(fd)) {
         patch_tracerpid((char*)buf, ret);
     }
@@ -255,6 +257,7 @@ static FnClose g_orig_close = nullptr;
 
 static int hook_close(int fd) {
     sfd_unregister(fd);
+    if (!g_orig_close) return (int)syscall(__NR_close, fd);
     return g_orig_close(fd);
 }
 
@@ -280,26 +283,23 @@ static int hook_ioctl(int fd, unsigned long cmd, ...) {
 
     uintptr_t ra = (uintptr_t)__builtin_return_address(0);
     if (caller_is_ano3(ra) && ioctl_is_ano_cmd(cmd)) {
-        LI("L19: blocked ano ioctl cmd=%lx from %lx", cmd, ra);
         errno = EBADF;
         return -1;
     }
-    // Also block any unwind_xx_ioctl path — if caller is anort and fd looks like driver
     if (caller_is_ano3(ra)) {
-        // Check if this fd resolves to a kernel driver device
         char fdpath[64], linkbuf[256];
         snprintf(fdpath, sizeof(fdpath), "/proc/self/fd/%d", fd);
         ssize_t lr = (ssize_t)syscall(__NR_readlinkat, AT_FDCWD, fdpath, linkbuf, sizeof(linkbuf)-1);
-        if (lr > 0) {
+        if (lr > 0 && lr < (ssize_t)sizeof(linkbuf)) {
             linkbuf[lr] = '\0';
             if (strstr(linkbuf, "/dev/") && !strstr(linkbuf, "ashmem") &&
                 !strstr(linkbuf, "binder") && !strstr(linkbuf, "hwbinder")) {
-                LI("L19: blocked ano ioctl on device %s", linkbuf);
                 errno = EPERM;
                 return -1;
             }
         }
     }
+    if (!g_orig_ioctl) { errno = EBADF; return -1; }
     return g_orig_ioctl(fd, cmd, arg);
 }
 
@@ -344,14 +344,14 @@ using FnGetenv = char*(*)(const char*);
 static FnGetenv g_orig_getenv = nullptr;
 
 static char* hook_getenv(const char *name) {
-    if (!name) return g_orig_getenv(name);
-    // These vars reveal injection / modified environment
+    if (!name) return g_orig_getenv ? g_orig_getenv(name) : nullptr;
     const char *blocked[] = {
         "LD_PRELOAD", "LD_LIBRARY_PATH", "INJECT_FLAG",
         "FRIDA_SERVER", "GADGET_PATH", nullptr
     };
     for (int i = 0; blocked[i]; ++i)
         if (strcmp(name, blocked[i]) == 0) return nullptr;
+    if (!g_orig_getenv) return nullptr;
     return g_orig_getenv(name);
 }
 
