@@ -42,6 +42,12 @@ static std::atomic<bool>  g_noSpread{false};
 static std::atomic<bool>  g_rapidFire{false};
 static std::atomic<float> g_fovOverride{0.f};
 
+// Aim system state
+static std::atomic<bool>  g_aimEnabled{false};
+static std::atomic<int>   g_aimBone{0};    // 0=AI, 1=NECK, 2=HEAD
+static std::atomic<float> g_aimFov{35.f};  // degrees
+static std::atomic<float> g_aimSmooth{0.6f}; // 0.0-1.0
+
 // Risk feature state
 static std::atomic<bool>  g_speedHack{false};
 static std::atomic<float> g_speedMult{1.f};      // 1.0 = normal, up to 3.0
@@ -51,6 +57,9 @@ static std::atomic<bool>  g_vehicleSpeed{false};
 static std::atomic<float> g_vehicleMult{1.f};
 static std::atomic<bool>  g_rapidFireRisk{false};
 static std::atomic<float> g_rapidIntensity{0.02f}; // fire interval: lower = faster
+static std::atomic<bool>  g_noGrass{false};
+static std::atomic<bool>  g_antiDamage{false};
+static std::atomic<float> g_damageMult{0.5f}; // 1.0=normal, 0.0=immune
 
 static void *g_origFireMethod = nullptr;
 
@@ -239,6 +248,158 @@ static void hookVehicleUpdate(void *self) { // patched in separately
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Aim system: bone-targeted magnetism hook on Camera/AimController
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct AimClasses {
+    Il2CppClass *aimCtrl    = nullptr;
+    Il2CppClass *boneCtrl   = nullptr;
+    int32_t offAimAngle     = -1;
+    int32_t offAimSmooth    = -1;
+    int32_t offBoneIndex    = -1;
+};
+static AimClasses g_aim;
+
+static void discoverAimClasses() {
+    static const char *kAim[] = {
+        "AimController","AimAssist","AimAssistController","AutoAim",
+        "PlayerAimHelper","AimHelper","AimSystem", nullptr
+    };
+    for (const char **cn = kAim; *cn && !g_aim.aimCtrl; cn++) {
+        Il2CppClass *c = Il2Cpp::cls(*cn);
+        if (!c) continue;
+        g_aim.aimCtrl = c;
+        static const char *kAngle[] = {"aimAngle","assistAngle","magnetAngle","lockAngle",nullptr};
+        for (const char **fn = kAngle; *fn; fn++) {
+            FieldInfo *f = Il2Cpp::getField(c, *fn);
+            if (f) { g_aim.offAimAngle = Il2Cpp::fieldOffset(f); break; }
+        }
+        static const char *kSmooth[] = {"smoothFactor","aimSmooth","smoothSpeed","lerpSpeed",nullptr};
+        for (const char **fn = kSmooth; *fn; fn++) {
+            FieldInfo *f = Il2Cpp::getField(c, *fn);
+            if (f) { g_aim.offAimSmooth = Il2Cpp::fieldOffset(f); break; }
+        }
+        static const char *kBone[] = {"boneIndex","targetBone","aimBone","targetBoneIndex",nullptr};
+        for (const char **fn = kBone; *fn; fn++) {
+            FieldInfo *f = Il2Cpp::getField(c, *fn);
+            if (f) { g_aim.offBoneIndex = Il2Cpp::fieldOffset(f); break; }
+        }
+    }
+}
+
+using FnAimUpdate = void(*)(void*);
+static FnAimUpdate g_origAimUpdate = nullptr;
+
+// Bone index map: FF uses HumanBodyBones enum
+// HEAD=5, NECK=4, CHEST=6 — approximate; game-specific offsets vary
+static constexpr int kBoneHead  = 5;
+static constexpr int kBoneNeck  = 4;
+static constexpr int kBoneChest = 6; // AI default: chest → smoothest tracking
+
+static void hookAimUpdate(void *self) {
+    if (g_aimEnabled) {
+        float fov    = g_aimFov.load(std::memory_order_relaxed);
+        float smooth = g_aimSmooth.load(std::memory_order_relaxed);
+        int   bone   = g_aimBone.load(std::memory_order_relaxed);
+
+        if (g_aim.offAimAngle  > 0) Il2Cpp::writeField<float>(self, g_aim.offAimAngle, fov);
+        if (g_aim.offAimSmooth > 0) Il2Cpp::writeField<float>(self, g_aim.offAimSmooth, smooth);
+        if (g_aim.offBoneIndex > 0) {
+            int boneId = (bone == 2) ? kBoneHead
+                       : (bone == 1) ? kBoneNeck
+                       :               kBoneChest;
+            Il2Cpp::writeField<int>(self, g_aim.offBoneIndex, boneId);
+        }
+    }
+    if (g_origAimUpdate) g_origAimUpdate(self);
+}
+
+static void hookAimSystem() {
+    discoverAimClasses();
+    if (!g_aim.aimCtrl) return;
+    static const char *kUpd[] = {"Update","LateUpdate","OnAimUpdate","Tick",nullptr};
+    for (const char **mn = kUpd; *mn; mn++) {
+        MethodInfo *m = Il2Cpp::getMethod(g_aim.aimCtrl, *mn, -1);
+        if (m && m->methodPointer) {
+            void *orig = nullptr;
+            DobbyHook(m->methodPointer, (void*)hookAimUpdate, &orig);
+            g_origAimUpdate = (FnAimUpdate)orig;
+            LOG("Hooked aim: %s @ %p", *mn, m->methodPointer);
+            break;
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// No Grass: null the grass renderer's draw call
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnGrassDraw = void(*)(void*);
+static FnGrassDraw g_origGrassDraw = nullptr;
+static void hookGrassDraw(void *self) {
+    if (!g_noGrass && g_origGrassDraw) g_origGrassDraw(self);
+    // when g_noGrass=true: skip draw call entirely → grass invisible
+}
+
+static void hookNoGrass() {
+    static const char *kGrass[] = {
+        "GrassRenderer","GrassSystem","TerrainGrass","GrassBatch","GrassManager",nullptr
+    };
+    for (const char **cn = kGrass; *cn; cn++) {
+        Il2CppClass *c = Il2Cpp::cls(*cn);
+        if (!c) continue;
+        static const char *kDraw[] = {"Render","Draw","DrawGrass","OnRender","DrawBatch",nullptr};
+        for (const char **mn = kDraw; *mn; mn++) {
+            MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
+            if (m && m->methodPointer) {
+                void *orig = nullptr;
+                DobbyHook(m->methodPointer, (void*)hookGrassDraw, &orig);
+                g_origGrassDraw = (FnGrassDraw)orig;
+                LOG("Hooked grass: %s::%s @ %p", *cn, *mn, m->methodPointer);
+                return;
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Anti Damage: intercept TakeDamage and scale down incoming value
+// ─────────────────────────────────────────────────────────────────────────────
+
+using FnTakeDamage = void(*)(void*, float, void*);
+static FnTakeDamage g_origTakeDamage = nullptr;
+static void hookTakeDamage(void *self, float dmg, void *info) {
+    float d = g_antiDamage
+        ? dmg * g_damageMult.load(std::memory_order_relaxed)
+        : dmg;
+    if (g_origTakeDamage) g_origTakeDamage(self, d, info);
+}
+
+static void hookAntiDamage() {
+    static const char *kCls[] = {
+        "CSPlayerState","PlayerHealth","HealthSystem","PlayerHP","CharacterHealth",nullptr
+    };
+    for (const char **cn = kCls; *cn; cn++) {
+        Il2CppClass *c = Il2Cpp::cls(*cn);
+        if (!c) c = g_cls.playerState;
+        if (!c) continue;
+        static const char *kMeth[] = {
+            "TakeDamage","OnTakeDamage","ReceiveDamage","ApplyDamage","HurtPlayer",nullptr
+        };
+        for (const char **mn = kMeth; *mn; mn++) {
+            MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
+            if (m && m->methodPointer) {
+                void *orig = nullptr;
+                DobbyHook(m->methodPointer, (void*)hookTakeDamage, &orig);
+                g_origTakeDamage = (FnTakeDamage)orig;
+                LOG("Hooked damage: %s::%s @ %p", *cn, *mn, m->methodPointer);
+                return;
+            }
+        }
+    }
+}
+
 static void hookRiskFeatures() {
     discoverRiskClasses();
     if (g_risk.playerMove) {
@@ -280,6 +441,9 @@ void Features::init() {
     hookUnityIcalls();
     hookWeaponFire();
     hookRiskFeatures();
+    hookAimSystem();
+    hookNoGrass();
+    hookAntiDamage();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -369,6 +533,23 @@ void Features::apply(int cmd, bool enable) {
             if (!enable) g_rapidIntensity.store(0.02f, std::memory_order_relaxed);
             LOG("RapidFireRisk %s", enable ? "ON" : "OFF");
             break;
+        case CMD_NO_GRASS:
+            g_noGrass = enable;
+            LOG("NoGrass %s", enable ? "ON" : "OFF");
+            break;
+        case CMD_ANTI_DAMAGE:
+            g_antiDamage = enable;
+            if (!enable) g_damageMult.store(0.5f, std::memory_order_relaxed);
+            LOG("AntiDamage %s", enable ? "ON" : "OFF");
+            break;
+        case CMD_AIM_ENABLE:
+            g_aimEnabled = enable;
+            LOG("AimSystem %s", enable ? "ON" : "OFF");
+            break;
+        case CMD_AIM_BONE:
+        case CMD_AIM_FOV:
+        case CMD_AIM_SMOOTH:
+            break; // these are intensity-only, handled by applyIntensity
         default: LOG("Unknown cmd: %d", cmd);
     }
 }
@@ -390,9 +571,24 @@ void Features::applyIntensity(int cmd, int intensity) {
             g_vehicleMult.store(1.f + t * 2.5f, std::memory_order_relaxed);
             break;
         case CMD_RAPID_FIRE_RISK:
-            // 0% = stock interval, 100% = near-instant (0.001)
-            // fireRate interval: lower = faster. 0.02 is stock
+            // 0% = stock interval (0.02), 100% = near-instant (0.001)
             g_rapidIntensity.store(0.02f - t * 0.019f, std::memory_order_relaxed);
+            break;
+        case CMD_ANTI_DAMAGE:
+            // 0% = normal (1.0x), 100% = immune (0.0x)
+            g_damageMult.store(1.f - t, std::memory_order_relaxed);
+            break;
+        case CMD_AIM_BONE:
+            // intensity encodes discrete bone: 0=AI, 1=NECK, 2=HEAD
+            g_aimBone.store(intensity, std::memory_order_relaxed);
+            break;
+        case CMD_AIM_FOV:
+            // intensity = FOV degrees (5-90)
+            g_aimFov.store((float)intensity, std::memory_order_relaxed);
+            break;
+        case CMD_AIM_SMOOTH:
+            // intensity 0-100 → smooth factor 0.0-1.0
+            g_aimSmooth.store(t, std::memory_order_relaxed);
             break;
         default: break;
     }

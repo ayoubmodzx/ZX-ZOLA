@@ -24,11 +24,13 @@
 // Feature command IDs — must match Cmd in ZxEngine.kt and features.cpp
 enum Cmd {
     ANTI_RECOIL     = 1,  NO_SPREAD       = 2,
-    RAPID_FIRE      = 3,  AIM_ASSIST      = 4,
-    ESP             = 5,  HEADSHOT_ASSIST = 6,
-    WIDE_POV        = 7,  SPEED_HACK      = 8,
-    HIGH_JUMP       = 9,  VEHICLE_SPEED   = 10,
-    RAPID_FIRE_RISK = 11,
+    RAPID_FIRE      = 3,  WIDE_POV        = 4,
+    ESP             = 5,  SPEED_HACK      = 6,
+    HIGH_JUMP       = 7,  VEHICLE_SPEED   = 8,
+    RAPID_FIRE_RISK = 9,  NO_GRASS        = 10,
+    ANTI_DAMAGE     = 11,
+    AIM_ENABLE      = 12, AIM_BONE        = 13,
+    AIM_FOV         = 14, AIM_SMOOTH      = 15,
 };
 
 // Payload .so path (extracted by ZxEngine.kt into app filesDir)

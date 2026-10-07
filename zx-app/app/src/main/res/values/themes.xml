@@ -31,4 +31,14 @@
         <item name="android:textColor">#FFFFFF</item>
         <item name="backgroundTint">@color/zx_amber</item>
     </style>
+
+    <!-- Aim system sliders: purple thumb + track -->
+    <style name="ZxSliderPurple" parent="Widget.Material3.Slider">
+        <item name="thumbColor">@color/zx_purple</item>
+        <item name="trackColorActive">@color/zx_purple</item>
+        <item name="trackColorInactive">@color/zx_text_muted</item>
+        <item name="thumbRadius">8dp</item>
+        <item name="trackHeight">3dp</item>
+        <item name="haloRadius">16dp</item>
+    </style>
 </resources>

@@ -12,11 +12,16 @@ private const val FF_PKG2 = "com.dts.freefiremax"
 
 object Cmd {
     const val ANTI_RECOIL    = 1;  const val NO_SPREAD      = 2
-    const val RAPID_FIRE     = 3;  const val AIM_ASSIST     = 4
-    const val ESP            = 5;  const val HEADSHOT_ASSIST= 6
-    const val WIDE_POV       = 7;  const val SPEED_HACK     = 8
-    const val HIGH_JUMP      = 9;  const val VEHICLE_SPEED  = 10
-    const val RAPID_FIRE_RISK= 11
+    const val RAPID_FIRE     = 3;  const val WIDE_POV       = 4
+    const val ESP            = 5;  const val SPEED_HACK     = 6
+    const val HIGH_JUMP      = 7;  const val VEHICLE_SPEED  = 8
+    const val RAPID_FIRE_RISK= 9;  const val NO_GRASS       = 10
+    const val ANTI_DAMAGE    = 11
+    // Aim system — uses setIntensity for bone/fov/smooth params
+    const val AIM_ENABLE     = 12
+    const val AIM_BONE       = 13  // intensity: 0=AI, 1=NECK, 2=HEAD
+    const val AIM_FOV        = 14  // intensity: 5-90 degrees
+    const val AIM_SMOOTH     = 15  // intensity: 0-100 smoothness
 }
 
 object ZxEngine {
