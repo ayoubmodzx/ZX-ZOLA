@@ -40,7 +40,6 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <stdarg.h>
 #include <atomic>
 #include <netdb.h>
 #include <sys/prctl.h>
@@ -138,19 +137,15 @@ static int hook_prop_get(const char *name, char *value) {
 // PR_GET_SECCOMP  → 0 (not sandboxed)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int (*g_orig_prctl)(int, ...) = nullptr;
+// prctl actual ABI: int prctl(int, unsigned long, unsigned long, unsigned long, unsigned long)
+static int (*g_orig_prctl)(int, unsigned long, unsigned long,
+                            unsigned long, unsigned long) = nullptr;
 
-static int hook_prctl(int opt, ...) {
-    va_list ap; va_start(ap, opt);
-    unsigned long a1 = va_arg(ap, unsigned long);
-    unsigned long a2 = va_arg(ap, unsigned long);
-    unsigned long a3 = va_arg(ap, unsigned long);
-    unsigned long a4 = va_arg(ap, unsigned long);
-    va_end(ap);
-
+static int hook_prctl(int opt, unsigned long a1, unsigned long a2,
+                      unsigned long a3, unsigned long a4) {
     if (opt == PR_GET_DUMPABLE)  return 0;
     if (opt == PR_GET_SECCOMP)   return 0;
-    if (opt == PR_SET_DUMPABLE)  return 0; // ignore attempts to re-enable
+    if (opt == PR_SET_DUMPABLE)  return 0;
     return g_orig_prctl(opt, a1, a2, a3, a4);
 }
 
@@ -210,21 +205,13 @@ static int hook_sigaction(int sig, const struct sigaction *act, struct sigaction
 // Routes AnoSDK's direct syscall() calls to our existing hook logic.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static long (*g_orig_syscall)(long, ...) = nullptr;
+// syscall() on ARM64: long syscall(long number, long a1..a6)
+// Use fixed-arg signature to match ARM64 ABI (args in X0..X6)
+static long (*g_orig_syscall)(long, long, long, long,
+                               long, long, long) = nullptr;
 
-static long hook_syscall(long nr, ...) {
-    va_list ap; va_start(ap, nr);
-    long a1 = va_arg(ap, long);
-    long a2 = va_arg(ap, long);
-    long a3 = va_arg(ap, long);
-    long a4 = va_arg(ap, long);
-    long a5 = va_arg(ap, long);
-    long a6 = va_arg(ap, long);
-    va_end(ap);
-
-    // openat (56) — delegate to existing openat hook via PLT (already installed)
-    // read    (63) — delegate to existing read hook via PLT
-    // Intercept remaining detection syscalls directly:
+static long hook_syscall(long nr, long a1, long a2, long a3,
+                         long a4, long a5, long a6) {
     switch (nr) {
         case 101: // setsid
             return 0;
@@ -257,7 +244,8 @@ static long hook_syscall(long nr, ...) {
 // Block O_RDWR detection on /proc/self/mem fds (debugger artifact).
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int (*g_orig_fcntl)(int, int, ...) = nullptr;
+// fcntl ABI on ARM64: int fcntl(int fd, int cmd, long arg) — fixed 3-arg registers
+static int (*g_orig_fcntl)(int, int, long) = nullptr;
 
 static bool is_proc_fd(int fd) {
     char link[64], path[128];
@@ -268,11 +256,7 @@ static bool is_proc_fd(int fd) {
     return (strncmp(path, "/proc/", 6) == 0);
 }
 
-static int hook_fcntl(int fd, int cmd, ...) {
-    va_list ap; va_start(ap, cmd);
-    long arg = va_arg(ap, long);
-    va_end(ap);
-
+static int hook_fcntl(int fd, int cmd, long arg) {
     int ret = g_orig_fcntl(fd, cmd, arg);
     // Strip O_RDWR on proc fds — debugger artifact
     if (cmd == F_GETFL && ret >= 0 && is_proc_fd(fd)) {
@@ -509,8 +493,14 @@ void install_stealth_ext4() {
     // Layer 33
     ZX_HOOK("sigaction", hook_sigaction, &g_orig_sigaction);
 
-    // Layer 34
-    ZX_HOOK("syscall", hook_syscall, &g_orig_syscall);
+    // Layer 34 — hook libc syscall() wrapper at PLT
+    {
+        void *_sym = dlsym(RTLD_DEFAULT, "syscall");
+        if (_sym) {
+            DobbyHook(_sym, (void*)hook_syscall, (void**)&g_orig_syscall);
+            LI("hooked: syscall");
+        } else LE("not found: syscall");
+    }
 
     // Layer 35
     ZX_HOOK("fcntl", hook_fcntl, &g_orig_fcntl);
