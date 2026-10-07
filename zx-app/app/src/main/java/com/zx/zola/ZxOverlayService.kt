@@ -4,12 +4,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.IBinder
+import android.util.Log
 import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
@@ -19,12 +22,15 @@ import kotlin.math.abs
 class ZxOverlayService : Service() {
 
     companion object {
-        const val ACTION_TOGGLE_FAB = "com.zx.zola.TOGGLE_FAB"
-        private const val FAB_DP    = 56
-        private const val MIN_W_DP  = 280
-        private const val MIN_H_DP  = 330
-        private const val DEF_W_DP  = 370
-        private const val DEF_H_DP  = 440
+        const val ACTION_TOGGLE_FAB  = "com.zx.zola.TOGGLE_FAB"
+        private const val FAB_DP     = 56
+        private const val MIN_W_DP   = 280
+        private const val MIN_H_DP   = 330
+        private const val DEF_W_DP   = 370
+        private const val DEF_H_DP   = 440
+        // Negative cmd = local-only (no ZxEngine dispatch)
+        const val CMD_ICON_HIDE   = -1
+        const val CMD_SCREEN_HIDE = -2
     }
 
     // ─── Data ─────────────────────────────────────────────────────────────────
@@ -39,7 +45,8 @@ class ZxOverlayService : Service() {
         val sliderMax:     Int     = 100,
         val sliderDefault: Int     = 50,
         val sliderLabel:   String  = "",
-        val rawIntensity:  Boolean = false
+        val rawIntensity:  Boolean = false,
+        val isLocalOnly:   Boolean = false  // true → no isActive guard, no ZxEngine dispatch
     )
 
     enum class Tab(val label: String, val icon: String) {
@@ -52,7 +59,7 @@ class ZxOverlayService : Service() {
 
     private val features: Map<Tab, List<Feature>> = mapOf(
         Tab.AIM to listOf(
-            Feature("Auto Headshot",  ZxEngine.Cmd.AUTO_HEADSHOT,  Risk.SAFE),
+            Feature("Auto Headshot",  ZxEngine.Cmd.AUTO_HEADSHOT,  Risk.RISK),
             Feature("Aim Assist",     ZxEngine.Cmd.AIM_ENABLE,     Risk.RISK),
             Feature("Aim FOV",        ZxEngine.Cmd.AIM_FOV,        Risk.RISK,
                 hasSlider = true, sliderMin = 5, sliderMax = 90, sliderDefault = 30, sliderLabel = "°"),
@@ -74,7 +81,7 @@ class ZxOverlayService : Service() {
             Feature("Wall Shoot",     ZxEngine.Cmd.WALL_SHOOT,       Risk.DANGER)
         ),
         Tab.MOVEMENT to listOf(
-            Feature("Vehicle Speed",  ZxEngine.Cmd.VEHICLE_SPEED,  Risk.SAFE,
+            Feature("Vehicle Speed",  ZxEngine.Cmd.VEHICLE_SPEED,  Risk.RISK,
                 hasSlider = true, sliderMin = 10, sliderMax = 200, sliderDefault = 50, sliderLabel = "%"),
             Feature("Save Position",  ZxEngine.Cmd.TELEPORT_SAVE,  Risk.SAFE),
             Feature("Speed Hack",     ZxEngine.Cmd.SPEED_HACK,     Risk.RISK,
@@ -94,7 +101,10 @@ class ZxOverlayService : Service() {
             Feature("ESP",            ZxEngine.Cmd.ESP,            Risk.SAFE),
             Feature("Wide FOV",       ZxEngine.Cmd.WIDE_POV,       Risk.SAFE,
                 hasSlider = true, sliderMin = 60, sliderMax = 150, sliderDefault = 90, sliderLabel = "°"),
-            Feature("No Grass",       ZxEngine.Cmd.NO_GRASS,       Risk.SAFE)
+            Feature("No Grass",       ZxEngine.Cmd.NO_GRASS,       Risk.SAFE),
+            // Protection toggles — local-only, no ZxEngine dispatch
+            Feature("Hide Icon",      CMD_ICON_HIDE,               Risk.SAFE, isLocalOnly = true),
+            Feature("Hide Screen",    CMD_SCREEN_HIDE,             Risk.SAFE, isLocalOnly = true)
         )
     )
 
@@ -123,6 +133,7 @@ class ZxOverlayService : Service() {
     private lateinit var footerCountTv: TextView
     private var currentTab       = Tab.AIM
     private var activeLayerCount = 0
+    private var secureMode       = true
     private val switchMap  = mutableMapOf<Int, Switch>()
     private val tabViews   = mutableMapOf<Tab, View>()
 
@@ -520,7 +531,11 @@ class ZxOverlayService : Service() {
             isChecked = false
             trackDrawable = ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.sel_switch_track)
             setOnCheckedChangeListener { _, on ->
-                ZxEngine.toggle(f.cmd, on)
+                if (f.isLocalOnly) {
+                    handleLocalFeature(f.cmd, on)
+                } else {
+                    ZxEngine.toggle(f.cmd, on)
+                }
                 activeLayerCount += if (on) 1 else -1
                 if (::footerCountTv.isInitialized)
                     footerCountTv.text = "$activeLayerCount LAYERS ACTIVE"
@@ -564,6 +579,39 @@ class ZxOverlayService : Service() {
             card.addView(slRow)
         }
         contentList.addView(card)
+    }
+
+    // ─── Local feature handlers ───────────────────────────────────────────────
+    private fun handleLocalFeature(cmd: Int, on: Boolean) {
+        when (cmd) {
+            CMD_ICON_HIDE   -> toggleIconVisibility(show = !on)
+            CMD_SCREEN_HIDE -> setSecureMode(on)
+        }
+    }
+
+    private fun toggleIconVisibility(show: Boolean) {
+        val state = if (show) PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+                    else      PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+        try {
+            packageManager.setComponentEnabledSetting(
+                ComponentName(this, "com.zx.zola.MainLauncher"),
+                state, PackageManager.DONT_KILL_APP
+            )
+        } catch (e: Exception) { Log.e("ZxEngine", "icon toggle failed: ${e.message}") }
+    }
+
+    private fun setSecureMode(on: Boolean) {
+        secureMode = on
+        val flag = WindowManager.LayoutParams.FLAG_SECURE
+        if (on) {
+            fabLp.flags   = fabLp.flags   or flag
+            panelLp.flags = panelLp.flags or flag
+        } else {
+            fabLp.flags   = fabLp.flags   and flag.inv()
+            panelLp.flags = panelLp.flags and flag.inv()
+        }
+        fabView?.let   { if (it.parent != null) wm.updateViewLayout(it, fabLp) }
+        panelRoot?.let { if (it.parent != null) wm.updateViewLayout(it, panelLp) }
     }
 
     // ─── Dividers ─────────────────────────────────────────────────────────────
