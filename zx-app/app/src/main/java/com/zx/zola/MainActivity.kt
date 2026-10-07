@@ -10,9 +10,13 @@ import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import android.widget.Button
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
 
@@ -59,12 +63,16 @@ class MainActivity : AppCompatActivity() {
             if (!Settings.canDrawOverlays(this)) {
                 requestOverlayPermission(); return@setOnClickListener
             }
-            if (!ZxEngine.isFfRunning()) {
-                Toast.makeText(this, "Launch Free Fire first", Toast.LENGTH_SHORT).show()
-                return@setOnClickListener
+            // isFfRunning() shells out to root — must NOT run on main thread
+            lifecycleScope.launch {
+                val running = withContext(Dispatchers.IO) { ZxEngine.isFfRunning() }
+                if (!running) {
+                    Toast.makeText(this@MainActivity, "Launch Free Fire first", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+                startFg()
+                setActive(true)
             }
-            startFg()
-            setActive(true)
         }
 
         stopBtn.setOnClickListener {
@@ -116,6 +124,7 @@ class MainActivity : AppCompatActivity() {
                 return@setOnCheckedChangeListener
             }
             aimBody.visibility = if (checked) View.VISIBLE else View.GONE
+            if (!isActive) return@setOnCheckedChangeListener // deactivation reset — no engine call
             ZxEngine.toggle(Cmd.AIM_ENABLE, checked)
             if (checked) {
                 ZxEngine.setIntensity(Cmd.AIM_BONE,   selectedBone)
@@ -151,6 +160,7 @@ class MainActivity : AppCompatActivity() {
                     return@setOnCheckedChangeListener
                 }
                 row.visibility = if (checked) View.VISIBLE else View.GONE
+                if (!isActive) return@setOnCheckedChangeListener // deactivation reset — no engine call
                 ZxEngine.toggle(rf.cmd, checked)
                 if (!checked) {
                     sl.value = 0f
@@ -186,12 +196,20 @@ class MainActivity : AppCompatActivity() {
             tv.text = "INACTIVE"
             tv.setTextColor(getColor(R.color.zx_text_dim))
             tvSub.text = "Ready"
+            // isActive is already false here — listener guards prevent redundant root dispatches
             featureMap.keys.forEach { id ->
                 findViewById<SwitchMaterial>(id).isChecked = false
             }
-            // Reset aim system
-            findViewById<SwitchMaterial>(R.id.sw_aim_system).isChecked = false
+            // Reset aim system — isChecked=false here triggers the swAim listener which
+            // checks isActive first, so no ZxEngine call fires
+            val swAimReset = findViewById<SwitchMaterial>(R.id.sw_aim_system)
+            swAimReset.isChecked = false
             findViewById<View>(R.id.ll_aim_body).visibility = View.GONE
+            // Reset aim sliders to defaults (consistent with risk slider reset below)
+            findViewById<Slider>(R.id.sl_aim_fov).value   = 35f
+            findViewById<TextView>(R.id.tv_aim_fov).text   = "35°"
+            findViewById<Slider>(R.id.sl_aim_smooth).value = 50f
+            findViewById<TextView>(R.id.tv_aim_smooth).text = "50%"
             // Reset risk switches + hide sliders
             riskSwitchIds.forEachIndexed { idx, switchId ->
                 val rf = riskFeatures[idx]

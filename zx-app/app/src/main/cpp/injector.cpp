@@ -198,11 +198,14 @@ int main(int argc, char *argv[]) {
     // The payload polls a small control struct it mmap'd at a known offset
     uintptr_t ctrl_addr = ProcMem::findSymbol(pid, "libzx_payload.so", "g_zx_ctrl");
     if (ctrl_addr) {
-        struct { int cmd; int enable; int intensity; } ctrl = {
-            cmd, enable ? 1 : 0, intensity
-        };
-        ProcMem::write(ctrl_addr, ctrl);
-        LOG("Command sent: cmd=%d enable=%d intensity=%d", cmd, enable ? 1 : 0, intensity);
+        // Write enable (+4) and intensity (+8) before cmd (+0) so the payload never
+        // reads a non-zero cmd with stale enable/intensity values (write-ordering fix)
+        int enable_val    = enable ? 1 : 0;
+        int intensity_val = intensity;
+        ProcMem::write(ctrl_addr + 4, &enable_val,    sizeof(int));
+        ProcMem::write(ctrl_addr + 8, &intensity_val, sizeof(int));
+        ProcMem::write(ctrl_addr,     &cmd,           sizeof(int)); // cmd last as trigger
+        LOG("Command sent: cmd=%d enable=%d intensity=%d", cmd, enable_val, intensity_val);
     }
 
     ProcMem::close();

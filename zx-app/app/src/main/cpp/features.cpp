@@ -59,7 +59,7 @@ static std::atomic<bool>  g_rapidFireRisk{false};
 static std::atomic<float> g_rapidIntensity{0.02f}; // fire interval: lower = faster
 static std::atomic<bool>  g_noGrass{false};
 static std::atomic<bool>  g_antiDamage{false};
-static std::atomic<float> g_damageMult{0.5f}; // 1.0=normal, 0.0=immune
+static std::atomic<float> g_damageMult{1.f}; // 1.0=normal, 0.0=immune
 
 static void *g_origFireMethod = nullptr;
 
@@ -226,26 +226,46 @@ static void discoverRiskClasses() {
 
 using FnMoveUpdate = void(*)(void*);
 static FnMoveUpdate g_origMoveUpdate = nullptr;
+// Bug fix: cache original values so per-frame multiply doesn't compound exponentially
+static float s_baseMoveSpeed = 0.f;
+static float s_baseJumpForce = 0.f;
+static float s_baseVehicleSpeed = 0.f;
+
 static void hookMoveUpdate(void *self) {
     if (g_speedHack && g_risk.offMoveSpeed > 0) {
-        float base = Il2Cpp::readField<float>(self, g_risk.offMoveSpeed);
-        float target = base * g_speedMult.load(std::memory_order_relaxed);
-        Il2Cpp::writeField<float>(self, g_risk.offMoveSpeed, target);
+        if (s_baseMoveSpeed == 0.f)
+            s_baseMoveSpeed = Il2Cpp::readField<float>(self, g_risk.offMoveSpeed);
+        Il2Cpp::writeField<float>(self, g_risk.offMoveSpeed,
+            s_baseMoveSpeed * g_speedMult.load(std::memory_order_relaxed));
+    } else if (!g_speedHack && s_baseMoveSpeed != 0.f && g_risk.offMoveSpeed > 0) {
+        Il2Cpp::writeField<float>(self, g_risk.offMoveSpeed, s_baseMoveSpeed);
+        s_baseMoveSpeed = 0.f;
     }
     if (g_highJump && g_risk.offJumpForce > 0) {
-        float base = Il2Cpp::readField<float>(self, g_risk.offJumpForce);
-        float target = base * g_jumpMult.load(std::memory_order_relaxed);
-        Il2Cpp::writeField<float>(self, g_risk.offJumpForce, target);
+        if (s_baseJumpForce == 0.f)
+            s_baseJumpForce = Il2Cpp::readField<float>(self, g_risk.offJumpForce);
+        Il2Cpp::writeField<float>(self, g_risk.offJumpForce,
+            s_baseJumpForce * g_jumpMult.load(std::memory_order_relaxed));
+    } else if (!g_highJump && s_baseJumpForce != 0.f && g_risk.offJumpForce > 0) {
+        Il2Cpp::writeField<float>(self, g_risk.offJumpForce, s_baseJumpForce);
+        s_baseJumpForce = 0.f;
     }
     if (g_origMoveUpdate) g_origMoveUpdate(self);
 }
 
-static void hookVehicleUpdate(void *self) { // patched in separately
+using FnVehicleUpdate = void(*)(void*);
+static FnVehicleUpdate g_origVehicleUpdate = nullptr;
+static void hookVehicleUpdate(void *self) {
     if (g_vehicleSpeed && g_risk.offVehicleSpeed > 0) {
-        float base = Il2Cpp::readField<float>(self, g_risk.offVehicleSpeed);
+        if (s_baseVehicleSpeed == 0.f)
+            s_baseVehicleSpeed = Il2Cpp::readField<float>(self, g_risk.offVehicleSpeed);
         Il2Cpp::writeField<float>(self, g_risk.offVehicleSpeed,
-            base * g_vehicleMult.load(std::memory_order_relaxed));
+            s_baseVehicleSpeed * g_vehicleMult.load(std::memory_order_relaxed));
+    } else if (!g_vehicleSpeed && s_baseVehicleSpeed != 0.f && g_risk.offVehicleSpeed > 0) {
+        Il2Cpp::writeField<float>(self, g_risk.offVehicleSpeed, s_baseVehicleSpeed);
+        s_baseVehicleSpeed = 0.f;
     }
+    if (g_origVehicleUpdate) g_origVehicleUpdate(self);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -317,17 +337,24 @@ static void hookAimUpdate(void *self) {
 
 static void hookAimSystem() {
     discoverAimClasses();
-    if (!g_aim.aimCtrl) return;
+    if (!g_aim.aimCtrl) {
+        ERR("hookAimSystem: no aim class found — aim assist disabled");
+        return;
+    }
+    // param count=0 avoids matching overloaded Update(float dt) with wrong ABI
     static const char *kUpd[] = {"Update","LateUpdate","OnAimUpdate","Tick",nullptr};
     for (const char **mn = kUpd; *mn; mn++) {
-        MethodInfo *m = Il2Cpp::getMethod(g_aim.aimCtrl, *mn, -1);
-        if (m && m->methodPointer) {
-            void *orig = nullptr;
-            DobbyHook(m->methodPointer, (void*)hookAimUpdate, &orig);
-            g_origAimUpdate = (FnAimUpdate)orig;
-            LOG("Hooked aim: %s @ %p", *mn, m->methodPointer);
-            break;
+        MethodInfo *m = Il2Cpp::getMethod(g_aim.aimCtrl, *mn, 0);
+        if (!m || !m->methodPointer) continue;
+        void *orig = nullptr;
+        int rc = DobbyHook(m->methodPointer, (void*)hookAimUpdate, &orig);
+        if (rc != 0 || !orig) {
+            ERR("hookAimSystem: DobbyHook failed for %s (rc=%d)", *mn, rc);
+            return;
         }
+        g_origAimUpdate = (FnAimUpdate)orig;
+        LOG("Hooked aim: %s @ %p", *mn, m->methodPointer);
+        break;
     }
 }
 
@@ -338,8 +365,11 @@ static void hookAimSystem() {
 using FnGrassDraw = void(*)(void*);
 static FnGrassDraw g_origGrassDraw = nullptr;
 static void hookGrassDraw(void *self) {
-    if (!g_noGrass && g_origGrassDraw) g_origGrassDraw(self);
-    // when g_noGrass=true: skip draw call entirely → grass invisible
+    if (g_noGrass) return;
+    if (g_origGrassDraw)
+        g_origGrassDraw(self);
+    else
+        ERR("hookGrassDraw: original null — draw dropped");
 }
 
 static void hookNoGrass() {
@@ -405,12 +435,25 @@ static void hookRiskFeatures() {
     if (g_risk.playerMove) {
         static const char *kUpd[] = {"Update","FixedUpdate","Move","OnMove",nullptr};
         for (const char **mn = kUpd; *mn; mn++) {
-            MethodInfo *m = Il2Cpp::getMethod(g_risk.playerMove, *mn, -1);
+            MethodInfo *m = Il2Cpp::getMethod(g_risk.playerMove, *mn, 0);
             if (m && m->methodPointer) {
                 void *orig = nullptr;
                 DobbyHook(m->methodPointer, (void*)hookMoveUpdate, &orig);
                 g_origMoveUpdate = (FnMoveUpdate)orig;
                 LOG("Hooked move/jump: %s @ %p", *mn, m->methodPointer);
+                break;
+            }
+        }
+    }
+    if (g_risk.vehicleCls) {
+        static const char *kVUpd[] = {"Update","FixedUpdate","VehicleUpdate","OnUpdate",nullptr};
+        for (const char **mn = kVUpd; *mn; mn++) {
+            MethodInfo *m = Il2Cpp::getMethod(g_risk.vehicleCls, *mn, 0);
+            if (m && m->methodPointer) {
+                void *orig = nullptr;
+                DobbyHook(m->methodPointer, (void*)hookVehicleUpdate, &orig);
+                g_origVehicleUpdate = (FnVehicleUpdate)orig;
+                LOG("Hooked vehicle: %s @ %p", *mn, m->methodPointer);
                 break;
             }
         }
@@ -500,19 +543,13 @@ static void widePov(bool on) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void Features::apply(int cmd, bool enable) {
-    static std::atomic<bool> g_init_done{false};
-    if (!g_init_done.exchange(true)) {
-        Features::init();
-    }
-
+    // init() is called once by ctrl_loop before any apply(); no lazy-init here
     switch (cmd) {
         case CMD_ANTI_RECOIL:     antiRecoil(enable);              break;
         case CMD_NO_SPREAD:       noSpread(enable);                break;
         case CMD_RAPID_FIRE:      rapidFire(enable);               break;
-        case CMD_AIM_ASSIST:      aimAssist(enable);               break;
         case CMD_WIDE_POV:        widePov(enable);                 break;
         case CMD_ESP:             ESP::setEnabled(enable);         break;
-        case CMD_HEADSHOT_ASSIST: ESP::setHeadshotAssist(enable);  break;
         case CMD_SPEED_HACK:
             g_speedHack = enable;
             if (!enable) g_speedMult.store(1.f, std::memory_order_relaxed);
@@ -539,7 +576,7 @@ void Features::apply(int cmd, bool enable) {
             break;
         case CMD_ANTI_DAMAGE:
             g_antiDamage = enable;
-            if (!enable) g_damageMult.store(0.5f, std::memory_order_relaxed);
+            if (!enable) g_damageMult.store(1.f, std::memory_order_relaxed);
             LOG("AntiDamage %s", enable ? "ON" : "OFF");
             break;
         case CMD_AIM_ENABLE:
@@ -571,8 +608,8 @@ void Features::applyIntensity(int cmd, int intensity) {
             g_vehicleMult.store(1.f + t * 2.5f, std::memory_order_relaxed);
             break;
         case CMD_RAPID_FIRE_RISK:
-            // 0% = stock interval (0.02), 100% = near-instant (0.001)
-            g_rapidIntensity.store(0.02f - t * 0.019f, std::memory_order_relaxed);
+            // 0% = stock interval (0.02s), 100% = 0.005s — floor prevents crash/ban at extreme values
+            g_rapidIntensity.store(std::max(0.02f - t * 0.015f, 0.005f), std::memory_order_relaxed);
             break;
         case CMD_ANTI_DAMAGE:
             // 0% = normal (1.0x), 100% = immune (0.0x)
@@ -583,12 +620,12 @@ void Features::applyIntensity(int cmd, int intensity) {
             g_aimBone.store(intensity, std::memory_order_relaxed);
             break;
         case CMD_AIM_FOV:
-            // intensity = FOV degrees (5-90)
-            g_aimFov.store((float)intensity, std::memory_order_relaxed);
+            // intensity = FOV degrees; clamp to minimum 5° so acquisition cone is never zero
+            g_aimFov.store(std::max((float)intensity, 5.f), std::memory_order_relaxed);
             break;
         case CMD_AIM_SMOOTH:
-            // intensity 0-100 → smooth factor 0.0-1.0
-            g_aimSmooth.store(t, std::memory_order_relaxed);
+            // 0% = fast snap (0.95), 100% = slow smooth follow (0.05) — inverted & floored
+            g_aimSmooth.store(std::max(1.f - t, 0.05f), std::memory_order_relaxed);
             break;
         default: break;
     }

@@ -33,25 +33,30 @@ static void *ctrl_loop(void *) {
     ESP::init();
     LOG("Payload ready");
 
-    int last_cmd = 0;
+    // Each injector call writes a fresh {cmd, enable, intensity} then expects a
+    // single processing pass. We clear cmd after each dispatch so the next write
+    // is always treated as a new command — this fixes re-toggle and toggle-off.
+    int  last_intensity = -1;
+    int  last_cmd_seen  = 0;
+    bool last_enable    = false;
     while (true) {
-        int cmd = g_zx_ctrl.cmd.load(std::memory_order_relaxed);
-        if (cmd != 0 && cmd != last_cmd) {
-            bool en        = g_zx_ctrl.enable.load() != 0;
+        int cmd = g_zx_ctrl.cmd.load(std::memory_order_acquire);
+        if (cmd != 0) {
+            bool en        = g_zx_ctrl.enable.load(std::memory_order_relaxed) != 0;
             int  intensity = g_zx_ctrl.intensity.load(std::memory_order_relaxed);
-            Features::apply(cmd, en);
-            if (intensity > 0)
-                Features::applyIntensity(cmd, intensity);
-            last_cmd = cmd;
+
+            bool state_changed     = (cmd != last_cmd_seen) || (en != last_enable);
+            bool intensity_changed = (intensity != last_intensity) || state_changed;
+
+            if (state_changed)
+                Features::apply(cmd, en);
+            if (intensity_changed)
+                Features::applyIntensity(cmd, intensity); // handles intensity=0 correctly
+
+            last_cmd_seen  = en ? cmd : 0; // reset so re-enable fires apply() again
+            last_enable    = en;
+            last_intensity = intensity;
             g_zx_ctrl.cmd.store(0, std::memory_order_release);
-        } else if (cmd != 0) {
-            // Same cmd as last — could be an intensity-only update
-            int intensity = g_zx_ctrl.intensity.load(std::memory_order_relaxed);
-            static int last_intensity = -1;
-            if (intensity != last_intensity) {
-                Features::applyIntensity(cmd, intensity);
-                last_intensity = intensity;
-            }
         }
         usleep(50000); // 50ms poll — negligible CPU
     }
