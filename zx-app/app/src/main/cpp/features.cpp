@@ -239,11 +239,11 @@ static void hookFireWeapon(void *self, void *a, void *b) {
     }
     if (g_noSpread && g_cls.offSpread > 0)
         Il2Cpp::writeField<float>(self, g_cls.offSpread, 0.f);
-    if (g_rapidFire && g_cls.offFireRate > 0)
-        Il2Cpp::writeField<float>(self, g_cls.offFireRate, 0.02f);
-    if (g_rapidFireRisk && g_cls.offFireRate > 0)
+    if (g_rapidFireRisk && g_cls.offFireRate > 0)       // LE-3: risk wins; else if prevents double write
         Il2Cpp::writeField<float>(self, g_cls.offFireRate,
             g_rapidIntensity.load(std::memory_order_relaxed));
+    else if (g_rapidFire && g_cls.offFireRate > 0)
+        Il2Cpp::writeField<float>(self, g_cls.offFireRate, 0.02f);
     if (!g_origFire) return;
     g_origFire(self, a, b);
 }
@@ -294,43 +294,50 @@ static void discoverRiskClasses() {
 
 using FnMoveUpdate = void(*)(void*);
 static FnMoveUpdate g_origMoveUpdate = nullptr;
-// Bug fix: cache original values so per-frame multiply doesn't compound exponentially
-static float s_baseMoveSpeed = 0.f;
-static float s_baseJumpForce = 0.f;
-static float s_baseVehicleSpeed = 0.f;
+// RC-1: atomic so ctrl_loop resets don't race with game thread reads
+static std::atomic<float> s_baseMoveSpeed{0.f};
+static std::atomic<float> s_baseJumpForce{0.f};
+static std::atomic<float> s_baseVehicleSpeed{0.f};
+
+// NW-2: store knocked teammate found via TakeDamage hook (see below)
+static std::atomic<void*> g_knockedTeammate{nullptr};
 
 static void hookMoveUpdate(void *self) {
     if (!s_risk_ready.load(std::memory_order_acquire)) {
         if (g_origMoveUpdate) g_origMoveUpdate(self);
         return;
     }
+    float bms = s_baseMoveSpeed.load(std::memory_order_relaxed);
     if (g_speedHack && g_risk.offMoveSpeed > 0) {
-        if (s_baseMoveSpeed == 0.f)
-            s_baseMoveSpeed = Il2Cpp::readField<float>(self, g_risk.offMoveSpeed);
+        if (bms == 0.f) {
+            bms = Il2Cpp::readField<float>(self, g_risk.offMoveSpeed);
+            s_baseMoveSpeed.store(bms, std::memory_order_relaxed);
+        }
         Il2Cpp::writeField<float>(self, g_risk.offMoveSpeed,
-            s_baseMoveSpeed * g_speedMult.load(std::memory_order_relaxed));
-    } else if (!g_speedHack && s_baseMoveSpeed != 0.f && g_risk.offMoveSpeed > 0) {
-        Il2Cpp::writeField<float>(self, g_risk.offMoveSpeed, s_baseMoveSpeed);
-        s_baseMoveSpeed = 0.f;
+            bms * g_speedMult.load(std::memory_order_relaxed));
+    } else if (!g_speedHack && bms != 0.f && g_risk.offMoveSpeed > 0) {
+        Il2Cpp::writeField<float>(self, g_risk.offMoveSpeed, bms);
+        s_baseMoveSpeed.store(0.f, std::memory_order_relaxed);
     }
+    float bjf = s_baseJumpForce.load(std::memory_order_relaxed);
     if (g_highJump && g_risk.offJumpForce > 0) {
-        if (s_baseJumpForce == 0.f)
-            s_baseJumpForce = Il2Cpp::readField<float>(self, g_risk.offJumpForce);
+        if (bjf == 0.f) {
+            bjf = Il2Cpp::readField<float>(self, g_risk.offJumpForce);
+            s_baseJumpForce.store(bjf, std::memory_order_relaxed);
+        }
         Il2Cpp::writeField<float>(self, g_risk.offJumpForce,
-            s_baseJumpForce * g_jumpMult.load(std::memory_order_relaxed));
-    } else if (!g_highJump && s_baseJumpForce != 0.f && g_risk.offJumpForce > 0) {
-        Il2Cpp::writeField<float>(self, g_risk.offJumpForce, s_baseJumpForce);
-        s_baseJumpForce = 0.f;
+            bjf * g_jumpMult.load(std::memory_order_relaxed));
+    } else if (!g_highJump && bjf != 0.f && g_risk.offJumpForce > 0) {
+        Il2Cpp::writeField<float>(self, g_risk.offJumpForce, bjf);
+        s_baseJumpForce.store(0.f, std::memory_order_relaxed);
     }
     if (g_origMoveUpdate) g_origMoveUpdate(self);
 
-    // Auto revive: scan nearby teammates for knocked state
-    if (g_autoRevive.load(std::memory_order_relaxed) && g_cls.offIsKnocked >= 0) {
-        // Trigger revive action through the move controller
-        if (g_origStartRevive) {
-            // Find knocked teammate via ESP player list — simplified: call revive on self context
-            // The actual teammate object would come from ESP's player cache
-            g_origStartRevive(self, nullptr);
+    // Auto revive: call StartRevive with the knocked teammate (CR-2: never pass nullptr)
+    if (g_autoRevive.load(std::memory_order_relaxed) && g_origStartRevive) {
+        void *tm = g_knockedTeammate.exchange(nullptr, std::memory_order_acq_rel);
+        if (tm) {
+            g_origStartRevive(self, tm);
         }
     }
 }
@@ -338,14 +345,17 @@ static void hookMoveUpdate(void *self) {
 using FnVehicleUpdate = void(*)(void*);
 static FnVehicleUpdate g_origVehicleUpdate = nullptr;
 static void hookVehicleUpdate(void *self) {
+    float bvs = s_baseVehicleSpeed.load(std::memory_order_relaxed);
     if (g_vehicleSpeed && g_risk.offVehicleSpeed > 0) {
-        if (s_baseVehicleSpeed == 0.f)
-            s_baseVehicleSpeed = Il2Cpp::readField<float>(self, g_risk.offVehicleSpeed);
+        if (bvs == 0.f) {
+            bvs = Il2Cpp::readField<float>(self, g_risk.offVehicleSpeed);
+            s_baseVehicleSpeed.store(bvs, std::memory_order_relaxed);
+        }
         Il2Cpp::writeField<float>(self, g_risk.offVehicleSpeed,
-            s_baseVehicleSpeed * g_vehicleMult.load(std::memory_order_relaxed));
-    } else if (!g_vehicleSpeed && s_baseVehicleSpeed != 0.f && g_risk.offVehicleSpeed > 0) {
-        Il2Cpp::writeField<float>(self, g_risk.offVehicleSpeed, s_baseVehicleSpeed);
-        s_baseVehicleSpeed = 0.f;
+            bvs * g_vehicleMult.load(std::memory_order_relaxed));
+    } else if (!g_vehicleSpeed && bvs != 0.f && g_risk.offVehicleSpeed > 0) {
+        Il2Cpp::writeField<float>(self, g_risk.offVehicleSpeed, bvs);
+        s_baseVehicleSpeed.store(0.f, std::memory_order_relaxed);
     }
     if (g_origVehicleUpdate) g_origVehicleUpdate(self);
 }
@@ -412,8 +422,7 @@ static void hookAimUpdate(void *self) {
 
     // Full aimbot: force aim angle toward nearest enemy head
     if (g_fullAimbot.load(std::memory_order_relaxed)) {
-        extern bool  ESP::hasHeadTarget();
-        extern Il2CppObject* ESP::getHeadTarget();
+        // CE-1: hasHeadTarget/getHeadTarget are declared in esp_renderer.hpp (already included)
         if (ESP::hasHeadTarget() && g_aim.offAimAngle >= 0) {
             // Max lock-on: set smooth to 0 (instant), bone to head
             Il2Cpp::writeField<float>(self, g_aim.offAimSmooth, 0.0f);
@@ -505,10 +514,17 @@ static void hookNoGrass() {
 using FnTakeDamage = void(*)(void*, float, void*);
 static FnTakeDamage g_origTakeDamage = nullptr;
 static void hookTakeDamage(void *self, float dmg, void *info) {
+    // CR-1: God Mode merged here — avoids double-hook on same TakeDamage method
+    if (g_godMode.load(std::memory_order_relaxed)) return;
     float d = g_antiDamage
         ? dmg * g_damageMult.load(std::memory_order_relaxed)
         : dmg;
     if (g_origTakeDamage) g_origTakeDamage(self, d, info);
+    // NW-2: detect knock after damage; store teammate ref for auto-revive
+    if (g_autoRevive.load(std::memory_order_relaxed) && g_cls.offIsKnocked >= 0) {
+        bool knocked = Il2Cpp::readField<bool>(self, g_cls.offIsKnocked);
+        if (knocked) g_knockedTeammate.store(self, std::memory_order_release);
+    }
 }
 
 static void hookAntiDamage() {
@@ -517,8 +533,7 @@ static void hookAntiDamage() {
     };
     for (const char **cn = kCls; *cn; cn++) {
         Il2CppClass *c = Il2Cpp::cls(*cn);
-        if (!c) c = g_cls.playerState;
-        if (!c) continue;
+        if (!c) continue; // LE-4: never fall back to playerState — wrong class
         static const char *kMeth[] = {
             "TakeDamage","OnTakeDamage","ReceiveDamage","ApplyDamage","HurtPlayer",nullptr
         };
@@ -580,16 +595,7 @@ static void hookWeaponFire() {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// God Mode — zero all incoming damage
-// ─────────────────────────────────────────────────────────────────────────────
-typedef void (*TakeDmgFn)(void*, float, void*);
-static TakeDmgFn g_origTakeDmg2 = nullptr;
-
-static void hookGodMode(void *self, float dmg, void *info) {
-    if (g_godMode.load(std::memory_order_relaxed)) return; // absorb
-    if (g_origTakeDmg2) g_origTakeDmg2(self, dmg, info);
-}
+// CR-1: God Mode logic merged into hookTakeDamage above — no second TakeDamage hook needed.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Infinite Ammo + No Reload
@@ -610,33 +616,44 @@ static void hookAfterFire(void *self, void *ctx) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// No-Clip — CharacterController.Move passthrough with no collision
-// We hook Move() and instead call SimpleMove with modified physics
+// No-Clip — CharacterController.Move passthrough with vertical freedom
+// CR-3: return type is CollisionFlags (int), not pointer. 0 = CollisionFlags.None
+// NW-3: offCharCtrl is not needed; vertical bypass works via motion.y manipulation
 // ─────────────────────────────────────────────────────────────────────────────
-typedef void* (*CharCtrlMoveFn)(void*, Vec3);
+typedef int (*CharCtrlMoveFn)(void*, Vec3);
 static CharCtrlMoveFn g_origCCMove = nullptr;
 
-static void* hookCCMove(void *self, Vec3 motion) {
+static int hookCCMove(void *self, Vec3 motion) {
     if (g_noclip.load(std::memory_order_relaxed)) {
-        // Scale motion vertically too — full 3D movement
-        motion.y = motion.y != 0.0f ? motion.y * 3.0f : 0.0f;
-        // Zero out gravity by writing isGrounded bypass
-        if (g_risk.offCharCtrl >= 0) {
-            // Write velocity directly past collision
-            Il2Cpp::writeField<Vec3>(self, g_risk.offCharCtrl, motion);
-        }
+        // Free vertical movement: add y component proportional to forward so player can fly
+        float horizMag = sqrtf(motion.x * motion.x + motion.z * motion.z);
+        if (horizMag > 0.001f)
+            motion.y = horizMag * 1.5f; // fly upward when moving, gentle climb
+        if (!g_origCCMove) return 0; // CollisionFlags::None
+        return g_origCCMove(self, motion);
     }
-    return g_origCCMove ? g_origCCMove(self, motion) : nullptr;
+    return g_origCCMove ? g_origCCMove(self, motion) : 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Teleport — write Transform.position on next update tick
+// NW-4: CMD_TELEPORT_SAVE sets g_savePosRequest; hookTransformSetPos captures
+//        the next position written for the local player and stores it as target.
 // ─────────────────────────────────────────────────────────────────────────────
 typedef void (*TransformSetPosFn)(void*, Vec3);
 static TransformSetPosFn g_origSetPos = nullptr;
 static std::atomic<bool> g_teleportPending{false};
+static std::atomic<bool> g_savePosRequest{false};
 
 static void hookTransformSetPos(void *self, Vec3 pos) {
+    // TELEPORT_SAVE: capture current position as future teleport destination
+    if (g_savePosRequest.exchange(false, std::memory_order_acq_rel)) {
+        g_teleportX.store(pos.x, std::memory_order_relaxed);
+        g_teleportY.store(pos.y, std::memory_order_relaxed);
+        g_teleportZ.store(pos.z, std::memory_order_relaxed);
+        LOG("Teleport position saved: %.1f,%.1f,%.1f", pos.x, pos.y, pos.z);
+    }
+    // TELEPORT: warp to previously saved position on next tick
     if (g_teleportPending.exchange(false, std::memory_order_acq_rel)) {
         Vec3 dst{ g_teleportX.load(), g_teleportY.load(), g_teleportZ.load() };
         if (g_origSetPos) g_origSetPos(self, dst);
@@ -656,9 +673,7 @@ static GetFireDirFn g_origGetFireDir = nullptr;
 static Vec3 hookGetFireDir(void *self) {
     Vec3 orig = g_origGetFireDir ? g_origGetFireDir(self) : Vec3{0,0,1};
     if (!g_silentAim.load(std::memory_order_relaxed)) return orig;
-    // Use ESP headshot target from esp_renderer
-    extern bool  ESP::hasHeadTarget();
-    extern Il2CppObject* ESP::getHeadTarget();
+    // CE-1: hasHeadTarget/getHeadTarget declared in esp_renderer.hpp
     if (!ESP::hasHeadTarget()) return orig;
     Il2CppObject *head = ESP::getHeadTarget();
     if (!head) return orig;
@@ -700,7 +715,8 @@ static HasLOSFn g_origHasLOS = nullptr;
 
 static bool hookHasLOS(void *self, void *from, void *to) {
     if (g_wallShoot.load(std::memory_order_relaxed)) return true;
-    return g_origHasLOS ? g_origHasLOS(self, from, to) : true;
+    // CR-4: safe fallback is false (no LOS) not true — prevents wall-shoot being permanently on
+    return g_origHasLOS ? g_origHasLOS(self, from, to) : false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -715,17 +731,8 @@ void Features::init() {
     hookAimSystem();
     hookNoGrass();
     hookAntiDamage();
+    // CR-1: God Mode is merged into hookTakeDamage — no separate hook here.
 
-    // God Mode — hook TakeDamage (reuse or find alternate symbol)
-    {
-        Il2CppClass *hcls = g_cls.healthCls ? g_cls.healthCls : Il2Cpp::cls("CSCharacterHealth");
-        if (hcls) {
-            MethodInfo *m = Il2Cpp::getMethod(hcls, "TakeDamage", 2);
-            if (m && m->methodPointer) {
-                DobbyHook((void*)m->methodPointer, (void*)hookGodMode, (void**)&g_origTakeDmg2);
-            }
-        }
-    }
     // Infinite Ammo + No Reload — hook post-fire callback
     {
         if (g_cls.weaponFire) {
@@ -779,6 +786,49 @@ void Features::init() {
             }
         }
     }
+    // NW-1: Silent Aim — hook GetFireDirection (must be here; not hooked anywhere else)
+    {
+        static const char *kSACls[] = {
+            "FireComponent","ShooterComponent","WeaponShooter","PlayerShooter",
+            "BulletShooter","GunComponent","WeaponFire",nullptr
+        };
+        for (const char **cn = kSACls; *cn; cn++) {
+            Il2CppClass *c = Il2Cpp::cls(*cn);
+            if (!c) continue;
+            static const char *kDir[] = {
+                "GetFireDirection","GetShootDir","CalculateFireDir",
+                "GetBulletDir","GetFireDir","FireDirection",nullptr
+            };
+            for (const char **mn = kDir; *mn; mn++) {
+                MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
+                if (m && m->methodPointer) {
+                    DobbyHook((void*)m->methodPointer, (void*)hookGetFireDir,
+                              (void**)&g_origGetFireDir);
+                    LOG("Silent Aim hooked: %s::%s @ %p", *cn, *mn, m->methodPointer);
+                    goto sa_done;
+                }
+            }
+        }
+        sa_done:;
+    }
+    // NW-2: Auto Revive — find StartRevive method pointer without double-hooking
+    {
+        static const char *kRevCls[] = {"CSPlayerState","PlayerController","CharacterRevive",nullptr};
+        for (const char **cn = kRevCls; *cn; cn++) {
+            Il2CppClass *c = Il2Cpp::cls(*cn);
+            if (!c) continue;
+            static const char *kRev[] = {"StartRevive","DoRevive","ReviveMate","RevivePlayer","TryRevive",nullptr};
+            for (const char **mn = kRev; *mn; mn++) {
+                MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
+                if (m && m->methodPointer) {
+                    g_origStartRevive = (StartReviveFn)m->methodPointer;
+                    LOG("StartRevive found: %s::%s @ %p", *cn, *mn, m->methodPointer);
+                    goto rev_done;
+                }
+            }
+        }
+        rev_done:;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -804,29 +854,17 @@ static void rapidFire(bool on) {
 }
 
 static void aimAssist(bool on) {
-    if (g_cls.playerState) {
-        static const char *kA[] = {"aimAssistAngle","AimAssistAngle","autoAimAngle","magnetAngle",nullptr};
-        for (const char **n = kA; *n; n++) {
-            FieldInfo *f = Il2Cpp::getField(g_cls.playerState, *n);
-            if (f) { Il2Cpp::setStaticFloat(f, on ? 30.f : 5.f); break; }
-        }
-    }
+    // NW-5: hookAimUpdate already writes aim angle per-instance via offAimAngle.
+    // LE-5: setStaticFloat on instance fields is wrong — removed.
+    // Just toggle the flag; hookAimUpdate does the real work.
+    g_aimEnabled = on;
     LOG("AimAssist %s", on ? "ON" : "OFF");
 }
 
 static void widePov(bool on) {
+    // LE-5: setStaticFloat on instance FOV field is wrong — removed.
+    // hookSetFOV intercepts Camera.set_fieldOfView and applies g_fovOverride per-frame.
     g_fovOverride.store(on ? 90.f : 0.f, std::memory_order_relaxed);
-    static const char *kCam[] = {"CameraController","CamController","FPSCamera","PlayerCamera",nullptr};
-    for (const char **cn = kCam; *cn; cn++) {
-        Il2CppClass *c = Il2Cpp::cls(*cn);
-        if (!c) continue;
-        static const char *kFov[] = {"fieldOfView","fov","FOV","m_fov",nullptr};
-        for (const char **fn = kFov; *fn; fn++) {
-            FieldInfo *f = Il2Cpp::getField(c, *fn);
-            if (f) { Il2Cpp::setStaticFloat(f, on ? 90.f : 60.f); break; }
-        }
-        break;
-    }
     LOG("WidePOV %s", on ? "ON" : "OFF");
 }
 
@@ -872,8 +910,7 @@ void Features::apply(int cmd, bool enable) {
             LOG("AntiDamage %s", enable ? "ON" : "OFF");
             break;
         case CMD_AIM_ENABLE:
-            g_aimEnabled = enable;
-            LOG("AimSystem %s", enable ? "ON" : "OFF");
+            aimAssist(enable); // NW-5: route through aimAssist() which sets g_aimEnabled
             break;
         case CMD_AIM_BONE:
         case CMD_AIM_FOV:
@@ -887,13 +924,15 @@ void Features::apply(int cmd, bool enable) {
             g_teleport.store(enable);
             if (enable) g_teleportPending.store(true);
             break;
-        case CMD_TELEPORT_SAVE: {
-            // Save local player position as teleport target
-            // Will be populated from UI via applyIntensity with encoded coords
+        case CMD_TELEPORT_SAVE:
+            // NW-4: request position capture on next hookTransformSetPos call
+            if (enable) g_savePosRequest.store(true, std::memory_order_release);
             break;
-        }
         case CMD_SILENT_AIM:      g_silentAim.store(enable);      break;
-        case CMD_AUTO_HEADSHOT:   g_autoHeadshot.store(enable);   break;
+        case CMD_AUTO_HEADSHOT:
+            g_autoHeadshot.store(enable);
+            ESP::setHeadshotAssist(enable); // SP-1: wire ESP headshot assist rendering
+            break;
         case CMD_FULL_AIMBOT:     g_fullAimbot.store(enable);     break;
         case CMD_ANTI_AIM:        g_antiAim.store(enable);        break;
         case CMD_AUTO_REVIVE:     g_autoRevive.store(enable);     break;
@@ -931,12 +970,18 @@ void Features::applyIntensity(int cmd, int intensity) {
             g_aimBone.store(intensity, std::memory_order_relaxed);
             break;
         case CMD_AIM_FOV:
-            // intensity = FOV degrees; clamp to minimum 5° so acquisition cone is never zero
-            g_aimFov.store(std::max((float)intensity, 5.f), std::memory_order_relaxed);
+            // LE-1: Kotlin sends 0-100% of (sliderMax-sliderMin). sliderMin=5,sliderMax=90 → range=85°.
+            // Map back: actual_degrees = 5 + intensity * 85 / 100. Clamp ≥5° always.
+            g_aimFov.store(std::max(5.f + (float)intensity * 85.f / 100.f, 5.f), std::memory_order_relaxed);
             break;
         case CMD_AIM_SMOOTH:
             // 0% = fast snap (0.95), 100% = slow smooth follow (0.05) — inverted & floored
             g_aimSmooth.store(std::max(1.f - t, 0.05f), std::memory_order_relaxed);
+            break;
+        case CMD_WIDE_POV:
+            // LE-2: add slider handling; sliderMin=60,sliderMax=150 → range=90°.
+            // Map: fov = 60 + intensity * 90 / 100. 0%→60°, 100%→150°.
+            g_fovOverride.store(60.f + (float)intensity * 90.f / 100.f, std::memory_order_relaxed);
             break;
         default: break;
     }

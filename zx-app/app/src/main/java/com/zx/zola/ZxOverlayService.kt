@@ -43,6 +43,8 @@ class ZxOverlayService : Service() {
             Feature("Anti-Aim",      ZxEngine.Cmd.ANTI_AIM,      Risk.DANGER),
             Feature("Aim FOV",       ZxEngine.Cmd.AIM_FOV,       Risk.RISK,
                 hasSlider=true, sliderMin=5, sliderMax=90, sliderDefault=30, sliderLabel="°"),
+            Feature("Aim Bone",      ZxEngine.Cmd.AIM_BONE,      Risk.RISK,
+                hasSlider=true, sliderMin=0, sliderMax=2, sliderDefault=0, sliderLabel=" (0=Chest 1=Neck 2=Head)"),
             Feature("Smoothness",    ZxEngine.Cmd.AIM_SMOOTH,    Risk.RISK,
                 hasSlider=true, sliderDefault=40, sliderLabel="%")
         ),
@@ -62,8 +64,9 @@ class ZxOverlayService : Service() {
                 hasSlider=true, sliderMin=10, sliderMax=200, sliderDefault=40, sliderLabel="%"),
             Feature("High Jump",     ZxEngine.Cmd.HIGH_JUMP,      Risk.RISK,
                 hasSlider=true, sliderMin=10, sliderMax=200, sliderDefault=50, sliderLabel="%"),
-            Feature("No-Clip",       ZxEngine.Cmd.NOCLIP,         Risk.DANGER),
-            Feature("Teleport",      ZxEngine.Cmd.TELEPORT,       Risk.DANGER)
+            Feature("No-Clip",          ZxEngine.Cmd.NOCLIP,          Risk.DANGER),
+            Feature("Teleport",         ZxEngine.Cmd.TELEPORT,        Risk.DANGER),
+            Feature("Save Position",    ZxEngine.Cmd.TELEPORT_SAVE,   Risk.SAFE)
         ),
         Tab.SURVIVAL to listOf(
             Feature("Anti Damage",   ZxEngine.Cmd.ANTI_DAMAGE,    Risk.RISK,
@@ -365,7 +368,7 @@ class ZxOverlayService : Service() {
         val sw = Switch(this).apply {
             isChecked = false
             trackDrawable = ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.sel_switch_track)
-            thumbDrawable = null
+            // CR-5: thumbDrawable = null causes NPE on API 26-29; use default thumb
             setOnCheckedChangeListener { _, on ->
                 ZxEngine.toggle(feature.cmd, on)
             }
