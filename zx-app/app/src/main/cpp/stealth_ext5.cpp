@@ -48,6 +48,8 @@
 #include <cstdlib>
 #include <sys/inotify.h>
 #include <pthread.h>
+#include <cctype>
+#include <cstdint>
 
 #ifndef ZX_RELEASE
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  "ZX", __VA_ARGS__)
@@ -63,8 +65,8 @@
 // "libzx_payload.so" XOR 0x5A
 // ─────────────────────────────────────────────────────────────────────────────
 static const uint8_t k_payload_xored[] = {
-    // l    i    b    z    x    _    p    a    y    l    o    a    d    .    s    o
-    0x36,0x33,0x38,0x22,0x22,0x65,0x2A,0x3B,0x23,0x36,0x35,0x3B,0x3E,0x74,0x29,0x35,0x00
+    // l     i     b     z     x     _     p     a     y     l     o     a     d     .     s     o
+    0x36, 0x33, 0x38, 0x20, 0x22, 0x05, 0x2A, 0x3B, 0x23, 0x36, 0x35, 0x3B, 0x3E, 0x74, 0x29, 0x35, 0x00
 };
 
 static char s_payload_name[32] = {};
@@ -75,20 +77,41 @@ static void decode_payload_name() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// libanogs.so range — used by Layer 44 for caller-aware dl_iterate_phdr filtering
+// ─────────────────────────────────────────────────────────────────────────────
+static uintptr_t s_ano_base5 = 0;
+static uintptr_t s_ano_end5  = 0;
+
+static int phdr_find_anogs5(dl_phdr_info *info, size_t /*sz*/, void * /*d*/) {
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_LOAD) {
+            uintptr_t se = base + ph.p_vaddr + ph.p_memsz;
+            if (se > end) end = se;
+        }
+    }
+    s_ano_base5 = base; s_ano_end5 = end; return 1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Layer 44 — dl_iterate_phdr poisoner
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct DlIterCtx {
     dl_iterate_phdr_callback real_cb;
     void *real_data;
+    bool  from_anogs;   // true = filter out our payload .so
 };
 
 static int dl_iter_filter_cb(dl_phdr_info *info, size_t size, void *data) {
     DlIterCtx *ctx = static_cast<DlIterCtx*>(data);
-    // Hide our payload .so from any enumerating caller
-    if (info && info->dlpi_name && s_payload_name[0] &&
+    // Only filter when caller is libanogs — IL2CPP exception unwinder also
+    // uses dl_iterate_phdr to find .eh_frame; hiding from it causes crashes.
+    if (ctx->from_anogs && info && info->dlpi_name && s_payload_name[0] &&
         strstr(info->dlpi_name, s_payload_name)) {
-        return 0; // silently skip — caller never sees it
+        return 0;
     }
     return ctx->real_cb(info, size, ctx->real_data);
 }
@@ -96,9 +119,12 @@ static int dl_iter_filter_cb(dl_phdr_info *info, size_t size, void *data) {
 typedef int (*dl_iterate_phdr_t)(dl_iterate_phdr_callback, void*);
 static dl_iterate_phdr_t orig_dl_iterate_phdr = nullptr;
 
-static int hook_dl_iterate_phdr(dl_iterate_phdr_callback cb, void *data) {
+static int __attribute__((noinline)) hook_dl_iterate_phdr(dl_iterate_phdr_callback cb, void *data) {
     if (!orig_dl_iterate_phdr) return 0;
-    DlIterCtx ctx = { cb, data };
+    uintptr_t lr = (uintptr_t)__builtin_return_address(0);
+    if (!s_ano_base5) orig_dl_iterate_phdr(phdr_find_anogs5, nullptr);
+    bool from_ano = (s_ano_base5 && lr >= s_ano_base5 && lr < s_ano_end5);
+    DlIterCtx ctx = { cb, data, from_ano };
     return orig_dl_iterate_phdr(dl_iter_filter_cb, &ctx);
 }
 
@@ -139,12 +165,10 @@ static int hook_inotify_add_watch(int fd, const char *pathname, uint32_t mask) {
     // Let through: only redirect if path looks like an AnoSDK monitored path.
     // If it's our own app's path monitoring — fall through unchanged.
     if (!pathname) return -1;
-    // Redirect AnoSDK's specific watch targets to /dev/null
+    // Redirect only AnoSDK's known watch targets — exclude /dev/input/* (gamepad)
     if (strstr(pathname, "/data/data") ||
         strstr(pathname, "/data/user") ||
-        strstr(pathname, "/dev/")     ||
         strstr(pathname, "/proc/")) {
-        // Redirect to /dev/null — watch is "installed" but fires nothing
         return orig_inotify_add_watch(fd, "/dev/null", mask);
     }
     return orig_inotify_add_watch(fd, pathname, mask);
@@ -159,18 +183,29 @@ static int hook_inotify_add_watch(int fd, const char *pathname, uint32_t mask) {
 typedef FILE* (*popen_t)(const char*, const char*);
 static popen_t orig_popen = nullptr;
 
+static bool cmd_has_word(const char *cmd, const char *word) {
+    const char *p = cmd;
+    size_t wlen = strlen(word);
+    while ((p = strstr(p, word)) != nullptr) {
+        bool pre_ok  = (p == cmd || !isalnum((unsigned char)p[-1]));
+        bool post_ok = !isalnum((unsigned char)p[wlen]);
+        if (pre_ok && post_ok) return true;
+        p++;
+    }
+    return false;
+}
+
 static bool is_ano_popen(const char *cmd) {
     if (!cmd) return false;
-    // Commands AnoSDK uses to gather process/memory info
-    return (strstr(cmd, "ps")       ||
+    return (cmd_has_word(cmd, "ps") ||
             strstr(cmd, "/proc/")   ||
             strstr(cmd, "ls /")     ||
             strstr(cmd, "cat /")    ||
             strstr(cmd, "grep ")    ||
             strstr(cmd, "getprop")  ||
-            strstr(cmd, "id ")      ||
+            cmd_has_word(cmd, "id") ||
             strstr(cmd, "whoami")   ||
-            strstr(cmd, "su ")      ||
+            cmd_has_word(cmd, "su") ||
             strstr(cmd, "mount"));
 }
 
@@ -189,6 +224,7 @@ static FILE* hook_popen(const char *cmd, const char *mode) {
 
 void install_stealth_ext5() {
     decode_payload_name();
+    dl_iterate_phdr(phdr_find_anogs5, nullptr);
 
     // Layer 44 — dl_iterate_phdr via libc PLT
     {

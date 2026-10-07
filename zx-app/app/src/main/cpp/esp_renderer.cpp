@@ -97,6 +97,30 @@ struct EnemyData {
     bool valid;
 };
 
+struct BoneCache {
+    void         *player_ptr;
+    Il2CppObject *head_b, *chest_b, *lsh_b, *rsh_b, *lft_b, *rft_b;
+};
+static BoneCache s_bone_cache[MAX_ENM];
+static int       s_bone_cache_n = 0;
+
+static BoneCache *lookup_bone_cache(void *player_ptr) {
+    for (int i = 0; i < s_bone_cache_n; i++)
+        if (s_bone_cache[i].player_ptr == player_ptr) return &s_bone_cache[i];
+    return nullptr;
+}
+
+static void evict_stale_bone_cache(Il2CppObject **active, int count) {
+    for (int ci = 0; ci < s_bone_cache_n; ) {
+        bool found = false;
+        for (int pi = 0; pi < count; pi++) {
+            if ((void*)active[pi] == s_bone_cache[ci].player_ptr) { found = true; break; }
+        }
+        if (!found) s_bone_cache[ci] = s_bone_cache[--s_bone_cache_n];
+        else ci++;
+    }
+}
+
 static EnemyData      g_cache[MAX_ENM];
 static int            g_cache_n = 0;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -440,13 +464,25 @@ static void *position_updater(void *) {
 
             EnemyData ed{};
 
-            // Get bone positions
-            Il2CppObject *head_b  = find_bone(tr, k_head_names);
-            Il2CppObject *chest_b = find_bone(tr, k_chest_names);
-            Il2CppObject *lsh_b   = find_bone(tr, k_lsh_names);
-            Il2CppObject *rsh_b   = find_bone(tr, k_rsh_names);
-            Il2CppObject *lft_b   = find_bone(tr, k_lft_names);
-            Il2CppObject *rft_b   = find_bone(tr, k_rft_names);
+            // Cache bone transforms — resolves IL2CPP string names once per new player
+            // instead of 36 Il2Cpp::newString() calls every 50ms (GC pressure eliminated)
+            BoneCache *bc = lookup_bone_cache(p);
+            if (!bc && s_bone_cache_n < MAX_ENM) {
+                bc = &s_bone_cache[s_bone_cache_n++];
+                bc->player_ptr = p;
+                bc->head_b  = find_bone(tr, k_head_names);
+                bc->chest_b = find_bone(tr, k_chest_names);
+                bc->lsh_b   = find_bone(tr, k_lsh_names);
+                bc->rsh_b   = find_bone(tr, k_rsh_names);
+                bc->lft_b   = find_bone(tr, k_lft_names);
+                bc->rft_b   = find_bone(tr, k_rft_names);
+            }
+            Il2CppObject *head_b  = bc ? bc->head_b  : nullptr;
+            Il2CppObject *chest_b = bc ? bc->chest_b : nullptr;
+            Il2CppObject *lsh_b   = bc ? bc->lsh_b   : nullptr;
+            Il2CppObject *rsh_b   = bc ? bc->rsh_b   : nullptr;
+            Il2CppObject *lft_b   = bc ? bc->lft_b   : nullptr;
+            Il2CppObject *rft_b   = bc ? bc->rft_b   : nullptr;
 
             Vec3 root_pos = get_position(tr);
             ed.head      = head_b  ? get_position(head_b)  : Vec3{root_pos.x, root_pos.y + 1.7f, root_pos.z};
@@ -463,7 +499,10 @@ static void *position_updater(void *) {
             new_cache[nc++] = ed;
         }
 
-        if (players) free(players);
+        if (players) {
+            evict_stale_bone_cache(players, player_count);
+            free(players);
+        }
 
         pthread_mutex_lock(&g_mu);
         memcpy(g_cache, new_cache, sizeof(EnemyData) * (size_t)nc);

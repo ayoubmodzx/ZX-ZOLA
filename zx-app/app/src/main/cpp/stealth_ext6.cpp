@@ -91,7 +91,11 @@ static int phdr_find_anogs(dl_phdr_info *info, size_t /*size*/, void * /*data*/)
     return 1; // stop iteration
 }
 
-static inline bool caller_is_anogs(uintptr_t lr) {
+static bool caller_is_anogs(uintptr_t lr) {
+    if (!s_ano_base) {
+        static int s_retry = 0;
+        if (s_retry++ < 50) dl_iterate_phdr(phdr_find_anogs, nullptr);
+    }
     return (s_ano_base && lr >= s_ano_base && lr < s_ano_end);
 }
 
@@ -100,7 +104,8 @@ static inline bool caller_is_anogs(uintptr_t lr) {
 // "libzx_payload.so"
 // ─────────────────────────────────────────────────────────────────────────────
 static const uint8_t k_pay_xor[] = {
-    0x36,0x33,0x38,0x22,0x22,0x65,0x2A,0x3B,0x23,0x36,0x35,0x3B,0x3E,0x74,0x29,0x35,0x00
+    // l     i     b     z     x     _     p     a     y     l     o     a     d     .     s     o
+    0x36, 0x33, 0x38, 0x20, 0x22, 0x05, 0x2A, 0x3B, 0x23, 0x36, 0x35, 0x3B, 0x3E, 0x74, 0x29, 0x35, 0x00
 };
 static char s_pay_name[32] = {};
 static void decode_pay() {
@@ -115,7 +120,7 @@ static void decode_pay() {
 typedef int (*connect_t)(int, const struct sockaddr*, socklen_t);
 static connect_t orig_connect = nullptr;
 
-static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+static int __attribute__((noinline)) hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
     if (caller_is_anogs(lr)) {
         // Block all outbound connections from libanogs — report as refused
@@ -132,7 +137,7 @@ static int hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrl
 typedef pid_t (*fork_t)();
 static fork_t orig_fork = nullptr;
 
-static pid_t hook_fork() {
+static pid_t __attribute__((noinline)) hook_fork() {
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
     if (caller_is_anogs(lr)) {
         pid_t pid = orig_fork();
@@ -171,7 +176,7 @@ static int hook_execv(const char *pathname, char* const argv[]) {
 typedef int (*mincore_t)(void*, size_t, unsigned char*);
 static mincore_t orig_mincore = nullptr;
 
-static int hook_mincore(void *addr, size_t length, unsigned char *vec) {
+static int __attribute__((noinline)) hook_mincore(void *addr, size_t length, unsigned char *vec) {
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
     int ret = orig_mincore(addr, length, vec);
     // If caller is libanogs — force all pages to look clean and in-core
@@ -195,7 +200,8 @@ static readlink_t orig_readlink = nullptr;
 
 // XOR-encoded injector binary name: "zx_injector" ^ 0x5A
 static const uint8_t k_inj_xor[] = {
-    0x22,0x32,0x65,0x33,0x31,0x38,0x3B,0x34,0x38,0x3B,0x29,0x00
+    // z     x     _     i     n     j     e     c     t     o     r
+    0x20, 0x22, 0x05, 0x33, 0x34, 0x30, 0x3F, 0x39, 0x2E, 0x35, 0x28, 0x00
 };
 static char s_inj_name[32] = {};
 static void decode_inj() {
