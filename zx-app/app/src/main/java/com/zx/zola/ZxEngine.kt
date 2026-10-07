@@ -13,10 +13,8 @@ private const val FF_PKG2 = "com.dts.freefiremax"
 object Cmd {
     const val ANTI_RECOIL    = 1;  const val NO_SPREAD      = 2
     const val RAPID_FIRE     = 3;  const val AIM_ASSIST     = 4
-    const val SPEED_HACK     = 5;  const val HIGH_JUMP      = 6
-    const val VEHICLE_SPEED  = 7;  const val WIDE_POV       = 8
-    const val NO_GRASS       = 9;  const val MAX_HEALTH     = 10
-    const val ANTI_DAMAGE    = 11
+    const val WIDE_POV       = 5;  const val ESP            = 6
+    const val HEADSHOT_ASSIST= 7
 }
 
 object ZxEngine {

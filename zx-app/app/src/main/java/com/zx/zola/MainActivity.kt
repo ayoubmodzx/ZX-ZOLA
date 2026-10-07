@@ -3,14 +3,31 @@ package com.zx.zola
 import android.content.*
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
+import android.view.View
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import com.google.android.material.switchmaterial.SwitchMaterial
 
 class MainActivity : AppCompatActivity() {
 
     private val OVERLAY_REQ = 100
+    private val handler = Handler(Looper.getMainLooper())
+    private var isActive = false
+
+    // Feature switch → Cmd constant mapping
+    private val featureMap = mapOf(
+        R.id.sw_aim_assist  to Cmd.AIM_ASSIST,
+        R.id.sw_headshot    to Cmd.HEADSHOT_ASSIST,
+        R.id.sw_wide_pov    to Cmd.WIDE_POV,
+        R.id.sw_anti_recoil to Cmd.ANTI_RECOIL,
+        R.id.sw_no_spread   to Cmd.NO_SPREAD,
+        R.id.sw_rapid_fire  to Cmd.RAPID_FIRE,
+        R.id.sw_esp         to Cmd.ESP
+    )
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -18,28 +35,59 @@ class MainActivity : AppCompatActivity() {
 
         ZxEngine.init(this)
 
-        val statusTv    = findViewById<TextView>(R.id.tv_status)
-        val activateBtn = findViewById<Button>(R.id.btn_activate)
-        val stopBtn     = findViewById<Button>(R.id.btn_stop)
+        val activateBtn  = findViewById<Button>(R.id.btn_activate)
+        val stopBtn      = findViewById<Button>(R.id.btn_stop)
 
         activateBtn.setOnClickListener {
             if (!Settings.canDrawOverlays(this)) {
-                requestOverlayPermission()
-                return@setOnClickListener
+                requestOverlayPermission(); return@setOnClickListener
             }
             if (!ZxEngine.isFfRunning()) {
-                Toast.makeText(this, "Open Free Fire first", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Launch Free Fire first", Toast.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
             startFg()
-            statusTv.text = "● ACTIVE"
-            statusTv.setTextColor(getColor(android.R.color.holo_red_light))
+            setActive(true)
         }
 
         stopBtn.setOnClickListener {
             stopFg()
-            statusTv.text = "● INACTIVE"
-            statusTv.setTextColor(getColor(android.R.color.darker_gray))
+            setActive(false)
+        }
+
+        // Wire all feature switches
+        featureMap.forEach { (viewId, cmd) ->
+            findViewById<SwitchMaterial>(viewId).setOnCheckedChangeListener { _, checked ->
+                if (isActive) ZxEngine.toggle(cmd, checked)
+                else if (checked) Toast.makeText(this, "Activate mod first", Toast.LENGTH_SHORT).show()
+                    .also { (it as? Unit); findViewById<SwitchMaterial>(viewId).isChecked = false }
+            }
+        }
+    }
+
+    private fun setActive(active: Boolean) {
+        isActive = active
+        val statusCard = findViewById<View>(R.id.card_status)
+        val dot        = findViewById<View>(R.id.dot_status)
+        val tv         = findViewById<TextView>(R.id.tv_status)
+        val tvSub      = findViewById<TextView>(R.id.tv_status_sub)
+
+        if (active) {
+            statusCard.setBackgroundResource(R.drawable.bg_status_active)
+            dot.setBackgroundColor(getColor(R.color.zx_purple))
+            tv.text = "ACTIVE"
+            tv.setTextColor(getColor(R.color.zx_purple))
+            tvSub.text = "Injected"
+        } else {
+            statusCard.setBackgroundResource(R.drawable.bg_status_inactive)
+            dot.setBackgroundColor(getColor(R.color.zx_text_muted))
+            tv.text = "INACTIVE"
+            tv.setTextColor(getColor(R.color.zx_text_dim))
+            tvSub.text = "Ready"
+            // Reset all switches when deactivating
+            featureMap.keys.forEach { id ->
+                findViewById<SwitchMaterial>(id).isChecked = false
+            }
         }
     }
 

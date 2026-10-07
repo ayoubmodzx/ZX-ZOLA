@@ -1,68 +1,357 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<androidx.core.widget.NestedScrollView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:background="#0A0A0A"
-    android:gravity="center"
-    android:padding="32dp">
+    android:background="@color/zx_bg"
+    android:fillViewport="true">
 
-    <TextView
-        android:text="⚡ ZX-ZOLA"
-        android:textColor="#FF4444"
-        android:textSize="36sp"
-        android:textStyle="bold"
-        android:layout_width="wrap_content"
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginBottom="8dp"/>
+        android:orientation="vertical"
+        android:padding="20dp">
 
-    <TextView
-        android:text="FREE FIRE MOD"
-        android:textColor="#666666"
-        android:textSize="12sp"
-        android:letterSpacing="0.3"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="40dp"/>
+        <!-- ══ HEADER ══════════════════════════════════════════════════════ -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:gravity="center"
+            android:paddingTop="24dp"
+            android:paddingBottom="28dp">
 
-    <TextView
-        android:id="@+id/tv_status"
-        android:text="● INACTIVE"
-        android:textColor="#666666"
-        android:textSize="14sp"
-        android:textStyle="bold"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginBottom="32dp"/>
+            <ImageView
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:src="@drawable/ic_zx"
+                android:layout_marginBottom="10dp"/>
 
-    <Button
-        android:id="@+id/btn_activate"
-        android:text="ACTIVATE"
-        android:textColor="#FFFFFF"
-        android:backgroundTint="#FF4444"
-        android:layout_width="220dp"
-        android:layout_height="52dp"
-        android:textSize="15sp"
-        android:textStyle="bold"
-        android:layout_marginBottom="12dp"
-        style="@style/Widget.Material3.Button"/>
+            <TextView
+                android:text="ZX-ZOLA"
+                android:textColor="@color/zx_purple"
+                android:textSize="34sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.15"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"/>
 
-    <Button
-        android:id="@+id/btn_stop"
-        android:text="STOP"
-        android:textColor="#AAAAAA"
-        android:backgroundTint="#1A1A1A"
-        android:layout_width="220dp"
-        android:layout_height="52dp"
-        android:textSize="15sp"
-        style="@style/Widget.Material3.Button.OutlinedButton"/>
+            <TextView
+                android:text="FREE FIRE • MOD MENU"
+                android:textColor="@color/zx_text_dim"
+                android:textSize="11sp"
+                android:letterSpacing="0.4"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"/>
+        </LinearLayout>
 
-    <TextView
-        android:text="Requires root • Open FF before activating"
-        android:textColor="#444444"
-        android:textSize="11sp"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="32dp"/>
+        <!-- ══ STATUS CARD ═════════════════════════════════════════════════ -->
+        <LinearLayout
+            android:id="@+id/card_status"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingStart="20dp"
+            android:paddingEnd="20dp"
+            android:background="@drawable/bg_status_inactive"
+            android:layout_marginBottom="20dp">
 
-</LinearLayout>
+            <View
+                android:id="@+id/dot_status"
+                android:layout_width="8dp"
+                android:layout_height="8dp"
+                android:background="#2D2D42"
+                android:layout_marginEnd="12dp"/>
+
+            <TextView
+                android:id="@+id/tv_status"
+                android:text="INACTIVE"
+                android:textColor="@color/zx_text_dim"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:letterSpacing="0.2"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"/>
+
+            <TextView
+                android:id="@+id/tv_status_sub"
+                android:text="Ready"
+                android:textColor="@color/zx_text_muted"
+                android:textSize="11sp"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"/>
+        </LinearLayout>
+
+        <!-- ══ AIMBOT SECTION ══════════════════════════════════════════════ -->
+        <TextView
+            android:text="  AIMBOT"
+            android:textColor="@color/zx_text_dim"
+            android:textSize="10sp"
+            android:letterSpacing="0.5"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_card"
+            android:layout_marginBottom="16dp">
+
+            <!-- Aim Assist -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_aim"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="Aim Assist" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Auto target lock" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_aim_assist"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:checked="false"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+
+            <View android:layout_width="match_parent" android:layout_height="1dp" android:background="@color/zx_border" android:marginStart="54dp"/>
+
+            <!-- Headshot Assist -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_recoil"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="Headshot Assist" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Force head hitbox" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_headshot"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+
+            <View android:layout_width="match_parent" android:layout_height="1dp" android:background="@color/zx_border" android:marginStart="54dp"/>
+
+            <!-- Wide POV -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_esp"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="Wide FOV" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Extended field of view" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_wide_pov"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ══ WEAPON SECTION ═════════════════════════════════════════════ -->
+        <TextView
+            android:text="  WEAPON"
+            android:textColor="@color/zx_text_dim"
+            android:textSize="10sp"
+            android:letterSpacing="0.5"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_card"
+            android:layout_marginBottom="16dp">
+
+            <!-- Anti Recoil -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_recoil"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="Anti Recoil" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Zero vertical climb" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_anti_recoil"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+
+            <View android:layout_width="match_parent" android:layout_height="1dp" android:background="@color/zx_border" android:marginStart="54dp"/>
+
+            <!-- No Spread -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_recoil"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="No Spread" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Pinpoint bullet accuracy" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_no_spread"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+
+            <View android:layout_width="match_parent" android:layout_height="1dp" android:background="@color/zx_border" android:marginStart="54dp"/>
+
+            <!-- Rapid Fire -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_zx"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="Rapid Fire" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Maximum fire rate" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_rapid_fire"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ══ VISUAL SECTION ════════════════════════════════════════════ -->
+        <TextView
+            android:text="  VISUAL"
+            android:textColor="@color/zx_text_dim"
+            android:textSize="10sp"
+            android:letterSpacing="0.5"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/bg_card"
+            android:layout_marginBottom="24dp">
+
+            <!-- ESP -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="60dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="18dp"
+                android:paddingEnd="14dp">
+                <ImageView
+                    android:layout_width="22dp"
+                    android:layout_height="22dp"
+                    android:src="@drawable/ic_esp"
+                    android:layout_marginEnd="14dp"/>
+                <LinearLayout android:layout_width="0dp" android:layout_height="wrap_content" android:layout_weight="1" android:orientation="vertical">
+                    <TextView android:text="ESP Boxes" android:textColor="@color/zx_text" android:textSize="14sp" android:textStyle="bold" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                    <TextView android:text="Neon outline through walls" android:textColor="@color/zx_text_dim" android:textSize="11sp" android:layout_width="wrap_content" android:layout_height="wrap_content"/>
+                </LinearLayout>
+                <com.google.android.material.switchmaterial.SwitchMaterial
+                    android:id="@+id/sw_esp"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    style="@style/ZxSwitch"/>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ══ ACTION BUTTONS ══════════════════════════════════════════════ -->
+        <Button
+            android:id="@+id/btn_activate"
+            android:text="ACTIVATE MOD"
+            android:textColor="#FFFFFF"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            android:letterSpacing="0.1"
+            android:layout_width="match_parent"
+            android:layout_height="56dp"
+            android:background="@drawable/bg_btn_activate"
+            android:layout_marginBottom="10dp"
+            android:stateListAnimator="@null"/>
+
+        <Button
+            android:id="@+id/btn_stop"
+            android:text="DEACTIVATE"
+            android:textColor="@color/zx_text_dim"
+            android:textSize="14sp"
+            android:letterSpacing="0.1"
+            android:layout_width="match_parent"
+            android:layout_height="52dp"
+            android:background="@drawable/bg_btn_stop"
+            android:layout_marginBottom="16dp"
+            android:stateListAnimator="@null"/>
+
+        <!-- ══ FOOTER ══════════════════════════════════════════════════════ -->
+        <TextView
+            android:text="Root required  •  Launch Free Fire before activating"
+            android:textColor="@color/zx_text_muted"
+            android:textSize="11sp"
+            android:gravity="center"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginBottom="24dp"/>
+
+    </LinearLayout>
+</androidx.core.widget.NestedScrollView>
