@@ -19,6 +19,9 @@
  *  Layer 40 — ffutil_UnmapCheck spoof
  *  Layer 41 — getrlimit RLIMIT_CORE = 0
  *  Layer 42 — getaddrinfo → ENONAME (silence C2 reporting), sysconf cores
+ *  Layer 43 — unwind_xx_info_query (libanort.so) → -1 + ENODATA
+ *             Blocks AnoSDK's secondary information-gather channel that bypasses
+ *             the ioctl gate (Layer 19) by calling libanort directly.
  */
 
 #include "stealth_ext4.hpp"
@@ -442,6 +445,21 @@ static long hook_sysconf(int name) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Layer 43 — unwind_xx_info_query (libanort.so)
+//
+// libanort.so exports unwind_xx_info_query alongside unwind_xx_ioctl.
+// Layer 19 blocks the ioctl path; this blocks the info-query path so AnoSDK
+// cannot gather process information through either libanort channel.
+// Signature unknown — naked nullifier is safe regardless of arg count.
+// ─────────────────────────────────────────────────────────────────────────────
+
+__attribute__((naked))
+static void *hook_unwind_info_nullify() {
+    // Return -1 (ENODATA) in X0 — safe for any calling convention
+    __asm__ volatile("mov x0, #-1\n\tret");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // dl_iterate_phdr callback — find libanogs .text range for Layer 39
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -470,7 +488,7 @@ static int phdr_find_ano(struct dl_phdr_info *info, size_t, void*) {
 } while(0)
 
 void install_stealth_ext4() {
-    LI("installing Layers 27-42...");
+    LI("installing Layers 27-43...");
 
     // Layer 27
     ZX_HOOK("clock_gettime", hook_clock_gettime, &g_orig_clock_gettime);
@@ -540,5 +558,17 @@ void install_stealth_ext4() {
     ZX_HOOK("getaddrinfo", hook_getaddrinfo, &g_orig_getaddrinfo);
     ZX_HOOK("sysconf",     hook_sysconf,     &g_orig_sysconf);
 
-    LI("Layers 27-42 installed OK");
+    // Layer 43 — unwind_xx_info_query via direct dlsym on libanort.so
+    {
+        void *anort = dlopen("libanort.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (anort) {
+            void *fn = dlsym(anort, "unwind_xx_info_query");
+            if (fn) {
+                DobbyHook(fn, (void*)hook_unwind_info_nullify, nullptr);
+                LI("L43 unwind_xx_info_query hooked");
+            }
+        }
+    }
+
+    LI("Layers 27-43 installed OK");
 }

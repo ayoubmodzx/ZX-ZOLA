@@ -489,5 +489,5 @@ void AntiDetect::install() {
     install_stealth_ext3();     // Layers 18-26
     install_stealth_ext4();     // Layers 27-42
 
-    LI("AntiDetect: all 42 layers active");
+    LI("AntiDetect: all 43 layers active");
 }
