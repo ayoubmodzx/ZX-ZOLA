@@ -184,17 +184,17 @@ static void discoverClasses() {
 
     // Ammo fields
     if (g_cls.weaponFire) {
-        g_cls.offAmmo       = Il2Cpp::fieldOffset(Il2Cpp::getField(g_cls.weaponFire, "m_curBulletNum"));
-        g_cls.offMaxAmmo    = Il2Cpp::fieldOffset(Il2Cpp::getField(g_cls.weaponFire, "m_maxBulletNum"));
-        g_cls.offReloadTime = Il2Cpp::fieldOffset(Il2Cpp::getField(g_cls.weaponFire, "m_reloadTime"));
+        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_curBulletNum"))  g_cls.offAmmo       = Il2Cpp::fieldOffset(f);
+        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_maxBulletNum"))  g_cls.offMaxAmmo    = Il2Cpp::fieldOffset(f);
+        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_reloadTime"))    g_cls.offReloadTime = Il2Cpp::fieldOffset(f);
     }
     // Health fields
     g_cls.healthCls = Il2Cpp::cls("CSCharacterHealth");
     if (!g_cls.healthCls) g_cls.healthCls = Il2Cpp::cls("PlayerHealth");
     if (g_cls.healthCls) {
-        g_cls.offHP        = Il2Cpp::fieldOffset(Il2Cpp::getField(g_cls.healthCls, "m_curHp"));
-        g_cls.offMaxHP     = Il2Cpp::fieldOffset(Il2Cpp::getField(g_cls.healthCls, "m_maxHp"));
-        g_cls.offIsKnocked = Il2Cpp::fieldOffset(Il2Cpp::getField(g_cls.healthCls, "m_isKnocked"));
+        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_curHp"))     g_cls.offHP        = Il2Cpp::fieldOffset(f);
+        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_maxHp"))     g_cls.offMaxHP     = Il2Cpp::fieldOffset(f);
+        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_isKnocked")) g_cls.offIsKnocked = Il2Cpp::fieldOffset(f);
     }
 
     g_cls.ready = true;
@@ -345,6 +345,10 @@ static void hookMoveUpdate(void *self) {
 using FnVehicleUpdate = void(*)(void*);
 static FnVehicleUpdate g_origVehicleUpdate = nullptr;
 static void hookVehicleUpdate(void *self) {
+    if (!s_risk_ready.load(std::memory_order_acquire)) {
+        if (g_origVehicleUpdate) g_origVehicleUpdate(self);
+        return;
+    }
     float bvs = s_baseVehicleSpeed.load(std::memory_order_relaxed);
     if (g_vehicleSpeed && g_risk.offVehicleSpeed > 0) {
         if (bvs == 0.f) {

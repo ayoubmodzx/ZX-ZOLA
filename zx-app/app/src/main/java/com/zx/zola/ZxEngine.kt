@@ -1,6 +1,8 @@
 package com.zx.zola
 
 import android.content.Context
+import android.os.Handler
+import android.os.HandlerThread
 import android.util.Log
 
 object ZxEngine {
@@ -52,6 +54,8 @@ object ZxEngine {
     private var targetPid: Int = -1
     private var payloadPath: String = "/data/local/tmp/libzx_payload.so"
     private val cmdLock = Any()
+    private val bgThread = HandlerThread("zx-engine").also { it.start() }
+    private val bgHandler = Handler(bgThread.looper)
 
     fun init(context: Context) {
         val payloadFile = context.getFileStreamPath("libzx_payload.so")
@@ -75,13 +79,15 @@ object ZxEngine {
 
     fun toggle(cmd: Int, on: Boolean, intensity: Int = 0) {
         if (targetPid <= 0) return
-        synchronized(cmdLock) {
-            try {
-                val en = if (on) 1 else 0
-                val args = "$targetPid $cmd $en $payloadPath $intensity"
-                Runtime.getRuntime().exec(arrayOf("su", "-c", "zx_injector $args")).waitFor()
-            } catch (e: Exception) {
-                Log.e("ZxEngine", "toggle failed: ${e.message}")
+        bgHandler.post {
+            synchronized(cmdLock) {
+                try {
+                    val en = if (on) 1 else 0
+                    val args = "$targetPid $cmd $en $payloadPath $intensity"
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", "zx_injector $args")).waitFor()
+                } catch (e: Exception) {
+                    Log.e("ZxEngine", "toggle failed: ${e.message}")
+                }
             }
         }
     }

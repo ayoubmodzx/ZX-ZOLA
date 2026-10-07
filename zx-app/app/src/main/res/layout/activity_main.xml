@@ -289,7 +289,7 @@
                             android:layout_weight="1"/>
                         <TextView
                             android:id="@+id/tv_aim_smooth"
-                            android:text="60%"
+                            android:text="50%"
                             android:textColor="@color/zx_purple"
                             android:textSize="11sp"
                             android:textStyle="bold"
@@ -304,7 +304,7 @@
                         android:layout_height="wrap_content"
                         android:valueFrom="0"
                         android:valueTo="100"
-                        android:value="60"
+                        android:value="50"
                         android:stepSize="1"
                         style="@style/ZxSliderPurple"/>
 

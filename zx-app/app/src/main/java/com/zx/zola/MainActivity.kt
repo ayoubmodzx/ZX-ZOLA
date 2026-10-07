@@ -75,6 +75,9 @@ class MainActivity : AppCompatActivity() {
                 }
                 startFg()
                 setActive(true)
+                isFabOn = true
+                findViewById<Button>(R.id.btn_float_icon).text = "FLOATING ICON  ●"
+                findViewById<Button>(R.id.btn_float_icon).setTextColor(getColor(R.color.zx_purple))
             }
         }
 
@@ -101,8 +104,10 @@ class MainActivity : AppCompatActivity() {
         featureMap.forEach { (viewId, cmd) ->
             findViewById<SwitchMaterial>(viewId).setOnCheckedChangeListener { _, checked ->
                 if (isActive) ZxEngine.toggle(cmd, checked)
-                else if (checked) Toast.makeText(this, "Activate mod first", Toast.LENGTH_SHORT).show()
-                    .also { (it as? Unit); findViewById<SwitchMaterial>(viewId).isChecked = false }
+                else if (checked) {
+                    Toast.makeText(this, "Activate mod first", Toast.LENGTH_SHORT).show()
+                    findViewById<SwitchMaterial>(viewId).isChecked = false
+                }
             }
         }
 
@@ -145,7 +150,7 @@ class MainActivity : AppCompatActivity() {
             ZxEngine.toggle(Cmd.AIM_ENABLE, checked)
             if (checked) {
                 ZxEngine.setIntensity(Cmd.AIM_BONE,   selectedBone)
-                ZxEngine.setIntensity(Cmd.AIM_FOV,    slFov.value.toInt())
+                ZxEngine.setIntensity(Cmd.AIM_FOV,    ((slFov.value.toInt() - 5) * 100 / 85).coerceIn(0, 100))
                 ZxEngine.setIntensity(Cmd.AIM_SMOOTH, slSmooth.value.toInt())
             }
         }
@@ -153,7 +158,7 @@ class MainActivity : AppCompatActivity() {
         slFov.addOnChangeListener { _, value, fromUser ->
             if (!fromUser) return@addOnChangeListener
             tvFov.text = "${value.toInt()}°"
-            if (isActive && swAim.isChecked) ZxEngine.setIntensity(Cmd.AIM_FOV, value.toInt())
+            if (isActive && swAim.isChecked) ZxEngine.setIntensity(Cmd.AIM_FOV, ((value.toInt() - 5) * 100 / 85).coerceIn(0, 100))
         }
 
         slSmooth.addOnChangeListener { _, value, fromUser ->

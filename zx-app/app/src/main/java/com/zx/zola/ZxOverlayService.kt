@@ -38,7 +38,8 @@ class ZxOverlayService : Service() {
         val sliderMin:     Int     = 0,
         val sliderMax:     Int     = 100,
         val sliderDefault: Int     = 50,
-        val sliderLabel:   String  = ""
+        val sliderLabel:   String  = "",
+        val rawIntensity:  Boolean = false
     )
 
     enum class Tab(val label: String, val icon: String) {
@@ -56,7 +57,7 @@ class ZxOverlayService : Service() {
             Feature("Aim FOV",        ZxEngine.Cmd.AIM_FOV,        Risk.RISK,
                 hasSlider = true, sliderMin = 5, sliderMax = 90, sliderDefault = 30, sliderLabel = "°"),
             Feature("Aim Bone",       ZxEngine.Cmd.AIM_BONE,       Risk.RISK,
-                hasSlider = true, sliderMin = 0, sliderMax = 2, sliderDefault = 0,  sliderLabel = ""),
+                hasSlider = true, sliderMin = 0, sliderMax = 2, sliderDefault = 0,  sliderLabel = "", rawIntensity = true),
             Feature("Smoothness",     ZxEngine.Cmd.AIM_SMOOTH,     Risk.RISK,
                 hasSlider = true, sliderDefault = 40, sliderLabel = "%"),
             Feature("Silent Aim",     ZxEngine.Cmd.SILENT_AIM,     Risk.DANGER),
@@ -116,10 +117,12 @@ class ZxOverlayService : Service() {
     private var rStartW = 0;   private var rStartH = 0
 
     // content refs set during buildPanel
-    private lateinit var contentList: LinearLayout
-    private lateinit var statusDot  : View
-    private lateinit var statusText : TextView
-    private var currentTab = Tab.AIM
+    private lateinit var contentList  : LinearLayout
+    private lateinit var statusDot    : View
+    private lateinit var statusText   : TextView
+    private lateinit var footerCountTv: TextView
+    private var currentTab       = Tab.AIM
+    private var activeLayerCount = 0
     private val switchMap  = mutableMapOf<Int, Switch>()
     private val tabViews   = mutableMapOf<Tab, View>()
 
@@ -250,6 +253,7 @@ class ZxOverlayService : Service() {
         body.addView(divV())
         body.addView(buildContent())
         root.addView(body)
+        root.addView(buildFooter())
         root.addView(buildResizeHandle())
 
         panelRoot = root
@@ -289,8 +293,9 @@ class ZxOverlayService : Service() {
         background = ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.bg_header)
 
         addView(ImageView(this@ZxOverlayService).apply {
-            setImageDrawable(ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.ic_zx))
-            layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).also { it.marginEnd = dp(7) }
+            setImageDrawable(ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.ic_logo_wolf))
+            scaleType = ImageView.ScaleType.CENTER_INSIDE
+            layoutParams = LinearLayout.LayoutParams(dp(28), dp(28)).also { it.marginEnd = dp(8) }
         })
         addView(TextView(this@ZxOverlayService).apply {
             text = "ZX"
@@ -299,9 +304,15 @@ class ZxOverlayService : Service() {
             typeface = android.graphics.Typeface.DEFAULT_BOLD
         })
         addView(TextView(this@ZxOverlayService).apply {
-            text = "  by AYOUB"
+            text = " by AYOUB"
             setTextColor(Color.parseColor("#50508A"))
             textSize = 8.5f
+        })
+        addView(TextView(this@ZxOverlayService).apply {
+            text = "  v3.0"
+            setTextColor(Color.parseColor("#404060"))
+            textSize = 8f
+            typeface = android.graphics.Typeface.MONOSPACE
         })
         // spacer
         addView(View(this@ZxOverlayService).apply {
@@ -376,6 +387,30 @@ class ZxOverlayService : Service() {
         return scroll
     }
 
+    // ─── Footer ───────────────────────────────────────────────────────────────
+    private fun buildFooter(): View = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(dp(12), dp(6), dp(12), dp(6))
+        setBackgroundColor(Color.parseColor("#060610"))
+        footerCountTv = TextView(this@ZxOverlayService).apply {
+            text = "0 LAYERS ACTIVE"
+            setTextColor(Color.parseColor("#7C4DFF"))
+            textSize = 9f
+            letterSpacing = 0.08f
+            typeface = android.graphics.Typeface.MONOSPACE
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        addView(footerCountTv)
+        addView(TextView(this@ZxOverlayService).apply {
+            text = "FF · BUILD 3.0.0"
+            setTextColor(Color.parseColor("#3A3A60"))
+            textSize = 9f
+            letterSpacing = 0.06f
+            typeface = android.graphics.Typeface.MONOSPACE
+        })
+    }
+
     // ─── Resize handle ────────────────────────────────────────────────────────
     private fun buildResizeHandle(): View = FrameLayout(this).apply {
         layoutParams = LinearLayout.LayoutParams(
@@ -421,6 +456,9 @@ class ZxOverlayService : Service() {
             }
         }
         contentList.removeAllViews()
+        switchMap.clear()
+        activeLayerCount = 0
+        if (::footerCountTv.isInitialized) footerCountTv.text = "0 LAYERS ACTIVE"
         val list = features[tab] ?: return
         val safe   = list.filter { it.risk == Risk.SAFE   }
         val risk   = list.filter { it.risk == Risk.RISK   }
@@ -465,26 +503,28 @@ class ZxOverlayService : Service() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
         }
-        row.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+        row.addView(TextView(this@ZxOverlayService).apply {
+            text = f.name; setTextColor(Color.WHITE); textSize = 12f
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            addView(TextView(this@ZxOverlayService).apply {
-                text = f.name; setTextColor(Color.WHITE); textSize = 12f
-            })
-            addView(TextView(this@ZxOverlayService).apply {
-                text = badgeTxt; setTextColor(Color.parseColor(badgeClr)); textSize = 8f
-                background = ContextCompat.getDrawable(this@ZxOverlayService, badgeRes)
-                layoutParams = LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).also { it.topMargin = dp(2) }
-                setPadding(dp(5), dp(2), dp(5), dp(2))
-            })
+        })
+        row.addView(TextView(this@ZxOverlayService).apply {
+            text = badgeTxt; setTextColor(Color.parseColor(badgeClr)); textSize = 8f
+            background = ContextCompat.getDrawable(this@ZxOverlayService, badgeRes)
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.marginEnd = dp(8) }
+            setPadding(dp(5), dp(2), dp(5), dp(2))
         })
 
         val sw = Switch(this).apply {
             isChecked = false
             trackDrawable = ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.sel_switch_track)
-            setOnCheckedChangeListener { _, on -> ZxEngine.toggle(f.cmd, on) }
+            setOnCheckedChangeListener { _, on ->
+                ZxEngine.toggle(f.cmd, on)
+                activeLayerCount += if (on) 1 else -1
+                if (::footerCountTv.isInitialized)
+                    footerCountTv.text = "$activeLayerCount LAYERS ACTIVE"
+            }
         }
         switchMap[f.cmd] = sw
         row.addView(sw)
@@ -508,8 +548,13 @@ class ZxOverlayService : Service() {
                 progressDrawable = null; thumb = null
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
-                        valTv.text = "${p + f.sliderMin}${f.sliderLabel}"
-                        if (fromUser) ZxEngine.setIntensity(f.cmd, p * 100 / (f.sliderMax - f.sliderMin).coerceAtLeast(1))
+                        val display = p + f.sliderMin
+                        valTv.text = "$display${f.sliderLabel}"
+                        if (fromUser && sw.isChecked) {
+                            val intensity = if (f.rawIntensity) display
+                                            else p * 100 / (f.sliderMax - f.sliderMin).coerceAtLeast(1)
+                            ZxEngine.setIntensity(f.cmd, intensity)
+                        }
                     }
                     override fun onStartTrackingTouch(sb: SeekBar) {}
                     override fun onStopTrackingTouch(sb: SeekBar) {}
