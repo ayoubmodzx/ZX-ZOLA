@@ -2,6 +2,7 @@ package com.zx.zola
 
 import android.content.*
 import android.net.Uri
+import com.zx.zola.ZxEngine.Cmd
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -23,6 +24,7 @@ class MainActivity : AppCompatActivity() {
     private val OVERLAY_REQ = 100
     private val handler = Handler(Looper.getMainLooper())
     private var isActive = false
+    private var isFabOn  = false
 
     // Feature switch → Cmd constant mapping (standard features)
     private val featureMap = mapOf(
@@ -56,8 +58,9 @@ class MainActivity : AppCompatActivity() {
 
         ZxEngine.init(this)
 
-        val activateBtn  = findViewById<Button>(R.id.btn_activate)
-        val stopBtn      = findViewById<Button>(R.id.btn_stop)
+        val activateBtn   = findViewById<Button>(R.id.btn_activate)
+        val stopBtn       = findViewById<Button>(R.id.btn_stop)
+        val fabToggleBtn  = findViewById<Button>(R.id.btn_float_icon)
 
         activateBtn.setOnClickListener {
             if (!Settings.canDrawOverlays(this)) {
@@ -78,6 +81,20 @@ class MainActivity : AppCompatActivity() {
         stopBtn.setOnClickListener {
             stopFg()
             setActive(false)
+        }
+
+        fabToggleBtn.setOnClickListener {
+            if (!isActive) {
+                Toast.makeText(this, "Activate mod first", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            isFabOn = !isFabOn
+            startService(Intent(this, ZxOverlayService::class.java).apply {
+                action = ZxOverlayService.ACTION_TOGGLE_FAB
+            })
+            fabToggleBtn.text = if (isFabOn) "FLOATING ICON  ●" else "FLOATING ICON  ○"
+            fabToggleBtn.setTextColor(getColor(
+                if (isFabOn) R.color.zx_purple else R.color.zx_text_muted))
         }
 
         // Wire all standard feature switches
@@ -196,6 +213,12 @@ class MainActivity : AppCompatActivity() {
             tv.text = "INACTIVE"
             tv.setTextColor(getColor(R.color.zx_text_dim))
             tvSub.text = "Ready"
+            // Reset FAB button state
+            isFabOn = false
+            findViewById<Button>(R.id.btn_float_icon).also {
+                it.text = "FLOATING ICON  ○"
+                it.setTextColor(getColor(R.color.zx_text_muted))
+            }
             // isActive is already false here — listener guards prevent redundant root dispatches
             featureMap.keys.forEach { id ->
                 findViewById<SwitchMaterial>(id).isChecked = false

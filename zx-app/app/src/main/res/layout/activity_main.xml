@@ -856,6 +856,18 @@
             android:layout_width="match_parent"
             android:layout_height="52dp"
             android:background="@drawable/bg_btn_stop"
+            android:layout_marginBottom="10dp"
+            android:stateListAnimator="@null"/>
+
+        <Button
+            android:id="@+id/btn_float_icon"
+            android:text="FLOATING ICON  ○"
+            android:textColor="@color/zx_text_muted"
+            android:textSize="13sp"
+            android:letterSpacing="0.08"
+            android:layout_width="match_parent"
+            android:layout_height="48dp"
+            android:background="@drawable/bg_btn_stop"
             android:layout_marginBottom="16dp"
             android:stateListAnimator="@null"/>
 

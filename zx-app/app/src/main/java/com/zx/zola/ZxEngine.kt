@@ -1,5 +1,6 @@
 package com.zx.zola
 
+import android.content.Context
 import android.util.Log
 
 object ZxEngine {
@@ -51,6 +52,21 @@ object ZxEngine {
     private var targetPid: Int = -1
     private var payloadPath: String = "/data/local/tmp/libzx_payload.so"
     private val cmdLock = Any()
+
+    fun init(context: Context) {
+        val payloadFile = context.getFileStreamPath("libzx_payload.so")
+        if (payloadFile.exists()) payloadPath = payloadFile.absolutePath
+    }
+
+    fun isFfRunning(): Boolean = try {
+        val proc = Runtime.getRuntime().exec(
+            arrayOf("su", "-c",
+                "pidof com.dts.freefireth 2>/dev/null || pidof com.garena.game.fftw 2>/dev/null"))
+        val out = proc.inputStream.bufferedReader().readText().trim()
+        proc.waitFor()
+        if (out.isNotEmpty()) { targetPid = out.trim().split(" ")[0].toIntOrNull() ?: -1 }
+        out.isNotEmpty()
+    } catch (e: Exception) { false }
 
     fun setTarget(pid: Int, path: String) {
         targetPid = pid
