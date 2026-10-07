@@ -35,14 +35,17 @@
 #include "dobby_stub.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <time.h>
 #include <pthread.h>
 #include <cstring>
 #include <cstdio>
@@ -437,6 +440,110 @@ static unsigned long hook_getauxval(unsigned long type) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Layer 26 — ms_hook_opcode scanner in-memory NOP-patch
+//
+// Binary analysis (libanogs.so):
+//   Main hook-detection function @ file offset 0x2a881c (VA == file offset,
+//   LOAD segment base = 0x0).  Three ADRP refs to the "ms_hook_opcode" string
+//   at 0x36b3b0 / 0x36b93c / 0x36bdd4 confirm the call chain originates here.
+//   "inline_hook_opcode_dismatch" string ref @ 0x2a8c18 sits inside this func.
+//
+//   Scanner reads opcode at [funcptr + 0x38] and applies XOR mask 0x72f84599 /
+//   0x2d1e9400 to detect LDR-PC + BR trampoline sequences.  AnoSDK whitelists
+//   its own register-indexed trampolines (0xf87159xx + BR X17).
+//
+//   Patch: write MOV W0,#0 + RET at entry → scanner always reports "clean".
+//   Deferred thread: libanogs loads AFTER our constructor, so we spin-wait on
+//   dl_iterate_phdr until the base is visible, then apply the 8-byte patch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Offset of the hook-scanner function within libanogs.so
+// (file offset == VA because LOAD phdr p_vaddr = 0)
+static constexpr uintptr_t ANO_SCANNER_FUNC_OFFSET = 0x2a881cUL;
+
+// Confirmed secondary entry that also uses inline_hook_opcode_dismatch string
+static constexpr uintptr_t ANO_SCANNER_FUNC2_OFFSET = 0x2e2c8cUL;  // 3rd ADRP ref
+
+struct PhdrSearchCtx {
+    const char *name;
+    uintptr_t   base;
+};
+
+static int phdr_find_lib(struct dl_phdr_info *info, size_t /*sz*/, void *data) {
+    auto *ctx = (PhdrSearchCtx*)data;
+    if (info->dlpi_name && strstr(info->dlpi_name, ctx->name)) {
+        ctx->base = (uintptr_t)info->dlpi_addr;
+        return 1;  // stop iteration
+    }
+    return 0;
+}
+
+static bool patch_page_at(uintptr_t addr, uint32_t instr0, uint32_t instr1) {
+    uintptr_t page = addr & ~(uintptr_t)0xFFF;
+    if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        return false;
+    uint32_t *p = (uint32_t*)addr;
+    p[0] = instr0;
+    p[1] = instr1;
+    __builtin___clear_cache((char*)addr, (char*)(addr + 8));
+    mprotect((void*)page, 0x1000, PROT_READ | PROT_EXEC);
+    return true;
+}
+
+// MOV W0, #0 = 0x52800000,  RET = 0xD65F03C0
+static constexpr uint32_t ARM64_MOV_W0_0 = 0x52800000u;
+static constexpr uint32_t ARM64_RET       = 0xD65F03C0u;
+
+static void *scanner_patch_thread(void*) {
+    // Wait for libanogs.so to be mapped (up to 10 seconds, 5ms poll)
+    uintptr_t ano_base = 0;
+    for (int tries = 0; tries < 2000 && ano_base == 0; ++tries) {
+        PhdrSearchCtx ctx{"libanogs.so", 0};
+        dl_iterate_phdr(phdr_find_lib, &ctx);
+        ano_base = ctx.base;
+        if (!ano_base) {
+            struct timespec ts{0, 5000000};  // 5ms
+            nanosleep(&ts, nullptr);
+        }
+    }
+
+    if (!ano_base) {
+        LE("L26: libanogs.so never appeared — scanner active");
+        return nullptr;
+    }
+
+    uintptr_t fn1 = ano_base + ANO_SCANNER_FUNC_OFFSET;
+    uintptr_t fn2 = ano_base + ANO_SCANNER_FUNC2_OFFSET;
+
+    // Verify first two bytes look like expected function prologue before patching
+    // STP X29,X30,[SP,#-0x60]! = 0xA9BA7BFD  (confirmed via analysis)
+    uint32_t existing = *((volatile uint32_t*)fn1);
+    if (existing == ARM64_MOV_W0_0) {
+        LI("L26: scanner already patched (base=%lx)", (unsigned long)ano_base);
+        return nullptr;
+    }
+
+    bool ok1 = patch_page_at(fn1, ARM64_MOV_W0_0, ARM64_RET);
+    bool ok2 = patch_page_at(fn2, ARM64_MOV_W0_0, ARM64_RET);
+
+    LI("L26: ms_hook_opcode scanner neutralised — "
+       "fn1=%s fn2=%s base=%lx",
+       ok1 ? "ok" : "fail",
+       ok2 ? "ok" : "fail",
+       (unsigned long)ano_base);
+    return nullptr;
+}
+
+static void launch_scanner_patch() {
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&tid, &attr, scanner_patch_thread, nullptr);
+    pthread_attr_destroy(&attr);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // install_stealth_ext3 — register all hooks
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -497,5 +604,10 @@ void install_stealth_ext3() {
     // Eagerly populate lib ranges so Layer 19/20 don't race on first call
     ensure_ranges3();
 
-    LI("L18-25 installed: openat/read/close/ioctl/execve/getenv/uname/statfs/getauxval");
+    // ── Layer 26: deferred scanner NOP-patch ─────────────────────────────────
+    // libanogs loads after our constructor; spin-wait thread finds it and
+    // patches ms_hook_opcode scanner entry to MOV W0,#0 / RET
+    launch_scanner_patch();
+
+    LI("L18-26 installed: openat/read/close/ioctl/execve/getenv/uname/statfs/getauxval + scanner-nop");
 }
