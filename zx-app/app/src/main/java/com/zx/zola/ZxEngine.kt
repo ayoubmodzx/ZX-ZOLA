@@ -1,101 +1,76 @@
 package com.zx.zola
 
-import android.content.Context
-import android.content.SharedPreferences
 import android.util.Log
-import kotlinx.coroutines.*
-import java.io.DataOutputStream
-import java.io.File
-import java.util.concurrent.TimeUnit
-
-private const val TAG    = "ZX-ENGINE"
-private const val FF_PKG  = "com.dts.freefireth"
-private const val FF_PKG2 = "com.dts.freefiremax"
-
-object Cmd {
-    const val ANTI_RECOIL    = 1;  const val NO_SPREAD      = 2
-    const val RAPID_FIRE     = 3;  const val WIDE_POV       = 4
-    const val ESP            = 5;  const val SPEED_HACK     = 6
-    const val HIGH_JUMP      = 7;  const val VEHICLE_SPEED  = 8
-    const val RAPID_FIRE_RISK= 9;  const val NO_GRASS       = 10
-    const val ANTI_DAMAGE    = 11
-    // Aim system — uses setIntensity for bone/fov/smooth params
-    const val AIM_ENABLE     = 12
-    const val AIM_BONE       = 13  // intensity: 0=AI, 1=NECK, 2=HEAD
-    const val AIM_FOV        = 14  // intensity: 5-90 degrees
-    const val AIM_SMOOTH     = 15  // intensity: 0-100 smoothness
-}
 
 object ZxEngine {
 
-    // Single-thread dispatcher guarantees toggle/intensity commands arrive in order
-    private val ioSerial   = Dispatchers.IO.limitedParallelism(1)
-    private val scope      = CoroutineScope(ioSerial + SupervisorJob())
-    private var injPath    = ""
-    private var payloadLib = ""
-    private val PREFS_KEY  = "zx_inj_ver"
+    object Cmd {
+        // WEAPON — SAFE
+        const val ANTI_RECOIL       = 1
+        const val NO_SPREAD         = 2
+        // WEAPON — RISK
+        const val RAPID_FIRE        = 3
+        const val RAPID_FIRE_RISK   = 9
+        // WEAPON — DANGER
+        const val INFINITE_AMMO     = 17
+        const val NO_RELOAD         = 18
+        const val WALL_SHOOT        = 27
 
-    fun init(context: Context) {
-        // Dispatch disk I/O off the main thread
-        CoroutineScope(Dispatchers.IO).launch {
-            payloadLib = "${context.applicationInfo.nativeLibraryDir}/libzx_payload.so"
-            injPath    = extractInjector(context)
-            Log.i(TAG, "injector=$injPath  payload=$payloadLib")
-        }
+        // AIM — RISK
+        const val AIM_ENABLE        = 12
+        const val AIM_BONE          = 13
+        const val AIM_FOV           = 14
+        const val AIM_SMOOTH        = 15
+        const val AUTO_HEADSHOT     = 23
+        // AIM — DANGER
+        const val SILENT_AIM        = 22
+        const val FULL_AIMBOT       = 24
+        const val ANTI_AIM          = 25
+
+        // MOVEMENT — RISK
+        const val SPEED_HACK        = 6
+        const val HIGH_JUMP         = 7
+        const val VEHICLE_SPEED     = 8
+        // MOVEMENT — DANGER
+        const val NOCLIP            = 19
+        const val TELEPORT          = 20
+        const val TELEPORT_SAVE     = 21
+
+        // SURVIVAL — RISK
+        const val ANTI_DAMAGE       = 11
+        const val AUTO_REVIVE       = 26
+        // SURVIVAL — DANGER
+        const val GOD_MODE          = 16
+
+        // VISUAL — SAFE
+        const val WIDE_POV          = 4
+        const val NO_GRASS          = 10
+        const val ESP               = 5
     }
 
-    fun toggle(cmd: Int, enable: Boolean) {
-        scope.launch {
-            val pid  = findFfPid() ?: run { Log.e(TAG, "FF not running"); return@launch }
-            val flag = if (enable) 1 else 0
-            // Quote paths to survive spaces in nativeLibraryDir (e.g. ~~base64== paths)
-            val out  = runRoot("'$injPath' $pid $cmd $flag '$payloadLib' 0")
-            Log.i(TAG, "toggle cmd=$cmd enable=$enable => $out")
-        }
+    private var targetPid: Int = -1
+    private var payloadPath: String = "/data/local/tmp/libzx_payload.so"
+    private val cmdLock = Any()
+
+    fun setTarget(pid: Int, path: String) {
+        targetPid = pid
+        payloadPath = path
     }
 
-    fun setIntensity(cmd: Int, intensity: Int) {
-        scope.launch {
-            val pid = findFfPid() ?: return@launch
-            val out = runRoot("'$injPath' $pid $cmd 1 '$payloadLib' $intensity")
-            Log.i(TAG, "intensity cmd=$cmd intensity=$intensity => $out")
-        }
-    }
-
-    fun isFfRunning(): Boolean = findFfPid() != null
-
-    private fun findFfPid(): Int? = try {
-        val out = runRoot("pidof $FF_PKG || pidof $FF_PKG2").trim()
-        // Take lowest PID (parent process) — some BusyBox versions return highest first
-        out.split("\\s+".toRegex()).mapNotNull { it.toIntOrNull() }.minOrNull()
-    } catch (e: Exception) { null }
-
-    private fun runRoot(cmd: String): String = try {
-        val proc = Runtime.getRuntime().exec("su")
-        DataOutputStream(proc.outputStream).also {
-            it.writeBytes("$cmd\n"); it.writeBytes("exit\n"); it.flush()
-        }
-        val finished = proc.waitFor(10L, TimeUnit.SECONDS)
-        if (!finished) { proc.destroyForcibly(); Log.e(TAG, "root exec timeout: $cmd") }
-        proc.inputStream.bufferedReader().readText()
-    } catch (e: Exception) { Log.e(TAG, "root exec: $e"); "" }
-
-    private fun extractInjector(ctx: Context): String {
-        val dest    = File(ctx.filesDir, "zx_injector")
-        val prefs   = ctx.getSharedPreferences("zx_prefs", 0)
-        val storedV = prefs.getInt(PREFS_KEY, -1)
-        val currentV = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionCode } catch (_: Exception) { 0 }
-        if (!dest.exists() || dest.length() == 0L || storedV != currentV) {
+    fun toggle(cmd: Int, on: Boolean, intensity: Int = 0) {
+        if (targetPid <= 0) return
+        synchronized(cmdLock) {
             try {
-                ctx.assets.open("arm64-v8a/zx_injector").use { inp ->
-                    dest.outputStream().use { inp.copyTo(it) }
-                }
-                dest.setExecutable(true, false)
-                prefs.edit().putInt(PREFS_KEY, currentV).apply()
+                val en = if (on) 1 else 0
+                val args = "$targetPid $cmd $en $payloadPath $intensity"
+                Runtime.getRuntime().exec(arrayOf("su", "-c", "zx_injector $args")).waitFor()
             } catch (e: Exception) {
-                Log.e(TAG, "extract injector failed: $e")
+                Log.e("ZxEngine", "toggle failed: ${e.message}")
             }
         }
-        return dest.absolutePath
+    }
+
+    fun setIntensity(cmd: Int, pct: Int) {
+        toggle(cmd, true, pct)
     }
 }
