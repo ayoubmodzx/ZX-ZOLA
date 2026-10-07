@@ -42,6 +42,10 @@ static GameClasses g_cls;
 // Hook state flags
 // ─────────────────────────────────────────────────────────────────────────────
 
+static std::atomic<bool>  s_cls_ready{false};
+static std::atomic<bool>  s_risk_ready{false};
+static std::atomic<bool>  s_aim_ready{false};
+
 static std::atomic<bool>  g_noRecoil{false};
 static std::atomic<bool>  g_noSpread{false};
 static std::atomic<bool>  g_rapidFire{false};
@@ -75,6 +79,7 @@ static void *g_origFireMethod = nullptr;
 using FnSetFOV = void(*)(void*, float);
 static FnSetFOV g_origSetFOV = nullptr;
 static void hookSetFOV(void *self, float fov) {
+    if (!g_origSetFOV) return;
     float ov = g_fovOverride.load(std::memory_order_relaxed);
     g_origSetFOV(self, ov > 0.f ? ov : fov);
 }
@@ -144,6 +149,7 @@ static void discoverClasses() {
     }
 
     g_cls.ready = true;
+    s_cls_ready.store(true, std::memory_order_release);
     LOG("Discovery done. playerState=%p weaponFire=%p", g_cls.playerState, g_cls.weaponFire);
 }
 
@@ -174,6 +180,10 @@ static void hookUnityIcalls() {
 using FnFireWeapon = void(*)(void*, void*, void*);
 static FnFireWeapon g_origFire = nullptr;
 static void hookFireWeapon(void *self, void *a, void *b) {
+    if (!s_cls_ready.load(std::memory_order_acquire)) {
+        if (g_origFire) g_origFire(self, a, b);
+        return;
+    }
     if (g_noRecoil) {
         if (g_cls.offRecoilH > 0) Il2Cpp::writeField<float>(self, g_cls.offRecoilH, 0.f);
         if (g_cls.offRecoilV > 0) Il2Cpp::writeField<float>(self, g_cls.offRecoilV, 0.f);
@@ -227,6 +237,7 @@ static void discoverRiskClasses() {
         };
         g_risk.vehicleCls = findClassByFields(pat, 2, "vehicleCls");
     }
+    s_risk_ready.store(true, std::memory_order_release);
 }
 
 using FnMoveUpdate = void(*)(void*);
@@ -237,6 +248,10 @@ static float s_baseJumpForce = 0.f;
 static float s_baseVehicleSpeed = 0.f;
 
 static void hookMoveUpdate(void *self) {
+    if (!s_risk_ready.load(std::memory_order_acquire)) {
+        if (g_origMoveUpdate) g_origMoveUpdate(self);
+        return;
+    }
     if (g_speedHack && g_risk.offMoveSpeed > 0) {
         if (s_baseMoveSpeed == 0.f)
             s_baseMoveSpeed = Il2Cpp::readField<float>(self, g_risk.offMoveSpeed);
@@ -311,6 +326,7 @@ static void discoverAimClasses() {
             if (f) { g_aim.offBoneIndex = Il2Cpp::fieldOffset(f); break; }
         }
     }
+    s_aim_ready.store(true, std::memory_order_release);
 }
 
 using FnAimUpdate = void(*)(void*);
@@ -323,6 +339,10 @@ static constexpr int kBoneNeck  = 4;
 static constexpr int kBoneChest = 6; // AI default: chest → smoothest tracking
 
 static void hookAimUpdate(void *self) {
+    if (!s_aim_ready.load(std::memory_order_acquire)) {
+        if (g_origAimUpdate) g_origAimUpdate(self);
+        return;
+    }
     if (g_aimEnabled) {
         float fov    = g_aimFov.load(std::memory_order_relaxed);
         float smooth = g_aimSmooth.load(std::memory_order_relaxed);

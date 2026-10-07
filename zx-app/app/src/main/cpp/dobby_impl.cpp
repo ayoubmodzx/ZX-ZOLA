@@ -51,6 +51,20 @@ static bool set_rwx(void *p, size_t n) {
     return mprotect((void*)base, sz, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
 }
 
+static bool has_pc_relative(const uint8_t *target) {
+    for (int i = 0; i < 4; i++) {
+        uint32_t insn;
+        memcpy(&insn, target + i * 4, 4);
+        if ((insn & 0x9F000000u) == 0x90000000u) return true;
+        if ((insn & 0x9F000000u) == 0x10000000u) return true;
+        if ((insn & 0x7C000000u) == 0x14000000u) return true;
+        if ((insn & 0x3B000000u) == 0x18000000u) return true;
+        if ((insn & 0x7E000000u) == 0x34000000u) return true;
+        if ((insn & 0x7E000000u) == 0x36000000u) return true;
+    }
+    return false;
+}
+
 // ── Hook table ────────────────────────────────────────────────────────────────
 
 struct Slot { void *target; uint8_t saved[TRAMP]; void *page; };
@@ -64,6 +78,11 @@ int DobbyHook(void *addr, void *replace, void **origin) {
     // Dedup guard — re-hooking an already-hooked address corrupts the trampoline chain
     for (auto &s : g_slots)
         if (s.target == addr) return -1;
+
+    if (has_pc_relative((const uint8_t*)addr)) {
+        DE("DobbyHook: PC-relative instruction in first 16 bytes of %p — skipping", addr);
+        return -1;
+    }
 
     if (!set_rwx(addr, TRAMP)) {
         DE("mprotect RWX failed @ %p: %s", addr, strerror(errno));

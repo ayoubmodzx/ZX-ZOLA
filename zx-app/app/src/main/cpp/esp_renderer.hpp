@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
 
+struct Il2CppObject;
+
 namespace ESP {
     // Called once from Features::init() after il2cpp is ready
     void init();
@@ -10,4 +12,7 @@ namespace ESP {
 
     // Called from features dispatch when headshot assist toggle changes
     void setHeadshotAssist(bool on);
+
+    Il2CppObject* getHeadTarget();
+    bool          hasHeadTarget();
 }

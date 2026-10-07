@@ -75,6 +75,7 @@ static FnGetHeight   g_getH      = nullptr;
 
 static std::atomic<bool> g_esp_on{false};
 static std::atomic<bool> g_hs_on{false};
+static std::atomic<bool> g_w2s_valid{false};
 
 // GL_LINES mode in Unity
 static constexpr int UNITY_GL_LINES = 1;
@@ -136,7 +137,7 @@ static int g_sw = 1080, g_sh = 1920;
 // ─────────────────────────────────────────────────────────────────────────────
 
 static bool w2s(void *cam, Vec3 world, Vec2 &out) {
-    if (!g_w2s || !cam) return false;
+    if (!g_w2s_valid.load(std::memory_order_acquire) || !g_w2s || !cam) return false;
     Vec3 r = g_w2s(cam, &world);
     if (r.z <= 0.f) return false;   // behind camera
     out.x = r.x;
@@ -581,6 +582,7 @@ void ESP::init() {
     g_w2s     = (FnW2S)    resolve("UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&,UnityEngine.Camera/MonoOrStereoscopicEye,UnityEngine.Vector3&)");
     if (!g_w2s)
         g_w2s = (FnW2S)    resolve("UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&)");
+    if (g_w2s) g_w2s_valid.store(true, std::memory_order_release);
     g_getMain = (FnGetMain)resolve("UnityEngine.Camera::get_main()");
 
     // Screen icalls

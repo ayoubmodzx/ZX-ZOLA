@@ -58,6 +58,7 @@
 #include <cstdio>
 #include <cstdint>
 #include <pthread.h>
+#include <atomic>
 
 #ifndef ZX_RELEASE
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  "ZX", __VA_ARGS__)
@@ -93,8 +94,9 @@ static int phdr_find_anogs(dl_phdr_info *info, size_t /*size*/, void * /*data*/)
 
 static bool caller_is_anogs(uintptr_t lr) {
     if (!s_ano_base) {
-        static int s_retry = 0;
-        if (s_retry++ < 50) dl_iterate_phdr(phdr_find_anogs, nullptr);
+        static std::atomic<int> s_retry{0};
+        if (s_retry.fetch_add(1, std::memory_order_relaxed) < 50)
+            dl_iterate_phdr(phdr_find_anogs, nullptr);
     }
     return (s_ano_base && lr >= s_ano_base && lr < s_ano_end);
 }
@@ -123,10 +125,10 @@ static connect_t orig_connect = nullptr;
 static int __attribute__((noinline)) hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
     if (caller_is_anogs(lr)) {
-        // Block all outbound connections from libanogs — report as refused
         errno = ECONNREFUSED;
         return -1;
     }
+    if (!orig_connect) { errno = ENOSYS; return -1; }
     return orig_connect(sockfd, addr, addrlen);
 }
 
@@ -138,14 +140,14 @@ typedef pid_t (*fork_t)();
 static fork_t orig_fork = nullptr;
 
 static pid_t __attribute__((noinline)) hook_fork() {
+    if (!orig_fork) { errno = EAGAIN; return -1; }
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
     if (caller_is_anogs(lr)) {
         pid_t pid = orig_fork();
         if (pid == 0) {
-            // We are the child — exit before any watchdog scan code runs
             _exit(0);
         }
-        return pid; // parent: returns real PID (waitpid Layer 37 handles it)
+        return pid;
     }
     return orig_fork();
 }
@@ -177,6 +179,7 @@ typedef int (*mincore_t)(void*, size_t, unsigned char*);
 static mincore_t orig_mincore = nullptr;
 
 static int __attribute__((noinline)) hook_mincore(void *addr, size_t length, unsigned char *vec) {
+    if (!orig_mincore) { errno = ENOSYS; return -1; }
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
     int ret = orig_mincore(addr, length, vec);
     // If caller is libanogs — force all pages to look clean and in-core
@@ -210,6 +213,7 @@ static void decode_inj() {
 }
 
 static ssize_t hook_readlink(const char *pathname, char *buf, size_t bufsiz) {
+    if (!orig_readlink) { errno = ENOSYS; return -1; }
     ssize_t ret = orig_readlink(pathname, buf, bufsiz);
     if (ret > 0 && buf) {
         // Null-terminate for safe strstr (within bounds)

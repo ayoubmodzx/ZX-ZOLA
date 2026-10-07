@@ -80,6 +80,7 @@ static int hook_clock_gettime(clockid_t clk, struct timespec *tp) {
         tp->tv_nsec = (long)  (ns % 1'000'000'000ULL);
         return 0;
     }
+    if (!g_orig_clock_gettime) { errno = ENOSYS; return -1; }
     return g_orig_clock_gettime(clk, tp);
 }
 
@@ -91,6 +92,7 @@ static int hook_clock_gettime(clockid_t clk, struct timespec *tp) {
 static int (*g_orig_gettimeofday)(struct timeval*, struct timezone*) = nullptr;
 
 static int hook_gettimeofday(struct timeval *tv, struct timezone *tz) {
+    if (!g_orig_gettimeofday) { errno = ENOSYS; return -1; }
     int ret = g_orig_gettimeofday(tv, tz);
     // Coarse-granularize to 10ms chunks to defeat microsecond timing probes
     if (ret == 0 && tv) {
@@ -105,8 +107,23 @@ static int hook_gettimeofday(struct timeval *tv, struct timezone *tz) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static pid_t (*g_orig_setsid)(void) = nullptr;
+
+static uintptr_t s_ano4_base = 0, s_ano4_end = 0;
+static int phdr_find_ano4(dl_phdr_info *info, size_t, void*) {
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_LOAD) { uintptr_t e = base + ph.p_vaddr + ph.p_memsz; if (e > end) end = e; }
+    }
+    s_ano4_base = base; s_ano4_end = end; return 1;
+}
+
 static pid_t hook_setsid(void) {
-    (void)g_orig_setsid; // don't call real — would change actual session
+    if (!s_ano4_base) dl_iterate_phdr(phdr_find_ano4, nullptr);
+    uintptr_t lr = (uintptr_t)__builtin_return_address(0);
+    if (s_ano4_base && !(lr >= s_ano4_base && lr < s_ano4_end))
+        return g_orig_setsid ? g_orig_setsid() : (pid_t)syscall(__NR_setsid);
     return 0;
 }
 
@@ -136,6 +153,7 @@ static int hook_prop_get(const char *name, char *value) {
             }
         }
     }
+    if (!g_orig_prop_get) return 0;
     return g_orig_prop_get(name, value);
 }
 
@@ -154,6 +172,7 @@ static int hook_prctl(int opt, unsigned long a1, unsigned long a2,
     if (opt == PR_GET_DUMPABLE)  return 0;
     if (opt == PR_GET_SECCOMP)   return 0;
     if (opt == PR_SET_DUMPABLE)  return 0;
+    if (!g_orig_prctl) { errno = ENOSYS; return -1; }
     return g_orig_prctl(opt, a1, a2, a3, a4);
 }
 
@@ -178,6 +197,7 @@ static bool is_hook_lib(const char *fname) {
 }
 
 static int hook_dladdr(const void *addr, Dl_info *info) {
+    if (!g_orig_dladdr) return 0;
     int ret = g_orig_dladdr(addr, info);
     if (ret && info && is_hook_lib(info->dli_fname)) {
         info->dli_fname = "/system/lib64/libc.so";
@@ -198,6 +218,7 @@ static int (*g_orig_sigaction)(int, const struct sigaction*, struct sigaction*) 
 static void noop_sighandler(int) {}
 
 static int hook_sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
+    if (!g_orig_sigaction) { errno = ENOSYS; return -1; }
     if (sig == SIGTRAP || sig == SIGILL) {
         struct sigaction noop_act{};
         noop_act.sa_handler = noop_sighandler;
@@ -244,6 +265,7 @@ static long hook_syscall(long nr, long a1, long a2, long a3,
             break;
         }
     }
+    if (!g_orig_syscall) { errno = ENOSYS; return -1; }
     return g_orig_syscall(nr, a1, a2, a3, a4, a5, a6);
 }
 
@@ -265,6 +287,7 @@ static bool is_proc_fd(int fd) {
 }
 
 static int hook_fcntl(int fd, int cmd, long arg) {
+    if (!g_orig_fcntl) return -1;
     int ret = g_orig_fcntl(fd, cmd, arg);
     // Strip O_RDWR on proc fds — debugger artifact
     if (cmd == F_GETFL && ret >= 0 && is_proc_fd(fd)) {
@@ -294,6 +317,7 @@ static int hook_access(const char *path, int mode) {
             if (strstr(path, *b)) { errno = ENOENT; return -1; }
         }
     }
+    if (!g_orig_access) { errno = ENOENT; return -1; }
     return g_orig_access(path, mode);
 }
 
@@ -311,7 +335,7 @@ static pid_t g_ano_forks[MAX_TRACKED];
 static int   g_ano_forks_n = 0;
 static pthread_mutex_t g_fork_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static void track_fork(pid_t child) {
+void track_fork(pid_t child) {
     pthread_mutex_lock(&g_fork_mu);
     if (g_ano_forks_n < MAX_TRACKED)
         g_ano_forks[g_ano_forks_n++] = child;
@@ -329,6 +353,7 @@ static pid_t hook_waitpid(pid_t pid, int *status, int opts) {
         if (status) *status = 0; // W_EXITCODE(0, 0)
         return pid;
     }
+    if (!g_orig_waitpid) { errno = ECHILD; return -1; }
     return g_orig_waitpid(pid, status, opts);
 }
 

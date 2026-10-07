@@ -42,6 +42,7 @@ struct Il2CppClass;
 struct Il2CppImage;
 struct Il2CppDomain;
 struct Il2CppAssembly;
+struct Il2CppString;
 struct Il2CppObject { void *klass; void *monitor; /* data follows */ };
 
 // Field-type id helpers (matches il2cpp TYPE_* constants we care about)
@@ -115,4 +116,12 @@ namespace Il2Cpp {
 
     // Runtime invoke with no args
     Il2CppObject *invoke0(MethodInfo *m, Il2CppObject *obj);
+
+    Il2CppObject* findObjectsOfType(Il2CppClass* klass);
+    Il2CppObject* getLocalInstance(Il2CppClass* klass);
+    void*         invoke1(Il2CppObject* obj, const char* method, void* arg0);
+    Il2CppString* newString(const char* str);
+    bool          getFieldBool(Il2CppObject* obj, FieldInfo* field);
+    template<typename T>
+    T invoke0(Il2CppObject* obj, const char* method);
 }

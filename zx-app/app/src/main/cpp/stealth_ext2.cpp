@@ -275,7 +275,12 @@ static pid_t hook_fork() {
         errno = EPERM;
         return (pid_t)-1;
     }
-    return g_orig_fork ? g_orig_fork() : (pid_t)-1;
+    pid_t pid = g_orig_fork ? g_orig_fork() : (pid_t)-1;
+    if (pid > 0) {
+        extern void track_fork(pid_t);
+        track_fork(pid);
+    }
+    return pid;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -310,6 +315,16 @@ static int hook_mincore(void *addr, size_t length, unsigned char *vec) {
         pthread_mutex_unlock(&g_rwx_mu);
     }
 
+    // Layer 52 merged: if caller is libanogs, force ALL pages in-core
+    if (s_stx2_ano_base) {
+        uintptr_t lr15 = (uintptr_t)__builtin_return_address(0);
+        if (lr15 >= s_stx2_ano_base && lr15 < s_stx2_ano_end && vec && length > 0) {
+            size_t np = (length + 4095) / 4096;
+            for (size_t pg = 0; pg < np; pg++)
+                vec[pg] = 1;
+        }
+    }
+
     g_in_mincore = false;
     return r;
 }
@@ -342,6 +357,22 @@ static int hook_tgkill(pid_t tgid, pid_t tid, int sig) {
     return g_orig_tgkill ? g_orig_tgkill(tgid, tid, sig) : -1;
 }
 
+// libanogs.so load range for caller-aware connect/mincore checks (Fix 4/6)
+static uintptr_t s_stx2_ano_base = 0;
+static uintptr_t s_stx2_ano_end  = 0;
+
+static int phdr_find_ano_stx2(struct dl_phdr_info *info, size_t, void*) {
+    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        if (info->dlpi_phdr[i].p_type == PT_LOAD) {
+            uintptr_t se = base + info->dlpi_phdr[i].p_vaddr + info->dlpi_phdr[i].p_memsz;
+            if (se > end) end = se;
+        }
+    }
+    s_stx2_ano_base = base; s_stx2_ano_end = end; return 1;
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Layer 17a — connect() gate
 //
@@ -354,6 +385,12 @@ using FnConnect = int(*)(int, const struct sockaddr*, socklen_t);
 static FnConnect g_orig_connect = nullptr;
 
 static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
+    uintptr_t lr17 = (uintptr_t)__builtin_return_address(0);
+    if (s_stx2_ano_base && lr17 >= s_stx2_ano_base && lr17 < s_stx2_ano_end) {
+        errno = ECONNREFUSED;
+        return -1;
+    }
+
     if (!addr) goto pass;
 
     if (addr->sa_family == AF_INET) {
@@ -477,6 +514,11 @@ void install_stealth_ext2() {
     // ── Layer 17b — __system_property_get spoof ─────────────────────────────
     if (libc) hk2(libc, "__system_property_get",
         (void*)hook_system_property_get, (void**)&g_orig_prop_get);
+
+    // Populate libanogs range for caller-aware connect/mincore checks
+    dl_iterate_phdr(phdr_find_ano_stx2, nullptr);
+    if (s_stx2_ano_base)
+        LI("L17a/L15 ano range: [%p-%p]", (void*)s_stx2_ano_base, (void*)s_stx2_ano_end);
 
     stx2_mask_thread_name();
 

@@ -68,7 +68,7 @@ static void *ctrl_loop(void *) {
 }
 
 // Called when payload is dlopen'd into FF
-__attribute__((constructor))
+__attribute__((constructor(102)))
 static void payload_init() {
     LOG("ZX-ZOLA payload injected");
     // Anti-detection runs first — before any IL2CPP or feature work

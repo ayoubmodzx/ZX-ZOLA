@@ -166,6 +166,7 @@ static int hook_inotify_add_watch(int fd, const char *pathname, uint32_t mask) {
     // If it's our own app's path monitoring — fall through unchanged.
     if (!pathname) return -1;
     // Redirect only AnoSDK's known watch targets — exclude /dev/input/* (gamepad)
+    if (!orig_inotify_add_watch) { errno = ENOSYS; return -1; }
     if (strstr(pathname, "/data/data") ||
         strstr(pathname, "/data/user") ||
         strstr(pathname, "/proc/")) {
@@ -210,9 +211,8 @@ static bool is_ano_popen(const char *cmd) {
 }
 
 static FILE* hook_popen(const char *cmd, const char *mode) {
+    if (!orig_popen) return nullptr;
     if (is_ano_popen(cmd)) {
-        // Return a valid FILE* that yields empty output
-        // /dev/null opened for reading gives immediate EOF
         return orig_popen("true", mode);
     }
     return orig_popen(cmd, mode);

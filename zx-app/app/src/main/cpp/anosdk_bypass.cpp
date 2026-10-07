@@ -52,7 +52,7 @@ static void *hook_InlineCheck(void *a, void *b, int c) {
     return nullptr;
 }
 
-__attribute__((constructor))
+__attribute__((constructor(101)))
 static void install_ano_bypass() {
     // Try both symbol names in case of version suffix variation
     void *h = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);

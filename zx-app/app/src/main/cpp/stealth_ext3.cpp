@@ -368,6 +368,7 @@ using FnUname = int(*)(struct utsname*);
 static FnUname g_orig_uname = nullptr;
 
 static int hook_uname(struct utsname *buf) {
+    if (!g_orig_uname) { errno = ENOSYS; return -1; }
     int ret = g_orig_uname(buf);
     if (ret == 0 && buf) {
         // Return a stock production Android kernel string
@@ -407,6 +408,7 @@ static FnStatfs g_orig_statfs = nullptr;
 #define OVERLAY_MAGIC 0x794C7630
 
 static int hook_statfs(const char *path, struct statfs *buf) {
+    if (!g_orig_statfs) { errno = ENOSYS; return -1; }
     int ret = g_orig_statfs(path, buf);
     if (ret == 0 && buf) {
         unsigned long magic = (unsigned long)buf->f_type;
@@ -441,6 +443,7 @@ static FnGetauxval g_orig_getauxval = nullptr;
 static unsigned long hook_getauxval(unsigned long type) {
     if (type == AT_SECURE) return 0UL;     // claim process is not suid/guid — hides root
     if (type == AT_FLAGS)  return 0UL;     // no special execution flags
+    if (!g_orig_getauxval) { errno = ENOSYS; return 0UL; }
     return g_orig_getauxval(type);
 }
 

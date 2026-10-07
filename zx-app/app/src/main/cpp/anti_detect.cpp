@@ -131,12 +131,14 @@ static int (*orig_ffutil_Unmap)(void*)                  = nullptr;
 static int (*orig_ffutil_SetUnmapTarget)(void*, int)    = nullptr;
 
 static int hook_ffutil_UnmapAddr(uintptr_t a, size_t l) {
+    if (addr_is_ours(a)) return 0;
     return orig_ffutil_UnmapAddr ? orig_ffutil_UnmapAddr(a, l) : 0;
 }
 static int hook_ffutil_UnmapSize(size_t l) {
     return orig_ffutil_UnmapSize ? orig_ffutil_UnmapSize(l) : 0;
 }
 static int hook_ffutil_Unmap(void *c) {
+    if (c && addr_is_ours((uintptr_t)c)) return 0;
     return orig_ffutil_Unmap ? orig_ffutil_Unmap(c) : 0;
 }
 static int hook_ffutil_SetUnmapTarget(void *c, int f) {

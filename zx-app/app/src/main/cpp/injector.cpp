@@ -73,6 +73,16 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
 
     memcpy(&regs, &orig, sizeof(regs));
 
+    // Place BRK #0 at the return address so we get SIGTRAP instead of running free
+    uintptr_t lr_addr = orig.regs[30]; // X30 = link register on ARM64
+    uint32_t  brk_insn = 0xD4200000u; // BRK #0
+    uint32_t  saved_insn = 0;
+    {
+        long w = ptrace(PTRACE_PEEKTEXT, pid, (void*)lr_addr, nullptr);
+        saved_insn = (uint32_t)w;
+        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)(uintptr_t)brk_insn);
+    }
+
     // arm64: syscall via SVC #0, args in x0-x5, syscall num in x8
     // mmap(NULL, size, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANON, -1, 0)
     regs.regs[8]  = 222; // __NR_mmap
@@ -84,9 +94,21 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     regs.regs[5]  = 0;
     regs.pc       = mmap_addr;
 
-    if (!set_regs(pid, &regs)) return 0;
+    if (!set_regs(pid, &regs)) {
+        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)(uintptr_t)saved_insn);
+        return 0;
+    }
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-    waitpid(pid, nullptr, 0);
+    int wst = 0;
+    waitpid(pid, &wst, 0);
+
+    // Restore original instruction at LR
+    ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)(uintptr_t)saved_insn);
+
+    if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
+        set_regs(pid, &orig);
+        return 0;
+    }
 
     get_regs(pid, &regs);
     uintptr_t result = regs.regs[0];
