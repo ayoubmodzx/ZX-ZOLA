@@ -1,13 +1,18 @@
 package com.zx.zola
 
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
+import android.os.Build
 import android.os.IBinder
 import android.view.*
 import android.widget.*
+import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlin.math.abs
 
@@ -123,11 +128,35 @@ class ZxOverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        startForegroundCompat()
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         panelW = dp(DEF_W_DP)
         panelH = dp(DEF_H_DP)
         createFab()
         createPanel()
+    }
+
+    private fun startForegroundCompat() {
+        val channelId = "zx_overlay"
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(channelId, "ZX Overlay",
+                NotificationManager.IMPORTANCE_MIN).apply {
+                setShowBadge(false); setSound(null, null)
+            }
+            getSystemService(NotificationManager::class.java)?.createNotificationChannel(ch)
+        }
+        val tap = PendingIntent.getActivity(this, 0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE)
+        val notif = NotificationCompat.Builder(this, channelId)
+            .setContentTitle("ZX • AYOUB")
+            .setContentText("Overlay active — tap to manage")
+            .setSmallIcon(R.drawable.ic_zx)
+            .setContentIntent(tap)
+            .setOngoing(true)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .build()
+        startForeground(1, notif)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
