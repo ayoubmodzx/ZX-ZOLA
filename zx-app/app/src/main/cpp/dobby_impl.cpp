@@ -41,7 +41,7 @@ static void write_jump(void *dst, const void *target) {
     t[1] = 0xD61F0220u;
     memcpy(&t[2], &target, 8);
     memcpy(dst, t, TRAMP);
-    __builtin___clear_cache(dst, (char*)dst + TRAMP);
+    __builtin___clear_cache((char*)dst, (char*)dst + TRAMP);
 }
 
 static bool set_rwx(void *p, size_t n) {
@@ -102,7 +102,7 @@ int DobbyHook(void *addr, void *replace, void **origin) {
         if (pg != MAP_FAILED) {
             memcpy(pg, s.saved, TRAMP);
             write_jump((char*)pg + TRAMP, (char*)addr + TRAMP);
-            __builtin___clear_cache(pg, (char*)pg + TRAMP * 2);
+            __builtin___clear_cache((char*)pg, (char*)pg + TRAMP * 2);
             s.page  = pg;
             *origin = pg;
             zx_track_rwx_page(pg, (size_t)getpagesize());
@@ -123,7 +123,7 @@ int DobbyDestroy(void *addr) {
         if (it->target != addr) continue;
         set_rwx(addr, TRAMP);
         memcpy(addr, it->saved, TRAMP);
-        __builtin___clear_cache(addr, (char*)addr + TRAMP);
+        __builtin___clear_cache((char*)addr, (char*)addr + TRAMP);
         if (it->page) munmap(it->page, (size_t)getpagesize());
         g_slots.erase(it);
         return 0;

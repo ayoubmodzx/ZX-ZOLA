@@ -14,6 +14,8 @@
 #include <sys/mman.h>
 #include <asm/ptrace.h>
 #include <elf.h>
+// Android NDK ARM64 provides user_pt_regs, not pt_regs, in userspace headers
+typedef struct user_pt_regs pt_regs;
 #include <errno.h>
 #include <android/log.h>
 
