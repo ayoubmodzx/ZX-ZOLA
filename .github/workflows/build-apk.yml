@@ -25,7 +25,7 @@ jobs:
           if [ ! -f "$SDKMANAGER" ]; then
             SDKMANAGER=$(find "$ANDROID_SDK_ROOT/cmdline-tools" -name sdkmanager | head -1)
           fi
-          echo "y" | "$SDKMANAGER" "ndk;27.2.12479018" "cmake;3.22.1" --sdk_root="$ANDROID_SDK_ROOT"
+          echo "y" | "$SDKMANAGER" "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-35" --sdk_root="$ANDROID_SDK_ROOT"
           echo "sdk.dir=$ANDROID_SDK_ROOT" > zx-app/local.properties
 
       - name: Cache Gradle
