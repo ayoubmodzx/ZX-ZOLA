@@ -34,6 +34,15 @@ add_executable(zx_injector
 )
 target_include_directories(zx_injector PRIVATE .)
 target_link_libraries(zx_injector log dl)
+# The injector runs via `su -c` outside the app's LD_LIBRARY_PATH where
+# libc++_shared.so is not present.  ANDROID_STL=c++_static (build.gradle) is
+# set but NDK r27 doesn't always propagate it to add_executable targets.
+# Force the static C++ runtime explicitly so the binary is fully self-contained.
+target_link_options(zx_injector PRIVATE
+    -nostdlib++
+    -l:libc++_static.a
+    -l:libc++abi.a
+)
 
 # Package injector as libzx_injector.so in jniLibs so the system installs it
 # into nativeLibraryDir at install time — that directory is exec-allowed, unlike
