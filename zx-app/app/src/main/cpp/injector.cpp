@@ -364,6 +364,35 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     //   [+36] NOP             — align pool to 8-byte boundary
     //   [+40] fn_loader_dlopen (8 bytes)
     //   [+48] fn_dlerror       (8 bytes)
+    // Test: can FF's process open the staged file? Use a remote openat syscall.
+    // AT_FDCWD=-100, O_RDONLY=0
+    {
+        pt_regs ro, rr; get_regs(pid, &ro); memcpy(&rr, &ro, sizeof(rr));
+        rr.pstate &= ~(uint64_t)(3u << 10);
+        rr.regs[8] = 56;                         // __NR_openat
+        rr.regs[0] = (uint64_t)-100LL;           // AT_FDCWD
+        rr.regs[1] = remote_buf;                 // path (already written above)
+        rr.regs[2] = 0;                          // O_RDONLY
+        rr.regs[3] = 0;
+        rr.pc = find_svc_gadget(pid);
+        if (rr.pc && set_regs(pid, &rr)) {
+            ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+            int wst = 0; waitpid(pid, &wst, 0);
+            pt_regs rp; get_regs(pid, &rp);
+            int64_t fd_ret = (int64_t)rp.regs[0];
+            zerr("remote_dlopen: openat test fd=%lld (neg=errno, >=0=ok)", (long long)fd_ret);
+            if (fd_ret >= 0) {
+                // close fd via syscall
+                rp.regs[8] = 57; rp.regs[0] = (uint64_t)fd_ret;
+                rp.pc = find_svc_gadget(pid);
+                if (rp.pc && set_regs(pid, &rp)) {
+                    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+                    waitpid(pid, &wst, 0);
+                }
+            }
+        }
+        set_regs(pid, &ro);
+    }
     uintptr_t sc_addr = remote_buf + path_aligned;
     struct { uint32_t insns[10]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
     sc.insns[0] = 0x58000148u; // LDR X8, #40  (PC=0, target=40, imm19=10)
@@ -425,9 +454,33 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
             zerr("remote_dlopen: dlerror read failed (ptr=0x%lx)", (unsigned long)err_ptr);
     }
 
-    // dlopen returns NULL (0) on failure; large values (> -4096) are negative errno-like errors
-    bool ok = (handle != 0) && (handle < (uintptr_t)-4096ULL);
-    if (!ok) zerr("remote_dlopen: FAILED — handle 0x%lx is not a valid pointer", (unsigned long)handle);
+    // Ground-truth check: did the library actually appear in /proc/pid/maps?
+    // Android 10+ uses 32-bit random obfuscated handles (zero-extended to 64 bits),
+    // so a valid handle is always in [1, 0xFFFFFFFF]. But verify via maps regardless.
+    bool in_maps = false;
+    {
+        char mpath[64]; snprintf(mpath, sizeof(mpath), "/proc/%d/maps", pid);
+        FILE *mf = fopen(mpath, "r");
+        char mline[512];
+        const char *bname = strrchr(so_path, '/');
+        bname = bname ? bname + 1 : so_path;
+        while (mf && fgets(mline, sizeof(mline), mf))
+            if (strstr(mline, bname)) { in_maps = true; break; }
+        if (mf) fclose(mf);
+        zerr("remote_dlopen: maps_check: in_maps=%d basename=%s", in_maps, bname);
+    }
+    // Dump bytes at loader_dlopen_addr to confirm what function is there
+    {
+        uint32_t ldi[4] = {};
+        ProcMem::read(loader_dlopen_addr, ldi, sizeof(ldi));
+        zerr("remote_dlopen: __loader_dlopen@0x%lx bytes: %08x %08x %08x %08x",
+             (unsigned long)loader_dlopen_addr, ldi[0], ldi[1], ldi[2], ldi[3]);
+    }
+    // Valid handle: non-zero AND fits in 32 bits (random obfuscated cookie on Android 10+)
+    // OR the library simply appeared in maps (handle may be a cookie that looks like -4)
+    bool ok = (handle != 0 && handle <= 0xFFFFFFFFULL) || in_maps;
+    if (!ok)
+        zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d", (unsigned long)handle, in_maps);
     return ok;
 }
 
