@@ -30,6 +30,7 @@
 #include <cmath>
 #include <atomic>
 #include <cstdlib>
+#include <dlfcn.h>
 
 #define TAG "ZX-ESP"
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -39,7 +40,6 @@
 // Math types
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct Vec2  { float x, y; };
 struct Vec3  { float x, y, z; };
 struct Color { float r, g, b, a; };
 
@@ -284,6 +284,8 @@ static void gl_restore(const GlSave &s) {
 
 static FnCamRender g_origOnPostRender = nullptr;
 
+static void update_hs_target(void *cam);  // defined below
+
 static void hook_OnPostRender(void *cam) {
     // Call original first
     if (g_origOnPostRender) g_origOnPostRender(cam);
@@ -399,8 +401,10 @@ static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
 static Vec3 get_position(Il2CppObject *transform) {
     Vec3 pos{};
     MethodInfo *m = Il2Cpp::getMethod(Il2Cpp::cls("Transform"), "get_position", 0);
-    if (m && m->methodPointer)
-        pos = Il2Cpp::invoke0<Vec3>(m, transform);
+    if (!m || !m->methodPointer) return pos;
+    // invoke0 returns a boxed Vector3; unbox by skipping the 16-byte Il2CppObject header
+    Il2CppObject *boxed = Il2Cpp::invoke0(m, transform);
+    if (boxed) __builtin_memcpy(&pos, (char*)boxed + sizeof(Il2CppObject), sizeof(Vec3));
     return pos;
 }
 
@@ -412,14 +416,11 @@ static float dist3(Vec3 a, Vec3 b) {
 // Find local player's position (to compute distances)
 static Vec3 get_local_pos() {
     if (!g_local_player) return {};
-    MethodInfo *m = Il2Cpp::getMethod(Il2Cpp::cls("Transform"), "get_position", 0);
-    if (!m || !m->methodPointer) return {};
-    MethodInfo *getT = Il2Cpp::getMethod(
-        Il2Cpp::cls("Component"), "get_transform", 0);
+    MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component"), "get_transform", 0);
     if (!getT || !getT->methodPointer) return {};
-    Il2CppObject *tr = Il2Cpp::invoke0(getT, g_local_player);
+    Il2CppObject *tr = Il2Cpp::invoke0(getT, (Il2CppObject*)g_local_player);
     if (!tr) return {};
-    return Il2Cpp::invoke0<Vec3>(m, tr);
+    return get_position(tr);
 }
 
 static void *position_updater(void *) {
@@ -454,7 +455,8 @@ static void *position_updater(void *) {
             if (!p || p == g_local_player) continue;
 
             // Check alive status
-            bool alive = Il2Cpp::getFieldBool(playerCls, p, "IsAlive");
+            FieldInfo *aliveF = Il2Cpp::getField(playerCls, "IsAlive");
+            bool alive = aliveF ? Il2Cpp::getFieldBool(p, aliveF) : true;
             if (!alive) continue;
 
             // Get transform

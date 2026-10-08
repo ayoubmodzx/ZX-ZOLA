@@ -114,14 +114,13 @@ namespace Il2Cpp {
     // FindObjectOfType shim — calls UnityEngine Object.FindObjectOfType(Type)
     Il2CppObject *findObject(Il2CppClass *klass);
 
-    // Runtime invoke with no args
+    // Runtime invoke with no args — returns boxed value or object ptr
     Il2CppObject *invoke0(MethodInfo *m, Il2CppObject *obj);
 
-    Il2CppObject* findObjectsOfType(Il2CppClass* klass);
-    Il2CppObject* getLocalInstance(Il2CppClass* klass);
-    void*         invoke1(Il2CppObject* obj, const char* method, void* arg0);
-    Il2CppString* newString(const char* str);
-    bool          getFieldBool(Il2CppObject* obj, FieldInfo* field);
-    template<typename T>
-    T invoke0(Il2CppObject* obj, const char* method);
+    // FindObjectsOfType — fills caller-allocated pointers; caller must free(*arr)
+    void          findObjectsOfType(Il2CppClass *klass, Il2CppObject ***arr, int *count);
+    Il2CppObject *getLocalInstance(Il2CppClass *klass);
+    Il2CppObject *invoke1(MethodInfo *m, Il2CppObject *obj, void *arg0);
+    Il2CppObject *newString(const char *str);
+    bool          getFieldBool(Il2CppObject *obj, FieldInfo *field);
 }

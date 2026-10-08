@@ -34,9 +34,12 @@ static void         (*p_field_static_set)(FieldInfo*, void*)                    
 static void         (*p_field_static_get)(FieldInfo*, void*)                     = nullptr;
 static uint32_t     (*p_class_num_fields)(Il2CppClass*)                          = nullptr;
 // For FindObjectOfType
-static Il2CppClass* (*p_unity_obj_class)(Il2CppImage*, const char*, const char*) = nullptr;
+static Il2CppClass*  (*p_unity_obj_class)(Il2CppImage*, const char*, const char*) = nullptr;
 static Il2CppObject* (*p_runtime_invoke)(MethodInfo*, Il2CppObject*, void**, void**) = nullptr;
 static Il2CppObject* (*p_object_new)(Il2CppClass*)                               = nullptr;
+static void*         (*p_class_get_type)(Il2CppClass*)                           = nullptr;
+static Il2CppObject* (*p_type_get_object)(void*)                                 = nullptr;
+static Il2CppObject* (*p_string_new_utf8)(const char*)                           = nullptr;
 
 static Il2CppImage *g_img    = nullptr;
 static Il2CppImage *g_unity  = nullptr;  // UnityEngine.CoreModule
@@ -78,7 +81,10 @@ bool Il2Cpp::init() {
     BIND(p_field_static_get,  "il2cpp_field_static_get_value")
     BIND(p_class_num_fields,  "il2cpp_class_num_fields")
     BIND(p_runtime_invoke,    "il2cpp_runtime_invoke")
-    BIND_OPT(p_object_new,    "il2cpp_object_new")
+    BIND_OPT(p_object_new,       "il2cpp_object_new")
+    BIND_OPT(p_class_get_type,   "il2cpp_class_get_type")
+    BIND_OPT(p_type_get_object,  "il2cpp_type_get_object")
+    BIND_OPT(p_string_new_utf8,  "il2cpp_string_new")
 
     Il2CppDomain *dom = p_domain_get();
     if (!dom) { ERR("il2cpp domain not ready"); return false; }
@@ -201,5 +207,96 @@ Il2CppObject *Il2Cpp::invoke0(MethodInfo *m, Il2CppObject *obj) {
     void *exc = nullptr;
     Il2CppObject *result = p_runtime_invoke(m, obj, nullptr, &exc);
     if (exc) { ERR("invoke0 exception on %s", m->name ? m->name : "?"); return nullptr; }
+    return result;
+}
+
+// ── invoke1 ───────────────────────────────────────────────────────────────────
+Il2CppObject *Il2Cpp::invoke1(MethodInfo *m, Il2CppObject *obj, void *arg0) {
+    if (!m || !p_runtime_invoke) return nullptr;
+    void *exc = nullptr;
+    void *params[1] = { arg0 };
+    Il2CppObject *result = p_runtime_invoke(m, obj, params, &exc);
+    if (exc) { ERR("invoke1 exception on %s", m->name ? m->name : "?"); return nullptr; }
+    return result;
+}
+
+// ── newString ─────────────────────────────────────────────────────────────────
+Il2CppObject *Il2Cpp::newString(const char *str) {
+    if (!str || !p_string_new_utf8) return nullptr;
+    return p_string_new_utf8(str);
+}
+
+// ── getFieldBool ──────────────────────────────────────────────────────────────
+bool Il2Cpp::getFieldBool(Il2CppObject *obj, FieldInfo *field) {
+    if (!obj || !field) return false;
+    int32_t off = fieldOffset(field);
+    if (off <= 0) return false;
+    return readField<bool>(obj, off);
+}
+
+// ── findObjectsOfType ─────────────────────────────────────────────────────────
+// Calls UnityEngine.Object::FindObjectsOfType(Type); caller must free(*arr).
+void Il2Cpp::findObjectsOfType(Il2CppClass *klass, Il2CppObject ***arr, int *count) {
+    *arr   = nullptr;
+    *count = 0;
+    if (!klass || !g_unity || !p_class_from_name || !p_runtime_invoke) return;
+    if (!p_class_get_type || !p_type_get_object) return;
+
+    static Il2CppClass *s_objCls = nullptr;
+    static MethodInfo  *s_findFn = nullptr;
+    if (!s_objCls) s_objCls = p_class_from_name(g_unity, "UnityEngine", "Object");
+    if (!s_objCls) return;
+    if (!s_findFn) s_findFn = p_method_from_name(s_objCls, "FindObjectsOfType", 1);
+    if (!s_findFn) return;
+
+    void         *type    = p_class_get_type(klass);
+    if (!type) return;
+    Il2CppObject *typeObj = p_type_get_object(type);
+    if (!typeObj) return;
+
+    void         *exc       = nullptr;
+    void         *params[1] = { typeObj };
+    Il2CppObject *res       = p_runtime_invoke(s_findFn, nullptr, params, &exc);
+    if (exc || !res) return;
+
+    // Il2CppArray: Il2CppObject hdr (16B) | void* bounds (8B) | uintptr_t max_length (8B) | data
+    struct Array {
+        Il2CppObject hdr;
+        void        *bounds;
+        uintptr_t    max_length;
+    };
+    auto *a = reinterpret_cast<Array*>(res);
+    int   n = (int)a->max_length;
+    if (n <= 0) return;
+
+    Il2CppObject **out = (Il2CppObject**)malloc(sizeof(Il2CppObject*) * (size_t)n);
+    if (!out) return;
+    auto *raw = reinterpret_cast<Il2CppObject**>(a + 1);
+    for (int i = 0; i < n; i++) out[i] = raw[i];
+
+    *arr   = out;
+    *count = n;
+}
+
+// ── getLocalInstance ──────────────────────────────────────────────────────────
+// Tries IsLocalPlayer field; falls back to first valid instance.
+Il2CppObject *Il2Cpp::getLocalInstance(Il2CppClass *klass) {
+    Il2CppObject **arr   = nullptr;
+    int            count = 0;
+    findObjectsOfType(klass, &arr, &count);
+    if (!arr) return nullptr;
+
+    Il2CppObject *result = nullptr;
+    FieldInfo    *localF = getField(klass, "IsLocalPlayer");
+    for (int i = 0; i < count; i++) {
+        if (!arr[i]) continue;
+        if (localF) {
+            if (getFieldBool(arr[i], localF)) { result = arr[i]; break; }
+        } else {
+            result = arr[i];
+            break;
+        }
+    }
+    free(arr);
     return result;
 }
