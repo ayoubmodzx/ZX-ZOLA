@@ -46,10 +46,14 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cerrno>
 #include <sys/inotify.h>
 #include <pthread.h>
 #include <cctype>
 #include <cstdint>
+
+// dl_iterate_phdr callback type (not defined by name in NDK <link.h>)
+typedef int (*phdr_cb_t)(struct dl_phdr_info *, size_t, void *);
 
 #ifndef ZX_RELEASE
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  "ZX", __VA_ARGS__)
@@ -100,7 +104,7 @@ static int phdr_find_anogs5(dl_phdr_info *info, size_t /*sz*/, void * /*d*/) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct DlIterCtx {
-    dl_iterate_phdr_callback real_cb;
+    phdr_cb_t real_cb;
     void *real_data;
     bool  from_anogs;   // true = filter out our payload .so
 };
@@ -116,10 +120,10 @@ static int dl_iter_filter_cb(dl_phdr_info *info, size_t size, void *data) {
     return ctx->real_cb(info, size, ctx->real_data);
 }
 
-typedef int (*dl_iterate_phdr_t)(dl_iterate_phdr_callback, void*);
+typedef int (*dl_iterate_phdr_t)(phdr_cb_t, void*);
 static dl_iterate_phdr_t orig_dl_iterate_phdr = nullptr;
 
-static int __attribute__((noinline)) hook_dl_iterate_phdr(dl_iterate_phdr_callback cb, void *data) {
+static int __attribute__((noinline)) hook_dl_iterate_phdr(phdr_cb_t cb, void *data) {
     if (!orig_dl_iterate_phdr) return 0;
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
     if (!s_ano_base5) orig_dl_iterate_phdr(phdr_find_anogs5, nullptr);
