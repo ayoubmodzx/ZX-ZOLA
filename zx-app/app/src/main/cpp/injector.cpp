@@ -1,6 +1,12 @@
 // zx_injector — standalone root binary
 // Usage: zx_injector <pid> <cmd> <1|0>
 // Injects zx_payload.so into FF process via /proc/PID/mem + dlopen shellcode
+// NOTE: This binary is ARM64-only; FF is a 64-bit process and ptrace
+//       register layout below is ARM64-specific (user_pt_regs / .regs[] / .pc).
+//       ARM32 builds compile a stub that exits immediately.
+
+#ifdef __aarch64__
+
 #include "proc_mem.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -236,3 +242,10 @@ int main(int argc, char *argv[]) {
     ProcMem::close();
     return 0;
 }
+
+#else // !__aarch64__
+
+// ARM32 stub — injector targets a 64-bit FF process; not applicable on 32-bit ABI
+int main(int /*argc*/, char ** /*argv*/) { return 1; }
+
+#endif // __aarch64__
