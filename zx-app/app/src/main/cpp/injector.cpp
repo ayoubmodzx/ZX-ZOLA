@@ -111,100 +111,97 @@ static bool set_regs(pid_t pid, pt_regs *regs) {
     return ptrace(PTRACE_SETREGSET, pid, (void*)NT_PRSTATUS, &iov) == 0;
 }
 
-// Allocate RWX memory in target process via remote mmap syscall
+// Scan target's libc.so for a raw SVC #0 gadget — bypasses BTI/CFI on the mmap wrapper.
+// ARM64 SVC #0 encoding (LE): 0xD4000001
+static uintptr_t find_svc_gadget(pid_t pid) {
+    uintptr_t base = ProcMem::findLibBase(pid, "libc.so");
+    if (!base) { zerr("find_svc_gadget: libc.so not mapped"); return 0; }
+    static uint8_t s_buf[65536];
+    const uint32_t SVC0 = 0xD4000001u;
+    for (size_t off = 0; off < 3 * 1024 * 1024; off += sizeof(s_buf)) {
+        if (!ProcMem::read(base + off, s_buf, sizeof(s_buf))) continue;
+        for (size_t i = 0; i + 4 <= sizeof(s_buf); i += 4) {
+            uint32_t insn;
+            memcpy(&insn, s_buf + i, 4);
+            if (insn == SVC0) {
+                zerr("find_svc_gadget: SVC#0 at 0x%lx (libc+0x%zx)", (unsigned long)(base + off + i), off + i);
+                return base + off + i;
+            }
+        }
+    }
+    zerr("find_svc_gadget: no SVC#0 found in libc.so");
+    return 0;
+}
+
+// Allocate RWX memory in target via a raw SVC #0 gadget + PTRACE_SINGLESTEP.
+// Bypasses the mmap() C wrapper whose BTI guard (ARMv8.5+) causes SIGSEGV when
+// we teleport PC there via PTRACE_SETREGSET instead of a real BL/BLR instruction.
 static uintptr_t remote_mmap(pid_t pid, size_t size) {
     pt_regs orig, regs;
     if (!get_regs(pid, &orig)) { zerr("remote_mmap: get_regs failed errno=%d", errno); return 0; }
 
-    // ── DIAG 1: thread state at stop ─────────────────────────────────────────
-    zerr("DIAG mmap[1]: PC=0x%lx X30=0x%lx SP=0x%lx X0=0x%lx",
-         (unsigned long)orig.pc, (unsigned long)orig.regs[30],
-         (unsigned long)orig.sp, (unsigned long)orig.regs[0]);
-
-    uintptr_t mmap_addr = ProcMem::findSymbol(pid, "libc.so", "mmap");
-    if (!mmap_addr) { zerr("remote_mmap: mmap not found in libc.so"); return 0; }
-    zerr("DIAG mmap[2]: mmap_addr=0x%lx", (unsigned long)mmap_addr);
+    uintptr_t svc_addr = find_svc_gadget(pid);
+    if (!svc_addr) return 0;
 
     memcpy(&regs, &orig, sizeof(regs));
-
-    uintptr_t lr_addr  = orig.regs[30]; // X30 = link register on ARM64
-    uint32_t  brk_insn = 0xD4200000u;   // BRK #0
-
-    // ── DIAG 2: validate X30 before patching ─────────────────────────────────
-    errno = 0;
-    long saved_word = ptrace(PTRACE_PEEKTEXT, pid, (void*)lr_addr, nullptr);
-    int  peek_err   = errno;
-    zerr("DIAG mmap[3]: PEEKTEXT X30=0x%lx -> 0x%lx (errno=%d %s)",
-         (unsigned long)lr_addr, (unsigned long)saved_word,
-         peek_err, peek_err ? strerror(peek_err) : "ok");
-
-    if (peek_err != 0) {
-        zerr("remote_mmap: X30=0x%lx is INVALID — aborting", (unsigned long)lr_addr);
-        return 0;
-    }
-
-    long brk_word = (saved_word & (long)0xFFFFFFFF00000000LL) | (long)brk_insn;
-    ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)brk_word);
-
-    // ── DIAG 3: verify BRK actually landed ───────────────────────────────────
-    errno = 0;
-    long verify   = ptrace(PTRACE_PEEKTEXT, pid, (void*)lr_addr, nullptr);
-    int  vfy_err  = errno;
-    zerr("DIAG mmap[4]: BRK write verify -> 0x%lx (errno=%d) match=%d",
-         (unsigned long)verify, vfy_err, (int)(verify == brk_word));
-
-    // arm64: syscall via SVC #0, args in x0-x5, syscall num in x8
-    // mmap(NULL, size, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANON, -1, 0)
-    regs.regs[8]  = 222; // __NR_mmap
-    regs.regs[0]  = 0;
-    regs.regs[1]  = size;
-    regs.regs[2]  = PROT_READ | PROT_WRITE | PROT_EXEC;
-    regs.regs[3]  = MAP_PRIVATE | MAP_ANONYMOUS;
-    regs.regs[4]  = (uint64_t)-1;
-    regs.regs[5]  = 0;
-    regs.pc       = mmap_addr;
-
-    zerr("DIAG mmap[5]: injecting mmap call — size=%zu prot=RWX", size);
+    // Direct mmap syscall: X8=nr, X0-X5=args — no wrapper, no BTI, no prologue
+    regs.regs[8] = 222; // __NR_mmap
+    regs.regs[0] = 0;
+    regs.regs[1] = size;
+    regs.regs[2] = PROT_READ | PROT_WRITE | PROT_EXEC;
+    regs.regs[3] = MAP_PRIVATE | MAP_ANONYMOUS;
+    regs.regs[4] = (uint64_t)-1;
+    regs.regs[5] = 0;
+    regs.pc      = svc_addr;
 
     if (!set_regs(pid, &regs)) {
         zerr("remote_mmap: set_regs failed errno=%d", errno);
-        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word);
         return 0;
     }
-    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+
+    // PTRACE_SINGLESTEP: executes exactly the SVC instruction, then stops with SIGTRAP.
+    // The kernel handles the mmap syscall during the SVC, returns X0 = mapped address.
+    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
     int wst = 0;
     waitpid(pid, &wst, 0);
 
-    // Restore full 8-byte word (both lr_addr and lr_addr+4 instructions)
-    ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word);
-
     if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
-        // ── DIAG 4: crash site ───────────────────────────────────────────────
-        pt_regs crash;
-        get_regs(pid, &crash);
-        zerr("DIAG mmap[6]: CRASH — wst=0x%x stopped=%d sig=%d  crash_PC=0x%lx crash_X30=0x%lx crash_X0=0x%lx",
-             wst, WIFSTOPPED(wst), WSTOPSIG(wst),
-             (unsigned long)crash.pc, (unsigned long)crash.regs[30],
-             (unsigned long)crash.regs[0]);
-        zerr("remote_mmap: bad stop wst=0x%x stopped=%d sig=%d", wst, WIFSTOPPED(wst), WSTOPSIG(wst));
+        pt_regs crash; get_regs(pid, &crash);
+        zerr("remote_mmap: singlestep bad stop wst=0x%x sig=%d crash_PC=0x%lx",
+             wst, WSTOPSIG(wst), (unsigned long)crash.pc);
         set_regs(pid, &orig);
         return 0;
     }
 
     get_regs(pid, &regs);
     uintptr_t result = regs.regs[0];
-    zerr("DIAG mmap[7]: mmap returned 0x%lx", (unsigned long)result);
+    zerr("remote_mmap: SVC mmap result=0x%lx", (unsigned long)result);
 
     set_regs(pid, &orig);
-    return (result > 0x1000) ? result : 0;
+    // Kernel returns -errno as a large unsigned value on failure
+    return (result < (uintptr_t)-4096ULL) ? result : 0;
 }
 
-// Write memory to target and call dlopen via ptrace
+// Write memory to target and call dlopen via a small shellcode stub.
+//
+// Direct PC-teleport to dlopen() segfaults on ARMv8.5+ BTI devices (same
+// root cause as the mmap wrapper crash).  Instead we write a tiny shellcode
+// into the RWX page we just allocated:
+//
+//   [+0 ] LDR X8, #16      — load dlopen_addr from the literal pool at +16
+//   [+4 ] BLR X8           — call dlopen via BLR (BTI-C compatible)
+//   [+8 ] BRK #0           — stop; ptrace catches SIGTRAP here
+//   [+12] NOP               — 8-byte padding
+//   [+16] dlopen_addr(u64) — literal pool
+//
+// Our mmap'd page has no GP/BTI guard bit, so the initial PC-teleport into
+// the shellcode is fine.  The BLR is what matters for the guarded dlopen page.
 static bool remote_dlopen(pid_t pid, const char *so_path) {
-    size_t path_len = strlen(so_path) + 1;
-    size_t alloc    = path_len + 128; // path + shellcode space
+    size_t path_len     = strlen(so_path) + 1;
+    size_t path_aligned = (path_len + 7) & ~(size_t)7; // 8-byte align for shellcode
+    size_t alloc        = path_aligned + 24;             // path + 24-byte shellcode
 
-    // 1. Allocate remote memory
+    // 1. Allocate RWX scratch page
     uintptr_t remote_buf = remote_mmap(pid, alloc);
     if (!remote_buf) { zerr("remote_dlopen: remote_mmap returned 0"); return false; }
 
@@ -216,32 +213,45 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // 3. Find dlopen in target
     uintptr_t dlopen_addr = ProcMem::findSymbol(pid, "libdl.so", "dlopen");
     if (!dlopen_addr) { zerr("remote_dlopen: dlopen not found in libdl.so"); return false; }
+    zerr("remote_dlopen: dlopen_addr=0x%lx sc_addr=0x%lx", (unsigned long)dlopen_addr, (unsigned long)(remote_buf + path_aligned));
 
-    // 4. Set up registers for dlopen(path, RTLD_NOW|RTLD_GLOBAL)
+    // 4. Write shellcode
+    uintptr_t sc_addr = remote_buf + path_aligned;
+    struct { uint32_t insns[4]; uint64_t fn_addr; } sc;
+    sc.insns[0] = 0x58000088u; // LDR X8, #16
+    sc.insns[1] = 0xD63F0100u; // BLR X8
+    sc.insns[2] = 0xD4200000u; // BRK #0
+    sc.insns[3] = 0xD503201Fu; // NOP (literal pool alignment)
+    sc.fn_addr  = (uint64_t)dlopen_addr;
+    if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
+        zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
+    }
+
+    // 5. Jump into shellcode: X0=path, X1=flags, PC=shellcode
     pt_regs orig, regs;
     get_regs(pid, &orig);
     memcpy(&regs, &orig, sizeof(regs));
+    regs.regs[0] = remote_buf;             // dlopen arg 1: path
+    regs.regs[1] = RTLD_NOW | RTLD_GLOBAL; // dlopen arg 2: flags
+    regs.pc      = sc_addr;
 
-    regs.regs[0] = remote_buf;            // const char *filename
-    regs.regs[1] = RTLD_NOW | RTLD_GLOBAL;
-    regs.pc      = dlopen_addr;
-
-    // Set LR to a known trap address so we catch return
-    uintptr_t trap_addr = ProcMem::findLibBase(pid, "linker64");
-    if (trap_addr) regs.regs[30] = trap_addr; // LR
-
-    set_regs(pid, &regs);
+    if (!set_regs(pid, &regs)) {
+        zerr("remote_dlopen: set_regs failed errno=%d", errno); return false;
+    }
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-
-    // Wait for SIGSEGV/SIGILL at trap (dlopen returned)
     int status;
     waitpid(pid, &status, 0);
 
-    // Restore original context
     set_regs(pid, &orig);
 
-    LOG("dlopen complete, signal=%d", WSTOPSIG(status));
-    return true;
+    if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
+        zerr("remote_dlopen: bad stop sig=%d (want SIGTRAP)", WSTOPSIG(status));
+        return false;
+    }
+
+    pt_regs post; get_regs(pid, &post);
+    zerr("remote_dlopen: dlopen handle=0x%lx", (unsigned long)post.regs[0]);
+    return post.regs[0] != 0;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
