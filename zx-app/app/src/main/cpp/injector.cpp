@@ -144,6 +144,12 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     if (!svc_addr) return 0;
 
     memcpy(&regs, &orig, sizeof(regs));
+    // Clear PSTATE.BTYPE [11:10]: if the thread was stopped mid-branch these bits
+    // encode the pending branch type.  Any non-zero BTYPE causes the CPU to enforce
+    // BTI on the next instruction — a SVC in the middle of a guarded libc page is
+    // not a BTI instruction, so it faults instantly.  BTYPE=0 means "no pending
+    // branch check" → CPU skips the BTI guard entirely.
+    regs.pstate &= ~(uint64_t)(3u << 10); // PSR_BTYPE_MASK
     // Direct mmap syscall: X8=nr, X0-X5=args — no wrapper, no BTI, no prologue
     regs.regs[8] = 222; // __NR_mmap
     regs.regs[0] = 0;
@@ -231,6 +237,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     pt_regs orig, regs;
     get_regs(pid, &orig);
     memcpy(&regs, &orig, sizeof(regs));
+    regs.pstate &= ~(uint64_t)(3u << 10); // clear PSTATE.BTYPE — BLR inside shellcode handles dlopen's BTI
     regs.regs[0] = remote_buf;             // dlopen arg 1: path
     regs.regs[1] = RTLD_NOW | RTLD_GLOBAL; // dlopen arg 2: flags
     regs.pc      = sc_addr;
