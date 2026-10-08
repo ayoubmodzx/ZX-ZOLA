@@ -56,7 +56,8 @@ class ZxOverlayService : Service() {
         WEAPON  ("WEAPON",  "⊕"),
         MOVEMENT("MOVE",    "⇨"),
         SURVIVAL("SURVIVE", "♥"),
-        VISUAL  ("VISUAL",  "◉")
+        VISUAL  ("VISUAL",  "◉"),
+        LOGS    ("LOG",     "≡")
     }
 
     private val features: Map<Tab, List<Feature>> = mapOf(
@@ -130,6 +131,7 @@ class ZxOverlayService : Service() {
 
     // content refs set during buildPanel
     private lateinit var contentList  : LinearLayout
+    private lateinit var contentScroll: ScrollView
     private lateinit var statusDot    : View
     private lateinit var statusText   : TextView
     private lateinit var footerCountTv: TextView
@@ -142,6 +144,21 @@ class ZxOverlayService : Service() {
     // Persistent feature state — survives tab switches and panel close/reopen
     private val featureEnabled   = mutableMapOf<Int, Boolean>()
     private val featureIntensity = mutableMapOf<Int, Int>()
+
+    // Log tab state
+    private var logTv: TextView? = null
+    private var logRefreshActive = false
+    private val logRefresher = object : Runnable {
+        override fun run() {
+            val tv = logTv
+            if (tv != null && tv.parent != null) {
+                tv.text = buildLogText()
+                if (::contentScroll.isInitialized)
+                    contentScroll.post { contentScroll.fullScroll(ScrollView.FOCUS_DOWN) }
+            }
+            if (logRefreshActive) uiHandler.postDelayed(this, 1000L)
+        }
+    }
 
     // Status polling
     private var isConnected = false
@@ -211,6 +228,7 @@ class ZxOverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         uiHandler.removeCallbacks(pollTask)
+        stopLogRefresher()
         fabView  ?.let { if (it.parent != null) wm.removeView(it) }
         panelRoot?.let { if (it.parent != null) wm.removeView(it) }
     }
@@ -417,7 +435,7 @@ class ZxOverlayService : Service() {
 
     // ─── Content ──────────────────────────────────────────────────────────────
     private fun buildContent(): View {
-        val scroll = ScrollView(this).apply {
+        contentScroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.MATCH_PARENT, 1f)
             isVerticalScrollBarEnabled = false
         }
@@ -425,8 +443,8 @@ class ZxOverlayService : Service() {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(10), dp(8), dp(10), dp(8))
         }
-        scroll.addView(contentList)
-        return scroll
+        contentScroll.addView(contentList)
+        return contentScroll
     }
 
     // ─── Footer ───────────────────────────────────────────────────────────────
@@ -485,6 +503,7 @@ class ZxOverlayService : Service() {
 
     // ─── Tab / content rendering ──────────────────────────────────────────────
     private fun selectTab(tab: Tab) {
+        stopLogRefresher()
         currentTab = tab
         tabViews.forEach { (t, v) ->
             val sel = t == tab
@@ -499,6 +518,13 @@ class ZxOverlayService : Service() {
         }
         contentList.removeAllViews()
         switchMap.clear()
+        logTv = null
+
+        if (tab == Tab.LOGS) {
+            buildLogsContent()
+            return
+        }
+
         val list = features[tab] ?: run {
             activeLayerCount = 0
             if (::footerCountTv.isInitialized) footerCountTv.text = "0 LAYERS ACTIVE"
@@ -521,6 +547,66 @@ class ZxOverlayService : Service() {
             if (safe.isNotEmpty() || risk.isNotEmpty()) contentList.addView(divH())
             section("DANGER", "#FF1744"); danger.forEach { featureCard(it) }
         }
+    }
+
+    private fun buildLogsContent() {
+        if (::footerCountTv.isInitialized) footerCountTv.text = "INJECTION CONSOLE"
+
+        val hdr = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.bottomMargin = dp(6) }
+        }
+        hdr.addView(TextView(this).apply {
+            text = "INJECTION LOG"
+            setTextColor(Color.parseColor("#7C4DFF"))
+            textSize = 9f; letterSpacing = 0.15f
+            typeface = android.graphics.Typeface.MONOSPACE
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        hdr.addView(TextView(this).apply {
+            text = "CLEAR"
+            setTextColor(Color.parseColor("#FF5252"))
+            textSize = 9f; letterSpacing = 0.1f
+            background = ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.bg_feature_danger)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            setOnClickListener { ZxLog.clear(); logTv?.text = buildLogText() }
+        })
+        contentList.addView(hdr)
+
+        val tv = TextView(this).apply {
+            setTextColor(Color.parseColor("#B0C8B0"))
+            textSize = 9f
+            typeface = android.graphics.Typeface.MONOSPACE
+            setBackgroundColor(Color.parseColor("#06060E"))
+            setPadding(dp(6), dp(6), dp(6), dp(80))
+            text = buildLogText()
+        }
+        logTv = tv
+        contentList.addView(tv)
+        startLogRefresher()
+    }
+
+    private fun buildLogText(): String {
+        val snap = ZxLog.snapshot()
+        if (snap.isEmpty()) return "— no logs yet —\n\nToggle any feature to see\ninjection output here."
+        return snap.joinToString("\n") { e ->
+            val tag = when (e.level) { 'E' -> "ERR"; 'W' -> "WRN"; else -> "INF" }
+            "[${e.ts}] $tag  ${e.msg}"
+        }
+    }
+
+    private fun startLogRefresher() {
+        logRefreshActive = true
+        uiHandler.postDelayed(logRefresher, 800L)
+    }
+
+    private fun stopLogRefresher() {
+        logRefreshActive = false
+        uiHandler.removeCallbacks(logRefresher)
     }
 
     private fun section(label: String, hex: String) {

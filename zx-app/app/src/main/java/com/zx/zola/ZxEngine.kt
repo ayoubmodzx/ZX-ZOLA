@@ -62,11 +62,14 @@ object ZxEngine {
     fun init(context: Context) {
         val appCtx = context.applicationContext
         val libDir = appCtx.applicationInfo.nativeLibraryDir
-        // Both files are installed by the system into nativeLibraryDir at APK install time.
-        // That directory is exec-allowed (unlike filesDir / /data/local/tmp which are noexec).
         payloadPath  = File(libDir, "libzx_payload.so").absolutePath
         injectorPath = File(libDir, "libzx_injector.so").absolutePath
         Log.i("ZxEngine", "injector=$injectorPath  payload=$payloadPath")
+        ZxLog.i("libDir: $libDir")
+        ZxLog.i("injector: $injectorPath")
+        ZxLog.i("  exists=${File(injectorPath).exists()}  exec=${File(injectorPath).canExecute()}")
+        ZxLog.i("payload: $payloadPath")
+        ZxLog.i("  exists=${File(payloadPath).exists()}")
     }
 
     fun isFfRunning(): Boolean = try {
@@ -88,21 +91,34 @@ object ZxEngine {
     }
 
     fun toggle(cmd: Int, on: Boolean, intensity: Int = 0) {
-        if (targetPid <= 0) return
+        if (targetPid <= 0) {
+            ZxLog.w("skip cmd=$cmd: pid not set")
+            return
+        }
         val injector = injectorPath
-        if (injector.isEmpty()) return
-        val payload  = payloadPath
+        if (injector.isEmpty()) {
+            ZxLog.w("skip cmd=$cmd: injectorPath empty")
+            return
+        }
+        val payload = payloadPath
         bgHandler.post {
             synchronized(cmdLock) {
                 try {
                     val en = if (on) 1 else 0
                     // Quote both paths — nativeLibraryDir contains ~~hash==/ on Android 12+
                     val cmd2 = "'$injector' $targetPid $cmd $en '$payload' $intensity"
+                    ZxLog.i("exec cmd=$cmd on=$on pid=$targetPid")
                     val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd2))
-                    proc.waitFor()
-                    Log.i("ZxEngine", "toggle cmd=$cmd on=$on rc=${proc.exitValue()}")
+                    val stdout = proc.inputStream.bufferedReader().readText().trim()
+                    val stderr = proc.errorStream.bufferedReader().readText().trim()
+                    val rc = proc.waitFor()
+                    Log.i("ZxEngine", "toggle cmd=$cmd on=$on rc=$rc")
+                    ZxLog.i("rc=$rc cmd=$cmd on=$on")
+                    if (stdout.isNotEmpty()) ZxLog.i("out: $stdout")
+                    if (stderr.isNotEmpty()) ZxLog.e("err: $stderr")
                 } catch (e: Exception) {
                     Log.e("ZxEngine", "toggle failed: ${e.message}")
+                    ZxLog.e("ex: ${e.message}")
                 }
             }
         }
