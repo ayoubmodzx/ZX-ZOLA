@@ -10,6 +10,7 @@
 #include <fcntl.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <dlfcn.h>
 #include <sys/uio.h>
 #include <sys/mman.h>
 #include <asm/ptrace.h>
