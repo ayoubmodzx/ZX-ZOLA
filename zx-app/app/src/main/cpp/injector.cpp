@@ -285,21 +285,83 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     return (result < (uintptr_t)-4096ULL) ? result : 0;
 }
 
-// ACE anti-cheat hooks libdl.so's GOT entry for __loader_dlopen (confirmed via
-// libanogs.so strings: "ms_set_inlie_hook", "ms_hook_opcode", "mprotect").
-// It replaces GOT[__loader_dlopen] in the target process with its own filter
-// that returns (void*)-4 for non-whitelisted libraries.
-//
-// Bypass: our injector process has NO ACE — its libdl.so GOT is unhooked.
-// We decode our own dlopen PLT to find the real __loader_dlopen function pointer,
-// compute its offset from our linker64 base, then apply to target's linker64 base.
-// The shellcode then calls linker64's __loader_dlopen directly, bypassing libdl.so
-// and the ACE-patched PLT entirely.
+// One hook record: target address + original instruction + ACE's replacement.
+struct AcePatch {
+    uintptr_t tgt_addr;
+    uint32_t  orig;
+    uint32_t  ace;
+};
+
+// Scan ALL executable pages of linker64 in both processes and collect every
+// instruction that differs (ACE inline hooks).  Static 64 KB read buffers avoid
+// stack overflow on large code sections.  Returns number of patches found.
+static int find_ace_linker_hooks(pid_t pid,
+                                  uintptr_t our_linker,
+                                  uintptr_t target_linker,
+                                  AcePatch* patches, int max_patches) {
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) { zerr("find_ace_linker_hooks: open /proc/self/maps failed"); return 0; }
+
+    static uint8_t s_our[65536], s_tgt[65536];
+    int count = 0;
+    char line[512];
+
+    while (fgets(line, sizeof(line), maps) && count < max_patches) {
+        uintptr_t start, end;
+        char perms[8] = {};
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) continue;
+        if (perms[2] != 'x') continue;
+        if (!strstr(line, "linker64")) continue;
+        if (start < our_linker || start >= our_linker + 0x400000UL) continue;
+
+        uintptr_t region_len = end - start;
+        uintptr_t our_off    = start - our_linker;
+        uintptr_t tgt_start  = target_linker + our_off;
+
+        zerr("find_ace_linker_hooks: exec region linker64+[0x%lx, 0x%lx)",
+             (unsigned long)our_off, (unsigned long)(our_off + region_len));
+
+        for (uintptr_t co = 0; co < region_len && count < max_patches; co += sizeof(s_our)) {
+            uintptr_t chunk = (region_len - co < sizeof(s_our)) ? (region_len - co) : sizeof(s_our);
+            memcpy(s_our, (const void*)(start + co), chunk);
+            if (!ProcMem::read(tgt_start + co, s_tgt, chunk)) {
+                zerr("find_ace_linker_hooks: read failed at tgt=0x%lx",
+                     (unsigned long)(tgt_start + co));
+                continue;
+            }
+            for (uintptr_t i = 0; i + 4 <= chunk && count < max_patches; i += 4) {
+                uint32_t ours = *(uint32_t*)(s_our + i);
+                uint32_t tgt  = *(uint32_t*)(s_tgt + i);
+                if (ours != tgt) {
+                    uintptr_t loff = our_off + co + i;
+                    zerr("ACE hook linker64+0x%05lx: ours=0x%08x ace=0x%08x",
+                         (unsigned long)loff, ours, tgt);
+                    patches[count++] = {target_linker + loff, ours, tgt};
+                }
+            }
+        }
+    }
+    fclose(maps);
+    zerr("find_ace_linker_hooks: %d total divergent instructions in linker64", count);
+    return count;
+}
+
+// ACE anti-cheat (libanogs.so) uses And64InlineHook style patching (ms_set_inlie_hook /
+// ms_hook_opcode) somewhere inside linker64's call chain to intercept dlopen.
+// The exact hook location is unknown — it is NOT at do_dlopen[0..63].
+// find_real_loader_dlopen locates __loader_dlopen and do_dlopen by decoding PLT/GOT
+// in our own (unhooked) process, then maps the same offsets to target's linker64.
+// find_ace_linker_hooks then scans all executable pages of linker64 to find ALL
+// patched instructions so we can restore them before calling __loader_dlopen.
 static uintptr_t find_real_loader_dlopen(int target_pid,
                                           uintptr_t *out_do_dlopen_local,
-                                          uintptr_t *out_do_dlopen_target) {
+                                          uintptr_t *out_do_dlopen_target,
+                                          uintptr_t *out_our_linker    = nullptr,
+                                          uintptr_t *out_target_linker = nullptr) {
     if (out_do_dlopen_local)  *out_do_dlopen_local  = 0;
     if (out_do_dlopen_target) *out_do_dlopen_target = 0;
+    if (out_our_linker)       *out_our_linker        = 0;
+    if (out_target_linker)    *out_target_linker     = 0;
     // 1. Our local dlopen = 4-insn wrapper in libdl.so
     uintptr_t our_dlopen = (uintptr_t)(void*)dlopen;
     zerr("find_real_loader_dlopen: our_dlopen=0x%lx", (unsigned long)our_dlopen);
@@ -356,6 +418,8 @@ static uintptr_t find_real_loader_dlopen(int target_pid,
     zerr("find_real_loader_dlopen: our_linker=0x%lx target_linker=0x%lx offset=0x%lx → target_fn=0x%lx",
          (unsigned long)our_linker, (unsigned long)target_linker,
          (unsigned long)offset, (unsigned long)result);
+    if (out_our_linker)    *out_our_linker    = our_linker;
+    if (out_target_linker) *out_target_linker = target_linker;
 
     // Decode the B instruction at __loader_dlopen+8 to locate do_dlopen.
     // The thunk is exactly: MOV X3,X2 / MOV X2,XZR / B do_dlopen
@@ -437,52 +501,29 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     zerr("remote_dlopen: dlopen=0x%lx dlerror=0x%lx path=%s",
          (unsigned long)dlopen_addr, (unsigned long)dlerror_addr, so_path);
 
-    // ACE hooks do_dlopen (linker64+0x31098) — NOT the __loader_dlopen thunk itself.
-    // Strategy:
-    //   1. find_real_loader_dlopen() locates both __loader_dlopen and do_dlopen in both
-    //      our (unhooked) process and the target, by decoding the B at thunk+8.
-    //   2. We PTRACE_PEEKTEXT do_dlopen[0] from target: if it differs from our copy,
-    //      ACE's hook is there.
-    //   3. Before calling the shellcode, we PTRACE_POKETEXT the original instruction back.
-    //   4. After the shellcode returns (BRK #0 stop), we restore ACE's hook instruction.
-    //   PTRACE_POKETEXT bypasses page protection on attached root processes; kernel handles
-    //   ARM64 icache coherency automatically.
+    // Locate __loader_dlopen and do_dlopen, and expose linker64 bases for the full scan.
     uintptr_t do_dlopen_local = 0, do_dlopen_target = 0;
-    uintptr_t loader_dlopen_addr = find_real_loader_dlopen(pid, &do_dlopen_local, &do_dlopen_target);
+    uintptr_t our_linker = 0, target_linker = 0;
+    uintptr_t loader_dlopen_addr = find_real_loader_dlopen(
+        pid, &do_dlopen_local, &do_dlopen_target, &our_linker, &target_linker);
     if (!loader_dlopen_addr) {
         zerr("remote_dlopen: find_real_loader_dlopen failed — falling back to wrapper");
         loader_dlopen_addr = dlopen_addr;
     }
-    zerr("remote_dlopen: loader_dlopen_addr=0x%lx do_dlopen_target=0x%lx",
-         (unsigned long)loader_dlopen_addr, (unsigned long)do_dlopen_target);
+    zerr("remote_dlopen: loader_dlopen=0x%lx do_dlopen_tgt=0x%lx our_linker=0x%lx tgt_linker=0x%lx",
+         (unsigned long)loader_dlopen_addr, (unsigned long)do_dlopen_target,
+         (unsigned long)our_linker, (unsigned long)target_linker);
 
-    // Scan first 64 instructions (256 bytes) of do_dlopen in both processes.
-    // And64InlineHook can patch ANY instruction, not just instruction 0.
-    // Build a patches table of ALL divergent positions so we can restore them all.
-    struct PatchEntry { int idx; uint32_t orig; uint32_t ace; };
-    static const int SCAN_INSNS = 64;
-    uint32_t local_do[SCAN_INSNS] = {}, tgt_do[SCAN_INSNS] = {};
-    PatchEntry patches[SCAN_INSNS];
-    int patch_count = 0;
-    bool should_patch = false;
-
-    if (do_dlopen_local && do_dlopen_target) {
-        memcpy(local_do, (const void*)do_dlopen_local, sizeof(local_do));
-        ProcMem::read(do_dlopen_target, tgt_do, sizeof(tgt_do));
-        zerr("remote_dlopen: do_dlopen target[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x",
-             tgt_do[0],tgt_do[1],tgt_do[2],tgt_do[3],tgt_do[4],tgt_do[5],tgt_do[6],tgt_do[7]);
-        zerr("remote_dlopen: do_dlopen local [0..7]: %08x %08x %08x %08x %08x %08x %08x %08x",
-             local_do[0],local_do[1],local_do[2],local_do[3],
-             local_do[4],local_do[5],local_do[6],local_do[7]);
-        for (int i = 0; i < SCAN_INSNS; i++) {
-            if (local_do[i] != tgt_do[i]) {
-                zerr("remote_dlopen: HOOK do_dlopen+%d: local=0x%08x ace=0x%08x",
-                     i*4, local_do[i], tgt_do[i]);
-                patches[patch_count++] = {i, local_do[i], tgt_do[i]};
-            }
-        }
-        zerr("remote_dlopen: do_dlopen scan: %d divergent insns in first %d", patch_count, SCAN_INSNS);
-        should_patch = (patch_count > 0);
+    // Scan ALL executable pages of linker64 for ACE inline hooks.
+    // Previous 64-insn do_dlopen scan found 0 divergences — ACE hooks deeper.
+    // This scan covers every instruction in every r-xp linker64 segment.
+    static AcePatch s_ace_patches[256];
+    int n_patches = 0;
+    if (our_linker && target_linker) {
+        n_patches = find_ace_linker_hooks(pid, our_linker, target_linker,
+                                          s_ace_patches, 256);
+    } else {
+        zerr("remote_dlopen: linker bases unknown — skipping full scan");
     }
 
     // 56-byte shellcode calling __loader_dlopen(path, flags, fake_caller) directly.
@@ -571,37 +612,32 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: set_regs failed errno=%d", errno); return false;
     }
 
-    // Poke ALL original instructions back into do_dlopen before shellcode runs.
-    // All secondary threads are frozen so no race with ACE re-patching.
+    // Restore all original instructions before shellcode runs.
+    // All secondary threads are frozen — no race with ACE re-patching.
     int actually_patched = 0;
-    if (should_patch) {
-        for (int i = 0; i < patch_count; i++) {
-            uintptr_t addr = do_dlopen_target + (uintptr_t)(patches[i].idx * 4);
-            if (remote_poke_insn(pid, addr, patches[i].orig)) {
-                actually_patched++;
-                zerr("remote_dlopen: poked do_dlopen+%d: 0x%08x→0x%08x",
-                     patches[i].idx*4, patches[i].ace, patches[i].orig);
-            } else {
-                zerr("remote_dlopen: POKE FAILED do_dlopen+%d", patches[i].idx*4);
-            }
+    for (int i = 0; i < n_patches; i++) {
+        if (remote_poke_insn(pid, s_ace_patches[i].tgt_addr, s_ace_patches[i].orig)) {
+            actually_patched++;
+        } else {
+            zerr("remote_dlopen: POKE FAILED linker64+0x%lx",
+                 (unsigned long)(s_ace_patches[i].tgt_addr - target_linker));
         }
-        zerr("remote_dlopen: patched %d/%d insns", actually_patched, patch_count);
-        should_patch = (actually_patched > 0);
     }
+    if (n_patches > 0)
+        zerr("remote_dlopen: restored %d/%d ACE hooks before shellcode", actually_patched, n_patches);
 
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
     int status;
     waitpid(pid, &status, 0);
 
-    // Restore ALL ACE hook instructions immediately after shellcode stops.
-    if (should_patch) {
-        for (int i = 0; i < patch_count; i++) {
-            uintptr_t addr = do_dlopen_target + (uintptr_t)(patches[i].idx * 4);
-            if (!remote_poke_insn(pid, addr, patches[i].ace))
-                zerr("remote_dlopen: WARNING restore failed do_dlopen+%d", patches[i].idx*4);
-        }
-        zerr("remote_dlopen: restored %d ACE hook insns", patch_count);
+    // Re-apply ACE's hook instructions after shellcode stops at BRK #0.
+    for (int i = 0; i < n_patches; i++) {
+        if (!remote_poke_insn(pid, s_ace_patches[i].tgt_addr, s_ace_patches[i].ace))
+            zerr("remote_dlopen: WARNING re-hook failed linker64+0x%lx",
+                 (unsigned long)(s_ace_patches[i].tgt_addr - target_linker));
     }
+    if (n_patches > 0)
+        zerr("remote_dlopen: re-applied %d ACE hooks after shellcode", n_patches);
 
     set_regs(pid, &orig);
 
