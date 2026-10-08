@@ -288,20 +288,35 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: write path failed errno=%d", errno); return false;
     }
 
-    uintptr_t dlopen_addr = ProcMem::findSymbol(pid, "libdl.so", "dlopen");
-    if (!dlopen_addr) { zerr("remote_dlopen: dlopen not found in libdl.so"); return false; }
-
-    uintptr_t dlerror_addr = ProcMem::findSymbol(pid, "libdl.so", "dlerror");
-    if (!dlerror_addr) {
-        zerr("remote_dlopen: dlerror not in libdl.so, trying libc.so");
-        dlerror_addr = ProcMem::findSymbol(pid, "libc.so", "dlerror");
+    // Get the REAL dlopen/dlerror via libmain.so's BIND_NOW-resolved GOT entries.
+    // libmain.so imports dlopen@LIBC with GOT slot at ELF VMA 0x9130 and dlerror at 0x9138.
+    // These are resolved by FF's own linker at load time → correct namespace, no -4 mystery.
+    // Offsets verified from libmain.so arm64 ELF (readelf -r shows R_AARCH64_JUMP_SLOT).
+    uintptr_t dlopen_addr = 0, dlerror_addr = 0;
+    {
+        uintptr_t libmain_base = ProcMem::findLibBase(pid, "libmain.so");
+        zerr("remote_dlopen: libmain_base=0x%lx", (unsigned long)libmain_base);
+        if (libmain_base) {
+            ProcMem::read(libmain_base + 0x9130UL, &dlopen_addr,  sizeof(dlopen_addr));
+            ProcMem::read(libmain_base + 0x9138UL, &dlerror_addr, sizeof(dlerror_addr));
+            zerr("remote_dlopen: got_dlopen=0x%lx got_dlerror=0x%lx",
+                 (unsigned long)dlopen_addr, (unsigned long)dlerror_addr);
+        }
     }
-    // Dump first 16 bytes at dlopen_addr so we can see what function we're calling
+    // Fallback: symbol lookup (old method, known to return -4 on this device)
+    if (!dlopen_addr) {
+        zerr("remote_dlopen: GOT lookup failed, falling back to findSymbol");
+        dlopen_addr  = ProcMem::findSymbol(pid, "libdl.so", "dlopen");
+        dlerror_addr = ProcMem::findSymbol(pid, "libdl.so", "dlerror");
+        if (!dlerror_addr) dlerror_addr = ProcMem::findSymbol(pid, "libc.so", "dlerror");
+    }
+    if (!dlopen_addr) { zerr("remote_dlopen: no dlopen address found"); return false; }
+    // Dump first 4 instructions at dlopen_addr to confirm we have a real function
     {
         uint32_t insns[4] = {};
         ProcMem::read(dlopen_addr, insns, sizeof(insns));
-        zerr("remote_dlopen: dlopen bytes: %08x %08x %08x %08x",
-             insns[0], insns[1], insns[2], insns[3]);
+        zerr("remote_dlopen: dlopen@0x%lx bytes: %08x %08x %08x %08x",
+             (unsigned long)dlopen_addr, insns[0], insns[1], insns[2], insns[3]);
     }
     zerr("remote_dlopen: dlopen=0x%lx dlerror=0x%lx path=%s",
          (unsigned long)dlopen_addr, (unsigned long)dlerror_addr, so_path);
