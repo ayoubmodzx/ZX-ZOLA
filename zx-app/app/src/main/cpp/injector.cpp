@@ -27,6 +27,7 @@ typedef struct user_pt_regs pt_regs;
 #include <android/log.h>
 #include <dirent.h>
 #include <cstdarg>
+#include <signal.h>
 
 #define TAG "ZX-INJ"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -111,25 +112,66 @@ static bool set_regs(pid_t pid, pt_regs *regs) {
     return ptrace(PTRACE_SETREGSET, pid, (void*)NT_PRSTATUS, &iov) == 0;
 }
 
-// Scan target's libc.so for a raw SVC #0 gadget — bypasses BTI/CFI on the mmap wrapper.
+// Scan target's libc.so for a raw SVC #0 gadget — ONLY in executable pages.
 // ARM64 SVC #0 encoding (LE): 0xD4000001
+// Previous bug: scanning from ELF base blindly hits data/rodata pages first;
+// 0xD4000001 in a data page → SIGSEGV (SEGV_ACCERR) when CPU tries to fetch it.
 static uintptr_t find_svc_gadget(pid_t pid) {
-    uintptr_t base = ProcMem::findLibBase(pid, "libc.so");
-    if (!base) { zerr("find_svc_gadget: libc.so not mapped"); return 0; }
-    static uint8_t s_buf[65536];
-    const uint32_t SVC0 = 0xD4000001u;
-    for (size_t off = 0; off < 3 * 1024 * 1024; off += sizeof(s_buf)) {
-        if (!ProcMem::read(base + off, s_buf, sizeof(s_buf))) continue;
-        for (size_t i = 0; i + 4 <= sizeof(s_buf); i += 4) {
-            uint32_t insn;
-            memcpy(&insn, s_buf + i, 4);
-            if (insn == SVC0) {
-                zerr("find_svc_gadget: SVC#0 at 0x%lx (libc+0x%zx)", (unsigned long)(base + off + i), off + i);
-                return base + off + i;
-            }
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    FILE *f = fopen(maps_path, "r");
+    if (!f) { zerr("find_svc_gadget: cannot open %s errno=%d", maps_path, errno); return 0; }
+
+    struct Region { uintptr_t start, end; };
+    Region exec_regions[32];
+    int exec_n = 0;
+    bool found_libc = false;
+    int total_libc_segs = 0;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, "libc.so")) continue;
+        found_libc = true;
+        uintptr_t start = 0, end = 0;
+        char perms[8] = {};
+        if (sscanf(line, "%lx-%lx %7s", &start, &end, perms) != 3) continue;
+        total_libc_segs++;
+        zerr("find_svc_gadget: libc seg[%d] [0x%lx-0x%lx] perms=%s size=%zuKB",
+             total_libc_segs, start, end, perms, (size_t)(end - start) / 1024);
+        if (perms[2] == 'x' && exec_n < 32) {
+            exec_regions[exec_n++] = {start, end};
         }
     }
-    zerr("find_svc_gadget: no SVC#0 found in libc.so");
+    fclose(f);
+
+    if (!found_libc) { zerr("find_svc_gadget: libc.so not in /proc/%d/maps", pid); return 0; }
+    zerr("find_svc_gadget: %d libc segments total, %d executable", total_libc_segs, exec_n);
+    if (exec_n == 0) { zerr("find_svc_gadget: no executable libc.so pages found!"); return 0; }
+
+    static uint8_t s_buf[65536];
+    const uint32_t SVC0 = 0xD4000001u;
+
+    for (int r = 0; r < exec_n; r++) {
+        uintptr_t rstart = exec_regions[r].start;
+        uintptr_t rend   = exec_regions[r].end;
+        zerr("find_svc_gadget: scanning exec[%d] [0x%lx-0x%lx] size=%zuKB", r, rstart, rend, (size_t)(rend - rstart) / 1024);
+        for (uintptr_t pos = rstart; pos < rend; pos += sizeof(s_buf)) {
+            size_t chunk = (rend - pos < sizeof(s_buf)) ? (size_t)(rend - pos) : sizeof(s_buf);
+            if (!ProcMem::read(pos, s_buf, chunk)) continue;
+            for (size_t i = 0; i + 4 <= chunk; i += 4) {
+                uint32_t insn;
+                memcpy(&insn, s_buf + i, 4);
+                if (insn == SVC0) {
+                    uintptr_t gadget = pos + i;
+                    zerr("find_svc_gadget: FOUND SVC#0 at 0x%lx (exec[%d]+0x%zx)",
+                         gadget, r, (size_t)(gadget - rstart));
+                    return gadget;
+                }
+            }
+        }
+        zerr("find_svc_gadget: no SVC#0 in exec[%d]", r);
+    }
+    zerr("find_svc_gadget: no SVC#0 found in ANY executable libc.so region");
     return 0;
 }
 
@@ -160,9 +202,23 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     regs.regs[5] = 0;
     regs.pc      = svc_addr;
 
+    zerr("remote_mmap: setting PC=0x%lx pstate=0x%lx btype_bits=%llu x8(nr)=%llu",
+         (unsigned long)svc_addr, (unsigned long)regs.pstate,
+         (unsigned long long)((regs.pstate >> 10) & 3),
+         (unsigned long long)regs.regs[8]);
+
     if (!set_regs(pid, &regs)) {
         zerr("remote_mmap: set_regs failed errno=%d", errno);
         return 0;
+    }
+
+    // Verify bytes at svc_addr before stepping
+    {
+        uint32_t verify_insn = 0;
+        if (ProcMem::read(svc_addr, &verify_insn, 4))
+            zerr("remote_mmap: insn@svc_addr=0x%08x (want 0xD4000001)", verify_insn);
+        else
+            zerr("remote_mmap: cannot read svc_addr bytes errno=%d", errno);
     }
 
     // PTRACE_SINGLESTEP: executes exactly the SVC instruction, then stops with SIGTRAP.
@@ -173,8 +229,26 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
 
     if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
         pt_regs crash; get_regs(pid, &crash);
-        zerr("remote_mmap: singlestep bad stop wst=0x%x sig=%d crash_PC=0x%lx",
-             wst, WSTOPSIG(wst), (unsigned long)crash.pc);
+        int sig = WIFSTOPPED(wst) ? WSTOPSIG(wst) : -1;
+        zerr("remote_mmap: singlestep bad stop wst=0x%x sig=%d crash_PC=0x%lx crash_pstate=0x%lx",
+             wst, sig, (unsigned long)crash.pc, (unsigned long)crash.pstate);
+        siginfo_t si = {};
+        if (ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si) == 0) {
+            zerr("remote_mmap: SIGINFO si_signo=%d si_code=%d si_addr=0x%lx",
+                 si.si_signo, si.si_code, (unsigned long)(uintptr_t)si.si_addr);
+            if (si.si_signo == SIGSEGV && si.si_code == SEGV_ACCERR)
+                zerr("remote_mmap: SEGV_ACCERR => PC mapped but NOT executable (data page hit)");
+            else if (si.si_signo == SIGSEGV && si.si_code == SEGV_MAPERR)
+                zerr("remote_mmap: SEGV_MAPERR => PC address not mapped at all");
+            else if (si.si_signo == SIGILL)
+                zerr("remote_mmap: SIGILL => BTI violation or truly illegal instruction");
+            else if (si.si_signo == SIGTRAP)
+                zerr("remote_mmap: SIGTRAP si_code=%d (BRK/BKPT?)", si.si_code);
+        } else {
+            zerr("remote_mmap: PTRACE_GETSIGINFO failed errno=%d", errno);
+        }
+        zerr("remote_mmap: crash_x0=0x%lx crash_x8=0x%lx",
+             (unsigned long)crash.regs[0], (unsigned long)crash.regs[8]);
         set_regs(pid, &orig);
         return 0;
     }
