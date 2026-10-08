@@ -262,6 +262,76 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     return (result < (uintptr_t)-4096ULL) ? result : 0;
 }
 
+// ACE anti-cheat hooks libdl.so's GOT entry for __loader_dlopen (confirmed via
+// libanogs.so strings: "ms_set_inlie_hook", "ms_hook_opcode", "mprotect").
+// It replaces GOT[__loader_dlopen] in the target process with its own filter
+// that returns (void*)-4 for non-whitelisted libraries.
+//
+// Bypass: our injector process has NO ACE — its libdl.so GOT is unhooked.
+// We decode our own dlopen PLT to find the real __loader_dlopen function pointer,
+// compute its offset from our linker64 base, then apply to target's linker64 base.
+// The shellcode then calls linker64's __loader_dlopen directly, bypassing libdl.so
+// and the ACE-patched PLT entirely.
+static uintptr_t find_real_loader_dlopen(int target_pid) {
+    // 1. Our local dlopen = 4-insn wrapper in libdl.so
+    uintptr_t our_dlopen = (uintptr_t)(void*)dlopen;
+    zerr("find_real_loader_dlopen: our_dlopen=0x%lx", (unsigned long)our_dlopen);
+
+    // 2. BL at wrapper+12 → PLT stub for __loader_dlopen
+    uint32_t bl_insn = *(uint32_t*)(our_dlopen + 12);
+    if ((bl_insn >> 26) != 0x25u) {
+        zerr("find_real_loader_dlopen: insn@+12=0x%08x not BL — cannot locate PLT", bl_insn);
+        return 0;
+    }
+    int64_t off26 = (int64_t)(bl_insn & 0x3FFFFFFu);
+    if (off26 & (1LL << 25)) off26 |= ~(int64_t)0x3FFFFFFu;
+    uintptr_t our_plt = (our_dlopen + 12) + (uintptr_t)(off26 * 4);
+    zerr("find_real_loader_dlopen: our_plt=0x%lx", (unsigned long)our_plt);
+
+    // 3. Decode ADRP+LDR in PLT to get GOT entry address
+    uint32_t adrp = *(uint32_t*)our_plt;
+    uint32_t ldr  = *(uint32_t*)(our_plt + 4);
+    // ADRP X16: page = (PC & ~0xFFF) + sign_ext_imm21 * 4096
+    int64_t immhi = (int64_t)((adrp >> 5) & 0x7FFFFu);
+    int64_t immlo = (int64_t)((adrp >> 29) & 0x3u);
+    int64_t imm21 = (immhi << 2) | immlo;
+    if (imm21 & (1LL << 20)) imm21 |= ~(int64_t)0xFFFFFu;
+    uintptr_t got_page = (our_plt & ~(uintptr_t)0xFFF) + (uintptr_t)(imm21 * 4096LL);
+    // LDR Xn,[Xm,#imm12*8]: bits[21:10], 64-bit load scales by 8
+    uint64_t imm12 = (ldr >> 10) & 0xFFFu;
+    uintptr_t our_got_entry = got_page + (uintptr_t)(imm12 * 8);
+    zerr("find_real_loader_dlopen: adrp=0x%08x ldr=0x%08x got_entry=0x%lx", adrp, ldr, (unsigned long)our_got_entry);
+
+    // 4. Read our unhooked GOT → real __loader_dlopen VA in our process
+    uintptr_t local_fn = *(uintptr_t*)our_got_entry;
+    zerr("find_real_loader_dlopen: local_fn=0x%lx", (unsigned long)local_fn);
+
+    // 5. Find linker64 base in OUR process
+    uintptr_t our_linker = ProcMem::findLibBase((int)getpid(), "linker64");
+    if (!our_linker) {
+        zerr("find_real_loader_dlopen: linker64 not in /proc/self/maps");
+        return 0;
+    }
+    if (local_fn < our_linker) {
+        zerr("find_real_loader_dlopen: local_fn 0x%lx < our_linker 0x%lx — unexpected",
+             (unsigned long)local_fn, (unsigned long)our_linker);
+        return 0;
+    }
+    uintptr_t offset = local_fn - our_linker;
+
+    // 6. Find linker64 base in TARGET process
+    uintptr_t target_linker = ProcMem::findLibBase(target_pid, "linker64");
+    if (!target_linker) {
+        zerr("find_real_loader_dlopen: linker64 not in /proc/%d/maps", target_pid);
+        return 0;
+    }
+    uintptr_t result = target_linker + offset;
+    zerr("find_real_loader_dlopen: our_linker=0x%lx target_linker=0x%lx offset=0x%lx → target_fn=0x%lx",
+         (unsigned long)our_linker, (unsigned long)target_linker,
+         (unsigned long)offset, (unsigned long)result);
+    return result;
+}
+
 // Call dlopen+dlerror via a single shellcode run to both open the .so and
 // capture the error message if it fails — all in one PTRACE_CONT window.
 //
@@ -321,31 +391,16 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     zerr("remote_dlopen: dlopen=0x%lx dlerror=0x%lx path=%s",
          (unsigned long)dlopen_addr, (unsigned long)dlerror_addr, so_path);
 
-    // The libdl.so dlopen wrapper at dlopen_addr is:
-    //   STP X29,X30,[SP,#-16]!   // a9bf7bfd
-    //   MOV X29,SP               // 910003fd
-    //   MOV X2,X30               // aa1e03e2  ← copies LR (= our sc+12, anon mmap) into caller_addr
-    //   BL  __loader_dlopen      // 94xxxxxx  ← linker rejects anon-mmap caller → returns -4
-    //
-    // Fix: decode the BL at dlopen_addr+12 to find __loader_dlopen, then call it DIRECTLY
-    // with X2 = dlopen_addr (a real address inside libdl.so → linker finds default namespace).
-    uintptr_t loader_dlopen_addr = dlopen_addr; // fallback = keep current behavior
-    {
-        uint32_t bl_insn = 0;
-        if (ProcMem::read(dlopen_addr + 12, &bl_insn, 4)) {
-            if ((bl_insn >> 26) == 0x25u) { // BL opcode
-                int64_t off26 = (int64_t)(bl_insn & 0x3FFFFFFu);
-                if (off26 & (1LL << 25)) off26 |= ~(int64_t)0x3FFFFFFu; // sign-extend
-                loader_dlopen_addr = (dlopen_addr + 12) + (uintptr_t)((int64_t)off26 * 4);
-                zerr("remote_dlopen: BL@+12=0x%08x off=%lld → __loader_dlopen=0x%lx",
-                     bl_insn, (long long)off26, (unsigned long)loader_dlopen_addr);
-            } else {
-                zerr("remote_dlopen: insn@+12=0x%08x is NOT a BL — using wrapper addr", bl_insn);
-            }
-        } else {
-            zerr("remote_dlopen: cannot read dlopen+12 errno=%d", errno);
-        }
+    // ACE hooks libdl.so's GOT entry for __loader_dlopen in the target process.
+    // find_real_loader_dlopen() reads our OWN (unhooked) libdl.so GOT, computes the
+    // real __loader_dlopen offset from our linker64, and maps it to target's linker64.
+    // This calls linker64 directly — ACE's libdl.so PLT hook is never touched.
+    uintptr_t loader_dlopen_addr = find_real_loader_dlopen(pid);
+    if (!loader_dlopen_addr) {
+        zerr("remote_dlopen: find_real_loader_dlopen failed — falling back to wrapper");
+        loader_dlopen_addr = dlopen_addr; // last resort: call dlopen wrapper (ACE will block)
     }
+    zerr("remote_dlopen: loader_dlopen_addr=0x%lx (direct linker64)", (unsigned long)loader_dlopen_addr);
 
     // 56-byte shellcode calling __loader_dlopen(path, flags, fake_caller) directly.
     // X2 (fake_caller = dlopen_addr = address inside libdl.so) is pre-loaded in regs
@@ -418,8 +473,16 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     regs.pstate &= ~(uint64_t)(3u << 10); // clear PSTATE.BTYPE
     regs.regs[0] = remote_buf;   // __loader_dlopen arg0: path
     regs.regs[1] = RTLD_NOW;    // __loader_dlopen arg1: flags
-    regs.regs[2] = dlopen_addr; // __loader_dlopen arg2: caller_addr (inside libdl.so → valid namespace)
-    regs.pc      = sc_addr;
+    // caller_addr: use libmain.so+0x1000 (game namespace) so the linker resolves
+    // the load request in the main app namespace rather than the linker's own namespace.
+    // Fallback to dlopen_addr (libdl.so) if libmain_base is not available.
+    {
+        uintptr_t libmain_base = ProcMem::findLibBase(pid, "libmain.so");
+        regs.regs[2] = libmain_base ? libmain_base + 0x1000 : dlopen_addr;
+        zerr("remote_dlopen: caller_addr=0x%lx (libmain_base=0x%lx)",
+             (unsigned long)regs.regs[2], (unsigned long)libmain_base);
+    }
+    regs.pc = sc_addr;
 
     if (!set_regs(pid, &regs)) {
         zerr("remote_dlopen: set_regs failed errno=%d", errno); return false;
