@@ -34,4 +34,9 @@
     <color name="zx_risk_glow">#20FFD740</color>
     <color name="zx_danger_glow">#20FF1744</color>
     <color name="zx_accent_glow">#207C4DFF</color>
+
+    <!-- Dim variants (low-alpha fills) -->
+    <color name="zx_amber_dim">#33FFD740</color>
+    <color name="zx_purple_dim">#337C4DFF</color>
+    <color name="zx_bg_card2">#12121F</color>
 </resources>
