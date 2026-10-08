@@ -262,58 +262,69 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     return (result < (uintptr_t)-4096ULL) ? result : 0;
 }
 
-// Write memory to target and call dlopen via a small shellcode stub.
+// Call dlopen+dlerror via a single shellcode run to both open the .so and
+// capture the error message if it fails — all in one PTRACE_CONT window.
 //
-// Direct PC-teleport to dlopen() segfaults on ARMv8.5+ BTI devices (same
-// root cause as the mmap wrapper crash).  Instead we write a tiny shellcode
-// into the RWX page we just allocated:
-//
-//   [+0 ] LDR X8, #16      — load dlopen_addr from the literal pool at +16
-//   [+4 ] BLR X8           — call dlopen via BLR (BTI-C compatible)
-//   [+8 ] BRK #0           — stop; ptrace catches SIGTRAP here
-//   [+12] NOP               — 8-byte padding
-//   [+16] dlopen_addr(u64) — literal pool
-//
-// Our mmap'd page has no GP/BTI guard bit, so the initial PC-teleport into
-// the shellcode is fine.  The BLR is what matters for the guarded dlopen page.
+// Extended 48-byte shellcode layout:
+//   [+0 ] LDR X8, #32    — load dlopen_addr from literal pool at +32
+//   [+4 ] BLR X8          — call dlopen(X0=path, X1=flags)
+//   [+8 ] MOV X19, X0    — save handle in callee-saved X19
+//   [+12] LDR X8, #28    — load dlerror_addr from literal pool at +40
+//   [+16] BLR X8          — call dlerror() → X0 = error string ptr (or NULL)
+//   [+20] MOV X1, X0     — dlerror ptr → X1
+//   [+24] MOV X0, X19    — restore dlopen handle → X0
+//   [+28] BRK #0          — stop; ptrace catches SIGTRAP; X0=handle, X1=dlerror_ptr
+//   [+32] dlopen_addr  (8 bytes)
+//   [+40] dlerror_addr (8 bytes)
 static bool remote_dlopen(pid_t pid, const char *so_path) {
     size_t path_len     = strlen(so_path) + 1;
-    size_t path_aligned = (path_len + 7) & ~(size_t)7; // 8-byte align for shellcode
-    size_t alloc        = path_aligned + 24;             // path + 24-byte shellcode
+    size_t path_aligned = (path_len + 7) & ~(size_t)7;
+    size_t alloc        = path_aligned + 48; // path + 48-byte shellcode
 
-    // 1. Allocate RWX scratch page
     uintptr_t remote_buf = remote_mmap(pid, alloc);
     if (!remote_buf) { zerr("remote_dlopen: remote_mmap returned 0"); return false; }
 
-    // 2. Write path string
     if (!ProcMem::write(remote_buf, so_path, path_len)) {
         zerr("remote_dlopen: write path failed errno=%d", errno); return false;
     }
 
-    // 3. Find dlopen in target
     uintptr_t dlopen_addr = ProcMem::findSymbol(pid, "libdl.so", "dlopen");
     if (!dlopen_addr) { zerr("remote_dlopen: dlopen not found in libdl.so"); return false; }
-    zerr("remote_dlopen: dlopen_addr=0x%lx sc_addr=0x%lx", (unsigned long)dlopen_addr, (unsigned long)(remote_buf + path_aligned));
 
-    // 4. Write shellcode
+    uintptr_t dlerror_addr = ProcMem::findSymbol(pid, "libdl.so", "dlerror");
+    if (!dlerror_addr) {
+        zerr("remote_dlopen: dlerror not in libdl.so, trying libc.so");
+        dlerror_addr = ProcMem::findSymbol(pid, "libc.so", "dlerror");
+    }
+    zerr("remote_dlopen: dlopen=0x%lx dlerror=0x%lx path=%s",
+         (unsigned long)dlopen_addr, (unsigned long)dlerror_addr, so_path);
+
     uintptr_t sc_addr = remote_buf + path_aligned;
-    struct { uint32_t insns[4]; uint64_t fn_addr; } sc;
-    sc.insns[0] = 0x58000088u; // LDR X8, #16
+    struct { uint32_t insns[8]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
+    // LDR Xn, #imm: opcode 0x58000000 | (imm19 << 5) | Rn
+    // insns[0] at offset 0 → target offset 32, distance=32, imm19=8
+    sc.insns[0] = 0x58000108u; // LDR X8, #32  (dlopen_addr)
     sc.insns[1] = 0xD63F0100u; // BLR X8
-    sc.insns[2] = 0xD4200000u; // BRK #0
-    sc.insns[3] = 0xD503201Fu; // NOP (literal pool alignment)
-    sc.fn_addr  = (uint64_t)dlopen_addr;
+    sc.insns[2] = 0xAA0003F3u; // MOV X19, X0  (ORR X19, XZR, X0)
+    // insns[3] at offset 12 → target offset 40, distance=28, imm19=7
+    sc.insns[3] = 0x580000E8u; // LDR X8, #28  (dlerror_addr)
+    sc.insns[4] = 0xD63F0100u; // BLR X8
+    sc.insns[5] = 0xAA0003E1u; // MOV X1, X0   (ORR X1, XZR, X0)
+    sc.insns[6] = 0xAA1303E0u; // MOV X0, X19  (ORR X0, XZR, X19)
+    sc.insns[7] = 0xD4200000u; // BRK #0
+    sc.fn_dlopen  = (uint64_t)dlopen_addr;
+    sc.fn_dlerror = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
+
     if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
         zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
     }
 
-    // 5. Jump into shellcode: X0=path, X1=flags, PC=shellcode
     pt_regs orig, regs;
     get_regs(pid, &orig);
     memcpy(&regs, &orig, sizeof(regs));
-    regs.pstate &= ~(uint64_t)(3u << 10); // clear PSTATE.BTYPE — BLR inside shellcode handles dlopen's BTI
-    regs.regs[0] = remote_buf;             // dlopen arg 1: path
-    regs.regs[1] = RTLD_NOW | RTLD_GLOBAL; // dlopen arg 2: flags
+    regs.pstate &= ~(uint64_t)(3u << 10); // clear PSTATE.BTYPE
+    regs.regs[0] = remote_buf;             // dlopen arg: path
+    regs.regs[1] = RTLD_NOW | RTLD_GLOBAL;
     regs.pc      = sc_addr;
 
     if (!set_regs(pid, &regs)) {
@@ -326,13 +337,33 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     set_regs(pid, &orig);
 
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-        zerr("remote_dlopen: bad stop sig=%d (want SIGTRAP)", WSTOPSIG(status));
+        pt_regs crash; get_regs(pid, &crash);
+        zerr("remote_dlopen: bad stop sig=%d crash_PC=0x%lx",
+             WSTOPSIG(status), (unsigned long)crash.pc);
+        siginfo_t si = {};
+        if (ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si) == 0)
+            zerr("remote_dlopen: SIGINFO si_signo=%d si_code=%d si_addr=0x%lx",
+                 si.si_signo, si.si_code, (unsigned long)(uintptr_t)si.si_addr);
         return false;
     }
 
     pt_regs post; get_regs(pid, &post);
-    zerr("remote_dlopen: dlopen handle=0x%lx", (unsigned long)post.regs[0]);
-    return post.regs[0] != 0;
+    uintptr_t handle  = (uintptr_t)post.regs[0];
+    uintptr_t err_ptr = (uintptr_t)post.regs[1];
+
+    zerr("remote_dlopen: handle=0x%lx dlerror_ptr=0x%lx", (unsigned long)handle, (unsigned long)err_ptr);
+    if (err_ptr) {
+        char err_str[256] = {};
+        if (ProcMem::read(err_ptr, err_str, sizeof(err_str) - 1))
+            zerr("remote_dlopen: dlerror=\"%s\"", err_str);
+        else
+            zerr("remote_dlopen: dlerror read failed (ptr=0x%lx)", (unsigned long)err_ptr);
+    }
+
+    // dlopen returns NULL (0) on failure; large values (> -4096) are negative errno-like errors
+    bool ok = (handle != 0) && (handle < (uintptr_t)-4096ULL);
+    if (!ok) zerr("remote_dlopen: FAILED — handle 0x%lx is not a valid pointer", (unsigned long)handle);
+    return ok;
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
