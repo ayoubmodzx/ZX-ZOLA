@@ -279,7 +279,7 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
 static bool remote_dlopen(pid_t pid, const char *so_path) {
     size_t path_len     = strlen(so_path) + 1;
     size_t path_aligned = (path_len + 7) & ~(size_t)7;
-    size_t alloc        = path_aligned + 48; // path + 48-byte shellcode
+    size_t alloc        = path_aligned + 56; // path + 56-byte shellcode
 
     uintptr_t remote_buf = remote_mmap(pid, alloc);
     if (!remote_buf) { zerr("remote_dlopen: remote_mmap returned 0"); return false; }
@@ -296,22 +296,44 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: dlerror not in libdl.so, trying libc.so");
         dlerror_addr = ProcMem::findSymbol(pid, "libc.so", "dlerror");
     }
+    // Dump first 16 bytes at dlopen_addr so we can see what function we're calling
+    {
+        uint32_t insns[4] = {};
+        ProcMem::read(dlopen_addr, insns, sizeof(insns));
+        zerr("remote_dlopen: dlopen bytes: %08x %08x %08x %08x",
+             insns[0], insns[1], insns[2], insns[3]);
+    }
     zerr("remote_dlopen: dlopen=0x%lx dlerror=0x%lx path=%s",
          (unsigned long)dlopen_addr, (unsigned long)dlerror_addr, so_path);
 
+    // Extended 56-byte shellcode — passes X2=dlopen_addr as fake caller_addr in case
+    // 0x7f9d522014 is actually __loader_dlopen(filename,flags,caller_addr) not dlopen(f,f).
+    // Linker uses caller_addr to pick namespace; dlopen_addr is in libdl.so → default ns.
+    //
+    //   [+0 ] LDR X8, #40    — load dlopen_addr from pool at +40
+    //   [+4 ] MOV X2, X8     — X2 = dlopen_addr (fake caller = inside libdl.so)
+    //   [+8 ] BLR X8          — call dlopen/___loader_dlopen
+    //   [+12] MOV X19, X0    — save handle (callee-saved)
+    //   [+16] LDR X8, #32    — load dlerror_addr from pool at +48
+    //   [+20] BLR X8          — call dlerror()
+    //   [+24] MOV X1, X0     — dlerror_ptr → X1
+    //   [+28] MOV X0, X19    — handle → X0
+    //   [+32] BRK #0          — stop
+    //   [+36] NOP             — align pool to 8 bytes
+    //   [+40] fn_dlopen  (8 bytes)
+    //   [+48] fn_dlerror (8 bytes)
     uintptr_t sc_addr = remote_buf + path_aligned;
-    struct { uint32_t insns[8]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
-    // LDR Xn, #imm: opcode 0x58000000 | (imm19 << 5) | Rn
-    // insns[0] at offset 0 → target offset 32, distance=32, imm19=8
-    sc.insns[0] = 0x58000108u; // LDR X8, #32  (dlopen_addr)
-    sc.insns[1] = 0xD63F0100u; // BLR X8
-    sc.insns[2] = 0xAA0003F3u; // MOV X19, X0  (ORR X19, XZR, X0)
-    // insns[3] at offset 12 → target offset 40, distance=28, imm19=7
-    sc.insns[3] = 0x580000E8u; // LDR X8, #28  (dlerror_addr)
-    sc.insns[4] = 0xD63F0100u; // BLR X8
-    sc.insns[5] = 0xAA0003E1u; // MOV X1, X0   (ORR X1, XZR, X0)
-    sc.insns[6] = 0xAA1303E0u; // MOV X0, X19  (ORR X0, XZR, X19)
-    sc.insns[7] = 0xD4200000u; // BRK #0
+    struct { uint32_t insns[10]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
+    sc.insns[0] = 0x58000148u; // LDR X8, #40  (offset 0→40)  imm19=10
+    sc.insns[1] = 0xAA0803E2u; // MOV X2, X8   (ORR X2, XZR, X8)
+    sc.insns[2] = 0xD63F0100u; // BLR X8
+    sc.insns[3] = 0xAA0003F3u; // MOV X19, X0
+    sc.insns[4] = 0x58000108u; // LDR X8, #32  (offset 16→48) imm19=8
+    sc.insns[5] = 0xD63F0100u; // BLR X8
+    sc.insns[6] = 0xAA0003E1u; // MOV X1, X0
+    sc.insns[7] = 0xAA1303E0u; // MOV X0, X19
+    sc.insns[8] = 0xD4200000u; // BRK #0
+    sc.insns[9] = 0xD503201Fu; // NOP (padding so fn_dlopen sits at 8-byte boundary +40)
     sc.fn_dlopen  = (uint64_t)dlopen_addr;
     sc.fn_dlerror = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
 
@@ -324,7 +346,8 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     memcpy(&regs, &orig, sizeof(regs));
     regs.pstate &= ~(uint64_t)(3u << 10); // clear PSTATE.BTYPE
     regs.regs[0] = remote_buf;             // dlopen arg: path
-    regs.regs[1] = RTLD_NOW | RTLD_GLOBAL;
+    regs.regs[1] = RTLD_NOW;              // RTLD_GLOBAL removed — can block namespace resolution
+    regs.regs[2] = dlopen_addr;           // fake caller_addr for 3-arg __loader_dlopen variant
     regs.pc      = sc_addr;
 
     if (!set_regs(pid, &regs)) {
@@ -407,6 +430,38 @@ int main(int argc, char *argv[]) {
         }
 
         LOG("Injecting payload from %s", payload_path);
+
+        // Copy payload to /data/local/tmp/ — cross-UID dlopen in FF's linker context
+        // may be blocked by SELinux when loading from our app's data dir, but
+        // /data/local/tmp/ (shell_data_file context) is accessible to any process.
+        {
+            char tmp_path[256];
+            snprintf(tmp_path, sizeof(tmp_path), "/data/local/tmp/zxpl_%d.so", pid);
+            int fi = open(payload_path, O_RDONLY);
+            if (fi >= 0) {
+                int fo = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+                if (fo >= 0) {
+                    char cbuf[8192]; ssize_t n;
+                    bool write_ok = true;
+                    while ((n = read(fi, cbuf, sizeof(cbuf))) > 0)
+                        if (write(fo, cbuf, (size_t)n) != n) { write_ok = false; break; }
+                    close(fo);
+                    if (write_ok) {
+                        zerr("main: payload staged at %s", tmp_path);
+                        strncpy(payload_path, tmp_path, sizeof(payload_path) - 1);
+                        payload_path[sizeof(payload_path) - 1] = '\0';
+                    } else {
+                        zerr("main: copy write failed errno=%d, using original path", errno);
+                        unlink(tmp_path);
+                    }
+                } else {
+                    zerr("main: cannot create %s errno=%d, using original path", tmp_path, errno);
+                }
+                close(fi);
+            } else {
+                zerr("main: cannot open source %s errno=%d", payload_path, errno);
+            }
+        }
 
         if (!ptrace_attach(pid)) { ProcMem::close(); return 3; }
         freeze_threads(pid);       // stop anti-cheat threads during injection
