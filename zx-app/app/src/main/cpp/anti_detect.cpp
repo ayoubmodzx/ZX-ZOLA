@@ -469,7 +469,7 @@ void zx_scrub_trampolines() {
         uintptr_t pg = (uintptr_t)p & ~(ps - 1);
         mprotect((void*)pg, ps, PROT_READ | PROT_WRITE | PROT_EXEC);
         memcpy(p, k_clean_hdr, 8);
-        __builtin___clear_cache(p, (char*)p + 8);
+        __builtin___clear_cache((char*)p, (char*)p + 8);
     }
     LI("L4 scrubbed %d trampoline headers", k_scrub_n);
 }

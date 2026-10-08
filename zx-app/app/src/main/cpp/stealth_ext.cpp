@@ -490,7 +490,7 @@ static void rotate_trampolines() {
         if (is_tramp) {
             memcpy(p,     &v.ldr, 4);
             memcpy(p + 4, &v.br,  4);
-            __builtin___clear_cache(p, p + 8);
+            __builtin___clear_cache((char*)p, (char*)p + 8);
             cnt++;
         }
     }

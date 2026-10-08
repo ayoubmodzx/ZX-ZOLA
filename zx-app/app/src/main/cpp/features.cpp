@@ -679,11 +679,8 @@ static Vec3 hookGetFireDir(void *self) {
     if (!g_silentAim.load(std::memory_order_relaxed)) return orig;
     // CE-1: hasHeadTarget/getHeadTarget declared in esp_renderer.hpp
     if (!ESP::hasHeadTarget()) return orig;
-    Il2CppObject *head = ESP::getHeadTarget();
-    if (!head) return orig;
-    // Direction = normalize(headPos - cameraPos)
-    // We store world head pos in ESP; get it via invoke0
-    // Fallback: return original if we can't compute
+    Vec2 head = ESP::getHeadTarget();
+    (void)head; // screen-space target; aim assist uses head.x, head.y
     return orig;
 }
 
