@@ -16,6 +16,7 @@
 #include <android/log.h>
 #include <dlfcn.h>
 #include <cstring>
+#include <cstdio>
 
 #define TAG "ZX-ANO"
 #ifndef ZX_RELEASE
