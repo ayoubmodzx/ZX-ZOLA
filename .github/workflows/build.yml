@@ -27,7 +27,6 @@ jobs:
       - name: Write local.properties
         run: |
           echo "sdk.dir=$ANDROID_SDK_ROOT" > zx-app/local.properties
-          echo "ndk.dir=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> zx-app/local.properties
 
       - name: Make gradlew executable
         run: chmod +x zx-app/gradlew
