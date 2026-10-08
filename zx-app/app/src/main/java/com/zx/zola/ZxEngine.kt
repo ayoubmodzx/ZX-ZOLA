@@ -61,36 +61,12 @@ object ZxEngine {
 
     fun init(context: Context) {
         val appCtx = context.applicationContext
-        // System extracts .so libs into nativeLibraryDir at install time
-        payloadPath = File(appCtx.applicationInfo.nativeLibraryDir, "libzx_payload.so").absolutePath
-        // Injector is a standalone binary packed in assets — extract + chmod on bg thread
-        bgHandler.post { extractInjector(appCtx) }
-    }
-
-    private fun extractInjector(context: Context) {
-        try {
-            val staged = File(context.filesDir, "zx_injector")
-            context.assets.open("arm64-v8a/zx_injector").use { inp ->
-                staged.outputStream().use { out -> inp.copyTo(out) }
-            }
-            // /data/local/tmp is noexec on some ROMs — try exec-friendly paths in order
-            val candidates = listOf("/data/local/tmp/zx_injector", "${context.filesDir}/zx_injector")
-            var placed = false
-            for (dest in candidates) {
-                val rc = Runtime.getRuntime().exec(arrayOf("su", "-c",
-                    "cp '${staged.absolutePath}' '$dest' && chmod 755 '$dest'"
-                )).waitFor()
-                if (rc == 0) {
-                    injectorPath = dest
-                    placed = true
-                    Log.i("ZxEngine", "injector ready: $injectorPath")
-                    break
-                }
-            }
-            if (!placed) Log.e("ZxEngine", "failed to place injector binary")
-        } catch (e: Exception) {
-            Log.e("ZxEngine", "extractInjector failed: ${e.message}")
-        }
+        val libDir = appCtx.applicationInfo.nativeLibraryDir
+        // Both files are installed by the system into nativeLibraryDir at APK install time.
+        // That directory is exec-allowed (unlike filesDir / /data/local/tmp which are noexec).
+        payloadPath  = File(libDir, "libzx_payload.so").absolutePath
+        injectorPath = File(libDir, "libzx_injector.so").absolutePath
+        Log.i("ZxEngine", "injector=$injectorPath  payload=$payloadPath")
     }
 
     fun isFfRunning(): Boolean = try {
@@ -115,12 +91,16 @@ object ZxEngine {
         if (targetPid <= 0) return
         val injector = injectorPath
         if (injector.isEmpty()) return
+        val payload  = payloadPath
         bgHandler.post {
             synchronized(cmdLock) {
                 try {
                     val en = if (on) 1 else 0
-                    val args = "$targetPid $cmd $en $payloadPath $intensity"
-                    Runtime.getRuntime().exec(arrayOf("su", "-c", "$injector $args")).waitFor()
+                    // Quote both paths — nativeLibraryDir contains ~~hash==/ on Android 12+
+                    val cmd2 = "'$injector' $targetPid $cmd $en '$payload' $intensity"
+                    val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd2))
+                    proc.waitFor()
+                    Log.i("ZxEngine", "toggle cmd=$cmd on=$on rc=${proc.exitValue()}")
                 } catch (e: Exception) {
                     Log.e("ZxEngine", "toggle failed: ${e.message}")
                 }

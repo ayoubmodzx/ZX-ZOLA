@@ -35,12 +35,14 @@ add_executable(zx_injector
 target_include_directories(zx_injector PRIVATE .)
 target_link_libraries(zx_injector log dl)
 
-# Copy injector binary to assets so Gradle packages it into the APK
+# Package injector as libzx_injector.so in jniLibs so the system installs it
+# into nativeLibraryDir at install time — that directory is exec-allowed, unlike
+# /data/local/tmp or filesDir which are noexec on most Android 10+ ROMs.
 add_custom_command(TARGET zx_injector POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
-        "${CMAKE_SOURCE_DIR}/../assets/arm64-v8a"
+        "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}"
     COMMAND ${CMAKE_COMMAND} -E copy
         "$<TARGET_FILE:zx_injector>"
-        "${CMAKE_SOURCE_DIR}/../assets/arm64-v8a/zx_injector"
-    COMMENT "Copying zx_injector -> assets/arm64-v8a/"
+        "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libzx_injector.so"
+    COMMENT "Packaging zx_injector -> jniLibs/${ANDROID_ABI}/libzx_injector.so"
 )
