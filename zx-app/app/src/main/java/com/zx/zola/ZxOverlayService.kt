@@ -4,7 +4,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
@@ -566,6 +569,22 @@ class ZxOverlayService : Service() {
             textSize = 9f; letterSpacing = 0.15f
             typeface = android.graphics.Typeface.MONOSPACE
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        hdr.addView(TextView(this).apply {
+            text = "COPY"
+            setTextColor(Color.parseColor("#00E676"))
+            textSize = 9f; letterSpacing = 0.1f
+            background = ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.bg_feature_safe)
+            setPadding(dp(8), dp(4), dp(8), dp(4))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.marginEnd = dp(6) }
+            setOnClickListener {
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("ZX_LOG", buildLogText()))
+                Toast.makeText(this@ZxOverlayService, "Copied", Toast.LENGTH_SHORT).show()
+            }
         })
         hdr.addView(TextView(this).apply {
             text = "CLEAR"
