@@ -19,9 +19,9 @@
  *     exec*  @ 0x1cdd           — process spawning
  *
  *   TracerPid / frida / xposed: confirmed runtime stack-built strings
- *     → spoofed via openat+read intercept on /proc/*/status
+ *     → spoofed via openat+read intercept on /proc/<pid>/status
  *
- * Layer 18: openat + read — /proc/*/status TracerPid spoof
+ * Layer 18: openat + read — /proc/<pid>/status TracerPid spoof
  * Layer 19: ioctl gate — block unwind_xx_ioctl + ano device fds
  * Layer 20: execve/execl/execvp gate — block ano-spawned processes
  * Layer 21: getenv filter — LD_PRELOAD → NULL, sanitize env leaks
@@ -45,6 +45,7 @@
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <sys/prctl.h>
 #include <time.h>
 #include <pthread.h>
 #include <cstring>
