@@ -11,7 +11,9 @@ import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import android.view.*
 import android.widget.*
@@ -137,17 +139,45 @@ class ZxOverlayService : Service() {
     private val switchMap  = mutableMapOf<Int, Switch>()
     private val tabViews   = mutableMapOf<Tab, View>()
 
+    // Persistent feature state — survives tab switches and panel close/reopen
+    private val featureEnabled   = mutableMapOf<Int, Boolean>()
+    private val featureIntensity = mutableMapOf<Int, Int>()
+
+    // Status polling
+    private var isConnected = false
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val pollTask = object : Runnable {
+        override fun run() {
+            Thread {
+                val running = ZxEngine.isFfRunning()
+                val pid     = ZxEngine.getTargetPid()
+                uiHandler.post {
+                    if (running && !isConnected) {
+                        isConnected = true
+                        setConnected(pid)
+                    } else if (!running && isConnected) {
+                        isConnected = false
+                        setDisconnected()
+                    }
+                }
+            }.start()
+            uiHandler.postDelayed(this, 3000L)
+        }
+    }
+
     // ─── Lifecycle ────────────────────────────────────────────────────────────
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
         startForegroundCompat()
+        ZxEngine.init(this)
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         panelW = dp(DEF_W_DP)
         panelH = dp(DEF_H_DP)
         createFab()
         createPanel()
+        uiHandler.post(pollTask)
     }
 
     private fun startForegroundCompat() {
@@ -180,6 +210,7 @@ class ZxOverlayService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        uiHandler.removeCallbacks(pollTask)
         fabView  ?.let { if (it.parent != null) wm.removeView(it) }
         panelRoot?.let { if (it.parent != null) wm.removeView(it) }
     }
@@ -468,9 +499,14 @@ class ZxOverlayService : Service() {
         }
         contentList.removeAllViews()
         switchMap.clear()
-        activeLayerCount = 0
-        if (::footerCountTv.isInitialized) footerCountTv.text = "0 LAYERS ACTIVE"
-        val list = features[tab] ?: return
+        val list = features[tab] ?: run {
+            activeLayerCount = 0
+            if (::footerCountTv.isInitialized) footerCountTv.text = "0 LAYERS ACTIVE"
+            return
+        }
+        // Recompute count from persisted state for this tab before building cards
+        activeLayerCount = list.count { !it.isLocalOnly && featureEnabled[it.cmd] == true }
+        if (::footerCountTv.isInitialized) footerCountTv.text = "$activeLayerCount LAYERS ACTIVE"
         val safe   = list.filter { it.risk == Risk.SAFE   }
         val risk   = list.filter { it.risk == Risk.RISK   }
         val danger = list.filter { it.risk == Risk.DANGER }
@@ -528,12 +564,13 @@ class ZxOverlayService : Service() {
         })
 
         val sw = Switch(this).apply {
-            isChecked = false
+            isChecked = if (f.isLocalOnly) false else (featureEnabled[f.cmd] == true)
             trackDrawable = ContextCompat.getDrawable(this@ZxOverlayService, R.drawable.sel_switch_track)
             setOnCheckedChangeListener { _, on ->
                 if (f.isLocalOnly) {
                     handleLocalFeature(f.cmd, on)
                 } else {
+                    featureEnabled[f.cmd] = on
                     ZxEngine.toggle(f.cmd, on)
                 }
                 activeLayerCount += if (on) 1 else -1
@@ -552,23 +589,29 @@ class ZxOverlayService : Service() {
                     LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
                 ).also { it.topMargin = dp(6) }
             }
+            // Restore persisted intensity or fall back to default
+            val savedProgress = featureIntensity[f.cmd]?.let { it - f.sliderMin } ?: (f.sliderDefault - f.sliderMin)
+            val savedDisplay  = savedProgress + f.sliderMin
             val valTv = TextView(this).apply {
-                text = "${f.sliderDefault}${f.sliderLabel}"
+                text = "$savedDisplay${f.sliderLabel}"
                 setTextColor(Color.parseColor("#7C4DFF")); textSize = 10f; minWidth = dp(36)
             }
             slRow.addView(SeekBar(this).apply {
                 max = f.sliderMax - f.sliderMin
-                progress = f.sliderDefault - f.sliderMin
+                progress = savedProgress
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
                 progressDrawable = null; thumb = null
                 setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
                     override fun onProgressChanged(sb: SeekBar, p: Int, fromUser: Boolean) {
                         val display = p + f.sliderMin
                         valTv.text = "$display${f.sliderLabel}"
-                        if (fromUser && sw.isChecked) {
-                            val intensity = if (f.rawIntensity) display
-                                            else p * 100 / (f.sliderMax - f.sliderMin).coerceAtLeast(1)
-                            ZxEngine.setIntensity(f.cmd, intensity)
+                        if (fromUser) {
+                            featureIntensity[f.cmd] = display
+                            if (sw.isChecked) {
+                                val intensity = if (f.rawIntensity) display
+                                                else p * 100 / (f.sliderMax - f.sliderMin).coerceAtLeast(1)
+                                ZxEngine.setIntensity(f.cmd, intensity)
+                            }
                         }
                     }
                     override fun onStartTrackingTouch(sb: SeekBar) {}
@@ -629,6 +672,12 @@ class ZxOverlayService : Service() {
         statusDot.background = ContextCompat.getDrawable(this, R.drawable.bg_status_dot_on)
         statusText.text = "PID $pid"
         statusText.setTextColor(Color.parseColor("#00E676"))
+    }
+
+    private fun setDisconnected() = statusDot.post {
+        statusDot.background = ContextCompat.getDrawable(this, R.drawable.bg_status_dot_off)
+        statusText.text = "OFFLINE"
+        statusText.setTextColor(Color.parseColor("#9090B0"))
     }
 
     // ─── Utils ────────────────────────────────────────────────────────────────

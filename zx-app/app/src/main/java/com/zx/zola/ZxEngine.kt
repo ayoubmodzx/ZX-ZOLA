@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import java.io.File
 
 object ZxEngine {
 
@@ -52,14 +53,44 @@ object ZxEngine {
     }
 
     private var targetPid: Int = -1
-    private var payloadPath: String = "/data/local/tmp/libzx_payload.so"
+    private var payloadPath: String = ""
+    private var injectorPath: String = ""
     private val cmdLock = Any()
     private val bgThread = HandlerThread("zx-engine").also { it.start() }
     private val bgHandler = Handler(bgThread.looper)
 
     fun init(context: Context) {
-        val payloadFile = context.getFileStreamPath("libzx_payload.so")
-        if (payloadFile.exists()) payloadPath = payloadFile.absolutePath
+        val appCtx = context.applicationContext
+        // System extracts .so libs into nativeLibraryDir at install time
+        payloadPath = File(appCtx.applicationInfo.nativeLibraryDir, "libzx_payload.so").absolutePath
+        // Injector is a standalone binary packed in assets — extract + chmod on bg thread
+        bgHandler.post { extractInjector(appCtx) }
+    }
+
+    private fun extractInjector(context: Context) {
+        try {
+            val staged = File(context.filesDir, "zx_injector")
+            context.assets.open("arm64-v8a/zx_injector").use { inp ->
+                staged.outputStream().use { out -> inp.copyTo(out) }
+            }
+            // /data/local/tmp is noexec on some ROMs — try exec-friendly paths in order
+            val candidates = listOf("/data/local/tmp/zx_injector", "${context.filesDir}/zx_injector")
+            var placed = false
+            for (dest in candidates) {
+                val rc = Runtime.getRuntime().exec(arrayOf("su", "-c",
+                    "cp '${staged.absolutePath}' '$dest' && chmod 755 '$dest'"
+                )).waitFor()
+                if (rc == 0) {
+                    injectorPath = dest
+                    placed = true
+                    Log.i("ZxEngine", "injector ready: $injectorPath")
+                    break
+                }
+            }
+            if (!placed) Log.e("ZxEngine", "failed to place injector binary")
+        } catch (e: Exception) {
+            Log.e("ZxEngine", "extractInjector failed: ${e.message}")
+        }
     }
 
     fun isFfRunning(): Boolean = try {
@@ -69,8 +100,11 @@ object ZxEngine {
         val out = proc.inputStream.bufferedReader().readText().trim()
         proc.waitFor()
         if (out.isNotEmpty()) { targetPid = out.trim().split(" ")[0].toIntOrNull() ?: -1 }
+        else { targetPid = -1 }
         out.isNotEmpty()
     } catch (e: Exception) { false }
+
+    fun getTargetPid(): Int = targetPid
 
     fun setTarget(pid: Int, path: String) {
         targetPid = pid
@@ -79,12 +113,14 @@ object ZxEngine {
 
     fun toggle(cmd: Int, on: Boolean, intensity: Int = 0) {
         if (targetPid <= 0) return
+        val injector = injectorPath
+        if (injector.isEmpty()) return
         bgHandler.post {
             synchronized(cmdLock) {
                 try {
                     val en = if (on) 1 else 0
                     val args = "$targetPid $cmd $en $payloadPath $intensity"
-                    Runtime.getRuntime().exec(arrayOf("su", "-c", "zx_injector $args")).waitFor()
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", "$injector $args")).waitFor()
                 } catch (e: Exception) {
                     Log.e("ZxEngine", "toggle failed: ${e.message}")
                 }
