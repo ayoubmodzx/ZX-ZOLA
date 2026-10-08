@@ -456,16 +456,33 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     zerr("remote_dlopen: loader_dlopen_addr=0x%lx do_dlopen_target=0x%lx",
          (unsigned long)loader_dlopen_addr, (unsigned long)do_dlopen_target);
 
-    // Read first instructions from both our do_dlopen and target's (possibly hooked) do_dlopen
-    uint32_t orig_insn = 0, ace_insn = 0;
+    // Scan first 64 instructions (256 bytes) of do_dlopen in both processes.
+    // And64InlineHook can patch ANY instruction, not just instruction 0.
+    // Build a patches table of ALL divergent positions so we can restore them all.
+    struct PatchEntry { int idx; uint32_t orig; uint32_t ace; };
+    static const int SCAN_INSNS = 64;
+    uint32_t local_do[SCAN_INSNS] = {}, tgt_do[SCAN_INSNS] = {};
+    PatchEntry patches[SCAN_INSNS];
+    int patch_count = 0;
     bool should_patch = false;
+
     if (do_dlopen_local && do_dlopen_target) {
-        orig_insn = *(uint32_t*)do_dlopen_local;
-        ProcMem::read(do_dlopen_target, &ace_insn, 4);
-        zerr("remote_dlopen: do_dlopen local[0]=0x%08x target[0]=0x%08x",
-             orig_insn, ace_insn);
-        should_patch = (ace_insn != 0) && (orig_insn != ace_insn);
-        zerr("remote_dlopen: ACE hook at do_dlopen? %s", should_patch ? "YES — patching" : "no");
+        memcpy(local_do, (const void*)do_dlopen_local, sizeof(local_do));
+        ProcMem::read(do_dlopen_target, tgt_do, sizeof(tgt_do));
+        zerr("remote_dlopen: do_dlopen target[0..7]: %08x %08x %08x %08x %08x %08x %08x %08x",
+             tgt_do[0],tgt_do[1],tgt_do[2],tgt_do[3],tgt_do[4],tgt_do[5],tgt_do[6],tgt_do[7]);
+        zerr("remote_dlopen: do_dlopen local [0..7]: %08x %08x %08x %08x %08x %08x %08x %08x",
+             local_do[0],local_do[1],local_do[2],local_do[3],
+             local_do[4],local_do[5],local_do[6],local_do[7]);
+        for (int i = 0; i < SCAN_INSNS; i++) {
+            if (local_do[i] != tgt_do[i]) {
+                zerr("remote_dlopen: HOOK do_dlopen+%d: local=0x%08x ace=0x%08x",
+                     i*4, local_do[i], tgt_do[i]);
+                patches[patch_count++] = {i, local_do[i], tgt_do[i]};
+            }
+        }
+        zerr("remote_dlopen: do_dlopen scan: %d divergent insns in first %d", patch_count, SCAN_INSNS);
+        should_patch = (patch_count > 0);
     }
 
     // 56-byte shellcode calling __loader_dlopen(path, flags, fake_caller) directly.
@@ -554,29 +571,36 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: set_regs failed errno=%d", errno); return false;
     }
 
-    // Patch ACE's hook out of do_dlopen just before the shellcode runs.
-    // All secondary threads are frozen (freeze_threads called before remote_dlopen),
-    // so there is no race with ACE re-patching during the window.
+    // Poke ALL original instructions back into do_dlopen before shellcode runs.
+    // All secondary threads are frozen so no race with ACE re-patching.
+    int actually_patched = 0;
     if (should_patch) {
-        if (remote_poke_insn(pid, do_dlopen_target, orig_insn))
-            zerr("remote_dlopen: patched do_dlopen: 0x%08x → 0x%08x (ACE→orig)", ace_insn, orig_insn);
-        else {
-            zerr("remote_dlopen: poke failed — proceeding without patch (will likely get -4)");
-            should_patch = false;
+        for (int i = 0; i < patch_count; i++) {
+            uintptr_t addr = do_dlopen_target + (uintptr_t)(patches[i].idx * 4);
+            if (remote_poke_insn(pid, addr, patches[i].orig)) {
+                actually_patched++;
+                zerr("remote_dlopen: poked do_dlopen+%d: 0x%08x→0x%08x",
+                     patches[i].idx*4, patches[i].ace, patches[i].orig);
+            } else {
+                zerr("remote_dlopen: POKE FAILED do_dlopen+%d", patches[i].idx*4);
+            }
         }
+        zerr("remote_dlopen: patched %d/%d insns", actually_patched, patch_count);
+        should_patch = (actually_patched > 0);
     }
 
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
     int status;
     waitpid(pid, &status, 0);
 
-    // Restore ACE's hook immediately — MUST happen before set_regs restore
-    // so the game's anti-cheat is functional again regardless of shellcode outcome.
+    // Restore ALL ACE hook instructions immediately after shellcode stops.
     if (should_patch) {
-        if (remote_poke_insn(pid, do_dlopen_target, ace_insn))
-            zerr("remote_dlopen: restored ACE hook: 0x%08x", ace_insn);
-        else
-            zerr("remote_dlopen: WARNING: failed to restore ACE hook at 0x%lx!", (unsigned long)do_dlopen_target);
+        for (int i = 0; i < patch_count; i++) {
+            uintptr_t addr = do_dlopen_target + (uintptr_t)(patches[i].idx * 4);
+            if (!remote_poke_insn(pid, addr, patches[i].ace))
+                zerr("remote_dlopen: WARNING restore failed do_dlopen+%d", patches[i].idx*4);
+        }
+        zerr("remote_dlopen: restored %d ACE hook insns", patch_count);
     }
 
     set_regs(pid, &orig);
