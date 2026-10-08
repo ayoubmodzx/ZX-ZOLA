@@ -25,10 +25,22 @@
 typedef struct user_pt_regs pt_regs;
 #include <errno.h>
 #include <android/log.h>
+#include <dirent.h>
+#include <cstdarg>
 
 #define TAG "ZX-INJ"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define ERR(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// Write to both logcat AND stderr — stderr is captured by ZxEngine and shown
+// in the in-app console, which logcat-only ERR() never reaches.
+__attribute__((format(printf,1,2)))
+static void zerr(const char *fmt, ...) {
+    char buf[256];
+    va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+    __android_log_print(ANDROID_LOG_ERROR, TAG, "%s", buf);
+    fprintf(stderr, "%s\n", buf);
+}
 
 // Feature command IDs — must match Cmd in ZxEngine.kt and features.cpp
 enum Cmd {
@@ -61,6 +73,34 @@ static bool ptrace_detach(pid_t pid) {
     return ptrace(PTRACE_DETACH, pid, nullptr, nullptr) == 0;
 }
 
+// Freeze all threads in the process EXCEPT the main thread (already attached).
+// This prevents anti-cheat threads from detecting ptrace during the injection window.
+static pid_t s_extra_tids[256];
+static int   s_extra_n = 0;
+
+static void freeze_threads(pid_t pid) {
+    char path[64]; snprintf(path, sizeof(path), "/proc/%d/task", pid);
+    DIR *d = opendir(path); if (!d) return;
+    struct dirent *e; s_extra_n = 0;
+    while ((e = readdir(d)) != nullptr && s_extra_n < 256) {
+        if (e->d_name[0] == '.') continue;
+        pid_t tid = (pid_t)atoi(e->d_name);
+        if (tid <= 0 || tid == pid) continue;
+        if (ptrace(PTRACE_ATTACH, tid, nullptr, nullptr) == 0) {
+            int st; waitpid(tid, &st, 0);
+            s_extra_tids[s_extra_n++] = tid;
+        }
+    }
+    closedir(d);
+    LOG("freeze_threads: stopped %d extra threads", s_extra_n);
+}
+
+static void thaw_threads() {
+    for (int i = 0; i < s_extra_n; i++)
+        ptrace(PTRACE_DETACH, s_extra_tids[i], nullptr, nullptr);
+    s_extra_n = 0;
+}
+
 static bool get_regs(pid_t pid, pt_regs *regs) {
     struct iovec iov = { regs, sizeof(*regs) };
     return ptrace(PTRACE_GETREGSET, pid, (void*)NT_PRSTATUS, &iov) == 0;
@@ -78,7 +118,7 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
 
     // Find mmap syscall address in target via maps
     uintptr_t mmap_addr = ProcMem::findSymbol(pid, "libc.so", "mmap");
-    if (!mmap_addr) return 0;
+    if (!mmap_addr) { zerr("remote_mmap: mmap not found in libc.so"); return 0; }
 
     memcpy(&regs, &orig, sizeof(regs));
 
@@ -108,6 +148,7 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     regs.pc       = mmap_addr;
 
     if (!set_regs(pid, &regs)) {
+        zerr("remote_mmap: set_regs failed errno=%d", errno);
         ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word); // full restore
         return 0;
     }
@@ -119,6 +160,7 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word);
 
     if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
+        zerr("remote_mmap: bad stop wst=0x%x stopped=%d sig=%d", wst, WIFSTOPPED(wst), WSTOPSIG(wst));
         set_regs(pid, &orig);
         return 0;
     }
@@ -139,16 +181,16 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
 
     // 1. Allocate remote memory
     uintptr_t remote_buf = remote_mmap(pid, alloc);
-    if (!remote_buf) { ERR("remote_mmap failed"); return false; }
+    if (!remote_buf) { zerr("remote_dlopen: remote_mmap returned 0"); return false; }
 
     // 2. Write path string
     if (!ProcMem::write(remote_buf, so_path, path_len)) {
-        ERR("write path failed"); return false;
+        zerr("remote_dlopen: write path failed errno=%d", errno); return false;
     }
 
     // 3. Find dlopen in target
     uintptr_t dlopen_addr = ProcMem::findSymbol(pid, "libdl.so", "dlopen");
-    if (!dlopen_addr) { ERR("dlopen not found"); return false; }
+    if (!dlopen_addr) { zerr("remote_dlopen: dlopen not found in libdl.so"); return false; }
 
     // 4. Set up registers for dlopen(path, RTLD_NOW|RTLD_GLOBAL)
     pt_regs orig, regs;
@@ -220,7 +262,9 @@ int main(int argc, char *argv[]) {
         LOG("Injecting payload from %s", payload_path);
 
         if (!ptrace_attach(pid)) { ProcMem::close(); return 3; }
+        freeze_threads(pid);       // stop anti-cheat threads during injection
         bool ok = remote_dlopen(pid, payload_path);
+        thaw_threads();
         ptrace_detach(pid);
 
         if (!ok) { ERR("Injection failed"); ProcMem::close(); return 4; }
