@@ -112,6 +112,29 @@ static bool set_regs(pid_t pid, pt_regs *regs) {
     return ptrace(PTRACE_SETREGSET, pid, (void*)NT_PRSTATUS, &iov) == 0;
 }
 
+// Patch a single ARM64 instruction in the target process via PTRACE_PEEKTEXT/POKETEXT.
+// Works on r-x pages (linker64 code) when running as root with ptrace attached.
+// The kernel handles ARM64 dcache/icache coherency for ptrace writes automatically.
+static bool remote_poke_insn(pid_t pid, uintptr_t addr, uint32_t insn) {
+    uintptr_t aligned = addr & ~(uintptr_t)7;
+    errno = 0;
+    long peek_val = ptrace(PTRACE_PEEKTEXT, pid, (void*)aligned, NULL);
+    if (errno) {
+        zerr("remote_poke_insn: PEEKTEXT@0x%lx errno=%d", (unsigned long)aligned, errno);
+        return false;
+    }
+    uint64_t word = (uint64_t)(unsigned long)peek_val;
+    if ((addr & 4) == 0)
+        word = (word & 0xFFFFFFFF00000000ULL) | (uint64_t)insn;
+    else
+        word = (word & 0x00000000FFFFFFFFULL) | ((uint64_t)insn << 32);
+    if (ptrace(PTRACE_POKETEXT, pid, (void*)aligned, (void*)(uintptr_t)word) < 0) {
+        zerr("remote_poke_insn: POKETEXT@0x%lx errno=%d", (unsigned long)aligned, errno);
+        return false;
+    }
+    return true;
+}
+
 // Scan target's libc.so for a raw SVC #0 gadget — ONLY in executable pages.
 // ARM64 SVC #0 encoding (LE): 0xD4000001
 // Previous bug: scanning from ELF base blindly hits data/rodata pages first;
@@ -272,7 +295,11 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
 // compute its offset from our linker64 base, then apply to target's linker64 base.
 // The shellcode then calls linker64's __loader_dlopen directly, bypassing libdl.so
 // and the ACE-patched PLT entirely.
-static uintptr_t find_real_loader_dlopen(int target_pid) {
+static uintptr_t find_real_loader_dlopen(int target_pid,
+                                          uintptr_t *out_do_dlopen_local,
+                                          uintptr_t *out_do_dlopen_target) {
+    if (out_do_dlopen_local)  *out_do_dlopen_local  = 0;
+    if (out_do_dlopen_target) *out_do_dlopen_target = 0;
     // 1. Our local dlopen = 4-insn wrapper in libdl.so
     uintptr_t our_dlopen = (uintptr_t)(void*)dlopen;
     zerr("find_real_loader_dlopen: our_dlopen=0x%lx", (unsigned long)our_dlopen);
@@ -329,6 +356,25 @@ static uintptr_t find_real_loader_dlopen(int target_pid) {
     zerr("find_real_loader_dlopen: our_linker=0x%lx target_linker=0x%lx offset=0x%lx → target_fn=0x%lx",
          (unsigned long)our_linker, (unsigned long)target_linker,
          (unsigned long)offset, (unsigned long)result);
+
+    // Decode the B instruction at __loader_dlopen+8 to locate do_dlopen.
+    // The thunk is exactly: MOV X3,X2 / MOV X2,XZR / B do_dlopen
+    // Bytes confirmed: aa0203e3 aa1f03e2 17ffffc0
+    uint32_t b_insn = *(uint32_t*)(local_fn + 8);
+    zerr("find_real_loader_dlopen: B@+8=0x%08x (want opcode 0x05 in bits[31:26])", b_insn);
+    if ((b_insn >> 26) == 0x05u) {
+        int64_t imm26 = (int64_t)(b_insn & 0x3FFFFFFu);
+        if (imm26 & (1LL << 25)) imm26 |= ~(int64_t)0x3FFFFFFu;
+        uintptr_t do_dlopen_local  = (local_fn + 8) + (uintptr_t)(imm26 * 4LL);
+        uintptr_t do_dlopen_offset = do_dlopen_local - our_linker;
+        uintptr_t do_dlopen_tgt    = target_linker + do_dlopen_offset;
+        zerr("find_real_loader_dlopen: imm26=%lld do_dlopen_local=0x%lx do_dlopen_target=0x%lx",
+             (long long)imm26, (unsigned long)do_dlopen_local, (unsigned long)do_dlopen_tgt);
+        if (out_do_dlopen_local)  *out_do_dlopen_local  = do_dlopen_local;
+        if (out_do_dlopen_target) *out_do_dlopen_target = do_dlopen_tgt;
+    } else {
+        zerr("find_real_loader_dlopen: insn@+8=0x%08x not B — cannot locate do_dlopen", b_insn);
+    }
     return result;
 }
 
@@ -391,16 +437,36 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     zerr("remote_dlopen: dlopen=0x%lx dlerror=0x%lx path=%s",
          (unsigned long)dlopen_addr, (unsigned long)dlerror_addr, so_path);
 
-    // ACE hooks libdl.so's GOT entry for __loader_dlopen in the target process.
-    // find_real_loader_dlopen() reads our OWN (unhooked) libdl.so GOT, computes the
-    // real __loader_dlopen offset from our linker64, and maps it to target's linker64.
-    // This calls linker64 directly — ACE's libdl.so PLT hook is never touched.
-    uintptr_t loader_dlopen_addr = find_real_loader_dlopen(pid);
+    // ACE hooks do_dlopen (linker64+0x31098) — NOT the __loader_dlopen thunk itself.
+    // Strategy:
+    //   1. find_real_loader_dlopen() locates both __loader_dlopen and do_dlopen in both
+    //      our (unhooked) process and the target, by decoding the B at thunk+8.
+    //   2. We PTRACE_PEEKTEXT do_dlopen[0] from target: if it differs from our copy,
+    //      ACE's hook is there.
+    //   3. Before calling the shellcode, we PTRACE_POKETEXT the original instruction back.
+    //   4. After the shellcode returns (BRK #0 stop), we restore ACE's hook instruction.
+    //   PTRACE_POKETEXT bypasses page protection on attached root processes; kernel handles
+    //   ARM64 icache coherency automatically.
+    uintptr_t do_dlopen_local = 0, do_dlopen_target = 0;
+    uintptr_t loader_dlopen_addr = find_real_loader_dlopen(pid, &do_dlopen_local, &do_dlopen_target);
     if (!loader_dlopen_addr) {
         zerr("remote_dlopen: find_real_loader_dlopen failed — falling back to wrapper");
-        loader_dlopen_addr = dlopen_addr; // last resort: call dlopen wrapper (ACE will block)
+        loader_dlopen_addr = dlopen_addr;
     }
-    zerr("remote_dlopen: loader_dlopen_addr=0x%lx (direct linker64)", (unsigned long)loader_dlopen_addr);
+    zerr("remote_dlopen: loader_dlopen_addr=0x%lx do_dlopen_target=0x%lx",
+         (unsigned long)loader_dlopen_addr, (unsigned long)do_dlopen_target);
+
+    // Read first instructions from both our do_dlopen and target's (possibly hooked) do_dlopen
+    uint32_t orig_insn = 0, ace_insn = 0;
+    bool should_patch = false;
+    if (do_dlopen_local && do_dlopen_target) {
+        orig_insn = *(uint32_t*)do_dlopen_local;
+        ProcMem::read(do_dlopen_target, &ace_insn, 4);
+        zerr("remote_dlopen: do_dlopen local[0]=0x%08x target[0]=0x%08x",
+             orig_insn, ace_insn);
+        should_patch = (ace_insn != 0) && (orig_insn != ace_insn);
+        zerr("remote_dlopen: ACE hook at do_dlopen? %s", should_patch ? "YES — patching" : "no");
+    }
 
     // 56-byte shellcode calling __loader_dlopen(path, flags, fake_caller) directly.
     // X2 (fake_caller = dlopen_addr = address inside libdl.so) is pre-loaded in regs
@@ -487,9 +553,31 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     if (!set_regs(pid, &regs)) {
         zerr("remote_dlopen: set_regs failed errno=%d", errno); return false;
     }
+
+    // Patch ACE's hook out of do_dlopen just before the shellcode runs.
+    // All secondary threads are frozen (freeze_threads called before remote_dlopen),
+    // so there is no race with ACE re-patching during the window.
+    if (should_patch) {
+        if (remote_poke_insn(pid, do_dlopen_target, orig_insn))
+            zerr("remote_dlopen: patched do_dlopen: 0x%08x → 0x%08x (ACE→orig)", ace_insn, orig_insn);
+        else {
+            zerr("remote_dlopen: poke failed — proceeding without patch (will likely get -4)");
+            should_patch = false;
+        }
+    }
+
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
     int status;
     waitpid(pid, &status, 0);
+
+    // Restore ACE's hook immediately — MUST happen before set_regs restore
+    // so the game's anti-cheat is functional again regardless of shellcode outcome.
+    if (should_patch) {
+        if (remote_poke_insn(pid, do_dlopen_target, ace_insn))
+            zerr("remote_dlopen: restored ACE hook: 0x%08x", ace_insn);
+        else
+            zerr("remote_dlopen: WARNING: failed to restore ACE hook at 0x%lx!", (unsigned long)do_dlopen_target);
+    }
 
     set_regs(pid, &orig);
 
