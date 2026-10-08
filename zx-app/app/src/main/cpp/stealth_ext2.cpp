@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <cerrno>
 #include <atomic>
+#include <link.h>
 
 #define TAG "ZX-STX2"
 #ifndef ZX_RELEASE
@@ -292,6 +293,10 @@ static pid_t hook_fork() {
 // which contains exact page addresses — no /proc/maps reading needed.
 // ═════════════════════════════════════════════════════════════════════════════
 
+// libanogs.so load range — forward-declared so hook_mincore can reference them
+static uintptr_t s_stx2_ano_base = 0;
+static uintptr_t s_stx2_ano_end  = 0;
+
 using FnMincore = int(*)(void*, size_t, unsigned char*);
 static FnMincore g_orig_mincore = nullptr;
 
@@ -356,10 +361,6 @@ static int hook_tgkill(pid_t tgid, pid_t tid, int sig) {
     }
     return g_orig_tgkill ? g_orig_tgkill(tgid, tid, sig) : -1;
 }
-
-// libanogs.so load range for caller-aware connect/mincore checks (Fix 4/6)
-static uintptr_t s_stx2_ano_base = 0;
-static uintptr_t s_stx2_ano_end  = 0;
 
 static int phdr_find_ano_stx2(struct dl_phdr_info *info, size_t, void*) {
     if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
