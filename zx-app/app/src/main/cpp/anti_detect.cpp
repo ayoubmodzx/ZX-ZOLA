@@ -385,7 +385,11 @@ static int hook_SetPeriod(int ms) {
 // Naked asm: safe regardless of callee arg count — just zero X0 and return
 __attribute__((naked))
 static void *hook_ScanNullify() {
+#ifdef __aarch64__
     __asm__ volatile("mov x0, #0\n\tret");
+#else
+    __asm__ volatile("mov r0, #0\n\tbx lr");
+#endif
 }
 
 static void install_anosdk_extended(void *h) {
