@@ -82,14 +82,18 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
 
     memcpy(&regs, &orig, sizeof(regs));
 
-    // Place BRK #0 at the return address so we get SIGTRAP instead of running free
-    uintptr_t lr_addr = orig.regs[30]; // X30 = link register on ARM64
-    uint32_t  brk_insn = 0xD4200000u; // BRK #0
-    uint32_t  saved_insn = 0;
+    // Place BRK #0 at the return address so we get SIGTRAP instead of running free.
+    // PTRACE_PEEKTEXT/POKETEXT operate on sizeof(long) = 8 bytes on ARM64.
+    // Save the full 8-byte word and restore it exactly — only replacing the lower
+    // 4 bytes (the instruction AT lr_addr) with BRK, so lr_addr+4 is never corrupted.
+    uintptr_t lr_addr   = orig.regs[30]; // X30 = link register on ARM64
+    uint32_t  brk_insn  = 0xD4200000u;  // BRK #0
+    long      saved_word = ptrace(PTRACE_PEEKTEXT, pid, (void*)lr_addr, nullptr);
     {
-        long w = ptrace(PTRACE_PEEKTEXT, pid, (void*)lr_addr, nullptr);
-        saved_insn = (uint32_t)w;
-        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)(uintptr_t)brk_insn);
+        // Little-endian ARM64: lower 32 bits = instruction at lr_addr,
+        //                      upper 32 bits = instruction at lr_addr+4
+        long brk_word = (saved_word & (long)0xFFFFFFFF00000000LL) | (long)brk_insn;
+        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)brk_word);
     }
 
     // arm64: syscall via SVC #0, args in x0-x5, syscall num in x8
@@ -104,15 +108,15 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     regs.pc       = mmap_addr;
 
     if (!set_regs(pid, &regs)) {
-        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)(uintptr_t)saved_insn);
+        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word); // full restore
         return 0;
     }
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
     int wst = 0;
     waitpid(pid, &wst, 0);
 
-    // Restore original instruction at LR
-    ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)(uintptr_t)saved_insn);
+    // Restore full 8-byte word (both lr_addr and lr_addr+4 instructions)
+    ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word);
 
     if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
         set_regs(pid, &orig);
