@@ -9,7 +9,8 @@
         android:icon="@drawable/ic_zx"
         android:label="ZX"
         android:theme="@style/Theme.ZX"
-        android:hardwareAccelerated="true">
+        android:hardwareAccelerated="true"
+        android:extractNativeLibs="true">
 
         <activity
             android:name=".MainActivity"

@@ -583,6 +583,7 @@ class ZxOverlayService : Service() {
             typeface = android.graphics.Typeface.MONOSPACE
             setBackgroundColor(Color.parseColor("#06060E"))
             setPadding(dp(6), dp(6), dp(6), dp(80))
+            setTextIsSelectable(true)
             text = buildLogText()
         }
         logTv = tv
