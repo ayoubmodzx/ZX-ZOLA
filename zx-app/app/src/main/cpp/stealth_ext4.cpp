@@ -481,7 +481,11 @@ static long hook_sysconf(int name) {
 __attribute__((naked))
 static void *hook_unwind_info_nullify() {
     // Return -1 (ENODATA) in X0 — safe for any calling convention
+#ifdef __aarch64__
     __asm__ volatile("mov x0, #-1\n\tret");
+#else
+    __asm__ volatile("mvn r0, #0\n\tbx lr");
+#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
