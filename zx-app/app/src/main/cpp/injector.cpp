@@ -114,27 +114,44 @@ static bool set_regs(pid_t pid, pt_regs *regs) {
 // Allocate RWX memory in target process via remote mmap syscall
 static uintptr_t remote_mmap(pid_t pid, size_t size) {
     pt_regs orig, regs;
-    if (!get_regs(pid, &orig)) return 0;
+    if (!get_regs(pid, &orig)) { zerr("remote_mmap: get_regs failed errno=%d", errno); return 0; }
 
-    // Find mmap syscall address in target via maps
+    // ── DIAG 1: thread state at stop ─────────────────────────────────────────
+    zerr("DIAG mmap[1]: PC=0x%lx X30=0x%lx SP=0x%lx X0=0x%lx",
+         (unsigned long)orig.pc, (unsigned long)orig.regs[30],
+         (unsigned long)orig.sp, (unsigned long)orig.regs[0]);
+
     uintptr_t mmap_addr = ProcMem::findSymbol(pid, "libc.so", "mmap");
     if (!mmap_addr) { zerr("remote_mmap: mmap not found in libc.so"); return 0; }
+    zerr("DIAG mmap[2]: mmap_addr=0x%lx", (unsigned long)mmap_addr);
 
     memcpy(&regs, &orig, sizeof(regs));
 
-    // Place BRK #0 at the return address so we get SIGTRAP instead of running free.
-    // PTRACE_PEEKTEXT/POKETEXT operate on sizeof(long) = 8 bytes on ARM64.
-    // Save the full 8-byte word and restore it exactly — only replacing the lower
-    // 4 bytes (the instruction AT lr_addr) with BRK, so lr_addr+4 is never corrupted.
-    uintptr_t lr_addr   = orig.regs[30]; // X30 = link register on ARM64
-    uint32_t  brk_insn  = 0xD4200000u;  // BRK #0
-    long      saved_word = ptrace(PTRACE_PEEKTEXT, pid, (void*)lr_addr, nullptr);
-    {
-        // Little-endian ARM64: lower 32 bits = instruction at lr_addr,
-        //                      upper 32 bits = instruction at lr_addr+4
-        long brk_word = (saved_word & (long)0xFFFFFFFF00000000LL) | (long)brk_insn;
-        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)brk_word);
+    uintptr_t lr_addr  = orig.regs[30]; // X30 = link register on ARM64
+    uint32_t  brk_insn = 0xD4200000u;   // BRK #0
+
+    // ── DIAG 2: validate X30 before patching ─────────────────────────────────
+    errno = 0;
+    long saved_word = ptrace(PTRACE_PEEKTEXT, pid, (void*)lr_addr, nullptr);
+    int  peek_err   = errno;
+    zerr("DIAG mmap[3]: PEEKTEXT X30=0x%lx -> 0x%lx (errno=%d %s)",
+         (unsigned long)lr_addr, (unsigned long)saved_word,
+         peek_err, peek_err ? strerror(peek_err) : "ok");
+
+    if (peek_err != 0) {
+        zerr("remote_mmap: X30=0x%lx is INVALID — aborting", (unsigned long)lr_addr);
+        return 0;
     }
+
+    long brk_word = (saved_word & (long)0xFFFFFFFF00000000LL) | (long)brk_insn;
+    ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)brk_word);
+
+    // ── DIAG 3: verify BRK actually landed ───────────────────────────────────
+    errno = 0;
+    long verify   = ptrace(PTRACE_PEEKTEXT, pid, (void*)lr_addr, nullptr);
+    int  vfy_err  = errno;
+    zerr("DIAG mmap[4]: BRK write verify -> 0x%lx (errno=%d) match=%d",
+         (unsigned long)verify, vfy_err, (int)(verify == brk_word));
 
     // arm64: syscall via SVC #0, args in x0-x5, syscall num in x8
     // mmap(NULL, size, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANON, -1, 0)
@@ -147,9 +164,11 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     regs.regs[5]  = 0;
     regs.pc       = mmap_addr;
 
+    zerr("DIAG mmap[5]: injecting mmap call — size=%zu prot=RWX", size);
+
     if (!set_regs(pid, &regs)) {
         zerr("remote_mmap: set_regs failed errno=%d", errno);
-        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word); // full restore
+        ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word);
         return 0;
     }
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
@@ -160,6 +179,13 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     ptrace(PTRACE_POKETEXT, pid, (void*)lr_addr, (void*)saved_word);
 
     if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
+        // ── DIAG 4: crash site ───────────────────────────────────────────────
+        pt_regs crash;
+        get_regs(pid, &crash);
+        zerr("DIAG mmap[6]: CRASH — wst=0x%x stopped=%d sig=%d  crash_PC=0x%lx crash_X30=0x%lx crash_X0=0x%lx",
+             wst, WIFSTOPPED(wst), WSTOPSIG(wst),
+             (unsigned long)crash.pc, (unsigned long)crash.regs[30],
+             (unsigned long)crash.regs[0]);
         zerr("remote_mmap: bad stop wst=0x%x stopped=%d sig=%d", wst, WIFSTOPPED(wst), WSTOPSIG(wst));
         set_regs(pid, &orig);
         return 0;
@@ -167,10 +193,9 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
 
     get_regs(pid, &regs);
     uintptr_t result = regs.regs[0];
+    zerr("DIAG mmap[7]: mmap returned 0x%lx", (unsigned long)result);
 
-    // Restore original registers
     set_regs(pid, &orig);
-
     return (result > 0x1000) ? result : 0;
 }
 
