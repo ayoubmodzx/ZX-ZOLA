@@ -55,7 +55,8 @@ using FnGLColor   = void(*)(Color* c);
 using FnGLPush    = void(*)();
 using FnGLPop     = void(*)();
 using FnGLLoadOrtho = void(*)();
-using FnW2S       = Vec3(*)(void* cam, Vec3* worldPos);
+using FnW2S       = Vec3(*)(void* cam, Vec3* worldPos);                 // Unity pre-2019 (1-param)
+using FnW2S_v2    = void(*)(void* cam, Vec3* worldPos, int eye, Vec3* out); // Unity 2019+ (3-param injected)
 using FnGetMain   = void*(*)();      // Camera.get_main()
 using FnGetWidth  = int(*)();        // Screen.get_width()
 using FnGetHeight = int(*)();        // Screen.get_height()
@@ -68,7 +69,8 @@ static FnGLColor     g_glColor   = nullptr;
 static FnGLPush      g_glPush    = nullptr;
 static FnGLPop       g_glPop     = nullptr;
 static FnGLLoadOrtho g_glOrtho   = nullptr;
-static FnW2S         g_w2s       = nullptr;
+static FnW2S         g_w2s       = nullptr;   // pre-2019 path
+static FnW2S_v2      g_w2s_v2    = nullptr;   // 2019+ path (Free Fire)
 static FnGetMain     g_getMain   = nullptr;
 static FnGetWidth    g_getW      = nullptr;
 static FnGetHeight   g_getH      = nullptr;
@@ -137,8 +139,17 @@ static int g_sw = 1080, g_sh = 1920;
 // ─────────────────────────────────────────────────────────────────────────────
 
 static bool w2s(void *cam, Vec3 world, Vec2 &out) {
-    if (!g_w2s_valid.load(std::memory_order_acquire) || !g_w2s || !cam) return false;
-    Vec3 r = g_w2s(cam, &world);
+    if (!g_w2s_valid.load(std::memory_order_acquire) || !cam) return false;
+    Vec3 r{};
+    if (g_w2s_v2) {
+        // Unity 2019+: void(Camera*, Vec3* pos, int eye, Vec3* out)
+        // eye=0 → MonoOrStereoscopicEye.Mono
+        g_w2s_v2(cam, &world, 0, &r);
+    } else if (g_w2s) {
+        r = g_w2s(cam, &world);
+    } else {
+        return false;
+    }
     if (r.z <= 0.f) return false;   // behind camera
     out.x = r.x;
     out.y = (float)g_sh - r.y;      // Unity Y is bottom-up; flip to top-down
@@ -580,19 +591,19 @@ void ESP::init() {
     g_glPop     = (FnGLPop)    resolve("UnityEngine.GL::PopMatrix()");
     g_glOrtho   = (FnGLLoadOrtho)resolve("UnityEngine.GL::LoadOrtho()");
 
-    // Camera icalls
-    g_w2s     = (FnW2S)    resolve("UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&,UnityEngine.Camera/MonoOrStereoscopicEye,UnityEngine.Vector3&)");
-    if (!g_w2s)
+    // Camera icalls — try Unity 2019+ (3-param void return) first, fallback to pre-2019
+    g_w2s_v2  = (FnW2S_v2) resolve("UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&,UnityEngine.Camera/MonoOrStereoscopicEye,UnityEngine.Vector3&)");
+    if (!g_w2s_v2)
         g_w2s = (FnW2S)    resolve("UnityEngine.Camera::WorldToScreenPoint_Injected(UnityEngine.Vector3&)");
-    if (g_w2s) g_w2s_valid.store(true, std::memory_order_release);
+    if (g_w2s_v2 || g_w2s) g_w2s_valid.store(true, std::memory_order_release);
     g_getMain = (FnGetMain)resolve("UnityEngine.Camera::get_main()");
 
     // Screen icalls
     g_getW = (FnGetWidth)  resolve("UnityEngine.Screen::get_width()");
     g_getH = (FnGetHeight) resolve("UnityEngine.Screen::get_height()");
 
-    LI("GL icalls: Begin=%p End=%p Vertex3=%p W2S=%p",
-       g_glBegin, g_glEnd, g_glVertex3, g_w2s);
+    LI("GL icalls: Begin=%p End=%p Vertex3=%p W2S=%p W2Sv2=%p",
+       g_glBegin, g_glEnd, g_glVertex3, g_w2s, g_w2s_v2);
 
     // Hook Camera.OnPostRender
     Il2CppClass *camCls = Il2Cpp::cls("Camera");
