@@ -54,19 +54,19 @@ static bool ptrace_detach(pid_t pid) {
     return ptrace(PTRACE_DETACH, pid, nullptr, nullptr) == 0;
 }
 
-static bool get_regs(pid_t pid, struct pt_regs *regs) {
+static bool get_regs(pid_t pid, pt_regs *regs) {
     struct iovec iov = { regs, sizeof(*regs) };
     return ptrace(PTRACE_GETREGSET, pid, (void*)NT_PRSTATUS, &iov) == 0;
 }
 
-static bool set_regs(pid_t pid, struct pt_regs *regs) {
+static bool set_regs(pid_t pid, pt_regs *regs) {
     struct iovec iov = { regs, sizeof(*regs) };
     return ptrace(PTRACE_SETREGSET, pid, (void*)NT_PRSTATUS, &iov) == 0;
 }
 
 // Allocate RWX memory in target process via remote mmap syscall
 static uintptr_t remote_mmap(pid_t pid, size_t size) {
-    struct pt_regs orig, regs;
+    pt_regs orig, regs;
     if (!get_regs(pid, &orig)) return 0;
 
     // Find mmap syscall address in target via maps
@@ -140,7 +140,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     if (!dlopen_addr) { ERR("dlopen not found"); return false; }
 
     // 4. Set up registers for dlopen(path, RTLD_NOW|RTLD_GLOBAL)
-    struct pt_regs orig, regs;
+    pt_regs orig, regs;
     get_regs(pid, &orig);
     memcpy(&regs, &orig, sizeof(regs));
 
