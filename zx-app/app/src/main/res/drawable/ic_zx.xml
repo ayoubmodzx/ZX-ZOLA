@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- ZX Lightning bolt icon -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="48"
+    android:viewportHeight="48">
+    <path
+        android:fillColor="#A855F7"
+        android:pathData="M28,4L12,26H22L20,44L36,22H26L28,4Z"/>
+    <path
+        android:fillColor="#D946EF"
+        android:pathData="M26,4L10,26H20L18,44L34,22H24L26,4Z"
+        android:fillAlpha="0.35"/>
+</vector>

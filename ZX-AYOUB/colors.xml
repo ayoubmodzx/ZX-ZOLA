@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Backgrounds -->
+    <color name="zx_bg">#080810</color>
+    <color name="zx_bg_card">#0F0F1E</color>
+    <color name="zx_surface">#0F0F1E</color>
+    <color name="zx_surface2">#161628</color>
+    <color name="zx_sidebar">#0A0A18</color>
+
+    <!-- Brand / accent -->
+    <color name="zx_purple">#7C4DFF</color>
+    <color name="zx_purple_dark">#5E35B1</color>
+    <color name="zx_accent">#7C4DFF</color>
+    <color name="zx_accent2">#00E5FF</color>
+    <color name="zx_amber">#FFD740</color>
+
+    <!-- Risk -->
+    <color name="zx_safe">#00E676</color>
+    <color name="zx_risk">#FFD740</color>
+    <color name="zx_danger">#FF1744</color>
+
+    <!-- Text -->
+    <color name="zx_text">#FFFFFF</color>
+    <color name="zx_text_sub">#9090B0</color>
+    <color name="zx_text_dim">#9090B0</color>
+    <color name="zx_text_muted">#60607A</color>
+
+    <!-- Borders / dividers -->
+    <color name="zx_border">#1E1E3A</color>
+    <color name="zx_divider">#1E1E3A</color>
+
+    <!-- Glow / tint overlays -->
+    <color name="zx_safe_glow">#2000E676</color>
+    <color name="zx_risk_glow">#20FFD740</color>
+    <color name="zx_danger_glow">#20FF1744</color>
+    <color name="zx_accent_glow">#207C4DFF</color>
+</resources>

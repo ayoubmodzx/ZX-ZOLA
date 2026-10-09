@@ -1,0 +1,3 @@
+-keep class com.zx.zola.** { *; }
+-keepclassmembers class * { native <methods>; }
+-dontwarn **

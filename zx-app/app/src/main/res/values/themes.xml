@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.ZX" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/zx_purple</item>
+        <item name="colorPrimaryVariant">@color/zx_purple_dark</item>
+        <item name="colorOnPrimary">@color/zx_text</item>
+        <item name="colorSurface">@color/zx_bg_card</item>
+        <item name="colorOnSurface">@color/zx_text</item>
+        <item name="android:windowBackground">@color/zx_bg</item>
+        <item name="android:statusBarColor">@color/zx_bg</item>
+        <item name="android:navigationBarColor">@color/zx_bg</item>
+        <item name="materialSwitchStyle">@style/ZxSwitch</item>
+    </style>
+
+    <style name="ZxSwitch" parent="Widget.Material3.CompoundButton.MaterialSwitch">
+        <item name="thumbTint">@color/zx_switch_thumb</item>
+        <item name="trackTint">@color/zx_switch_track</item>
+    </style>
+
+    <!-- Risk slider: amber thumb + track -->
+    <style name="ZxSlider" parent="Widget.Material3.Slider">
+        <item name="thumbColor">@color/zx_amber</item>
+        <item name="trackColorActive">@color/zx_amber</item>
+        <item name="trackColorInactive">@color/zx_text_muted</item>
+        <item name="labelStyle">@style/ZxSliderLabel</item>
+        <item name="thumbRadius">8dp</item>
+        <item name="trackHeight">3dp</item>
+        <item name="haloRadius">16dp</item>
+    </style>
+    <style name="ZxSliderLabel" parent="Widget.Material3.Tooltip">
+        <item name="android:textColor">#FFFFFF</item>
+        <item name="backgroundTint">@color/zx_amber</item>
+    </style>
+
+    <!-- Aim system sliders: purple thumb + track -->
+    <style name="ZxSliderPurple" parent="Widget.Material3.Slider">
+        <item name="thumbColor">@color/zx_purple</item>
+        <item name="trackColorActive">@color/zx_purple</item>
+        <item name="trackColorInactive">@color/zx_text_muted</item>
+        <item name="thumbRadius">8dp</item>
+        <item name="trackHeight">3dp</item>
+        <item name="haloRadius">16dp</item>
+    </style>
+</resources>
