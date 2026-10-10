@@ -11,11 +11,12 @@
 #include <atomic>
 
 #define TAG "ZX-PAYLOAD"
-#ifndef ZX_RELEASE
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
-#else
-#define LOG(...) ((void)0)
-#endif
+
+// Version marker — visible in logcat if this binary actually loaded.
+// If you see "ZX-PAYLOAD: build=v7" the new binary is running.
+// If dlopen still fails you never see this — it means the OLD APK is still installed.
+static const char kBuildTag[] __attribute__((used)) = "ZX-BUILD-v7";
 
 // Control struct — written by injector via /proc/PID/mem.
 // IMPORTANT: struct definition and variable definition are SEPARATE.
@@ -77,6 +78,7 @@ static void *ctrl_loop(void *) {
 // Called when payload is dlopen'd into FF
 __attribute__((constructor(102)))
 static void payload_init() {
+    LOG("build=%s", kBuildTag);
     LOG("ZX-ZOLA payload injected");
     // Anti-detection runs first — before any IL2CPP or feature work
     AntiDetect::install();
