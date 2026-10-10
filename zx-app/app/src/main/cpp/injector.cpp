@@ -858,6 +858,14 @@ int main(int argc, char *argv[]) {
         thaw_threads();
         ptrace_detach(pid);
 
+        // Wipe the tmp file immediately after injection — payload is now inside
+        // FF's process via memfd. The file on disk is no longer needed and ACE
+        // scans /data/local/tmp for recognisable .so names.
+        if (strstr(payload_path, "/data/local/tmp/")) {
+            unlink(payload_path);
+            zerr("main: tmp staging file removed");
+        }
+
         if (!ok) { ERR("Injection failed"); ProcMem::close(); return 4; }
 
         payload_base = ProcMem::findLibBase(pid, "libzx_payload.so");

