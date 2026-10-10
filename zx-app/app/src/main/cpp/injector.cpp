@@ -459,7 +459,7 @@ static uintptr_t find_real_loader_dlopen(int target_pid,
 static bool remote_dlopen(pid_t pid, const char *so_path) {
     size_t path_len     = strlen(so_path) + 1;
     size_t path_aligned = (path_len + 7) & ~(size_t)7;
-    size_t alloc        = path_aligned + 56; // path + 56-byte shellcode
+    size_t alloc        = path_aligned + 120; // path + 72-byte shellcode + 48-byte android_dlextinfo
 
     uintptr_t remote_buf = remote_mmap(pid, alloc);
     if (!remote_buf) { zerr("remote_dlopen: remote_mmap returned 0"); return false; }
@@ -526,25 +526,14 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: linker bases unknown — skipping full scan");
     }
 
-    // 56-byte shellcode calling __loader_dlopen(path, flags, fake_caller) directly.
-    // X2 (fake_caller = dlopen_addr = address inside libdl.so) is pre-loaded in regs
-    // before PTRACE_CONT and is NOT touched by __loader_dlopen at entry (only the
-    // wrapper overwrites X2 with X30; __loader_dlopen reads it as its 3rd argument).
-    //
-    //   [+0 ] LDR X8, #40    — load loader_dlopen_addr from pool at +40
-    //   [+4 ] NOP             — X2 already = dlopen_addr from pre-set regs (fake caller)
-    //   [+8 ] BLR X8          — call __loader_dlopen(X0=path, X1=flags, X2=fake_caller)
-    //   [+12] MOV X19, X0    — save handle (callee-saved)
-    //   [+16] LDR X8, #32    — load dlerror_addr from pool at +48
-    //   [+20] BLR X8          — call dlerror()
-    //   [+24] MOV X1, X0     — dlerror_ptr → X1
-    //   [+28] MOV X0, X19    — handle → X0
-    //   [+32] BRK #0          — stop
-    //   [+36] NOP             — align pool to 8-byte boundary
-    //   [+40] fn_loader_dlopen (8 bytes)
-    //   [+48] fn_dlerror       (8 bytes)
-    // Test: can FF's process open the staged file? Use a remote openat syscall.
+    // ANDROID_DLEXT_USE_LIBRARY_FD fix: call do_dlopen(path, flags, extinfo, caller)
+    // directly with extinfo.flags=0x200 and extinfo.library_fd = fd from openat.
+    // The linker namespace path check runs only when fd==-1 (inside open_library()).
+    // Providing a real fd bypasses that check entirely. Falls back to __loader_dlopen
+    // (no extinfo) if do_dlopen_target is unavailable.
+    // Test: open the staged file in FF's process to capture a valid fd.
     // AT_FDCWD=-100, O_RDONLY=0
+    int64_t saved_fd = -1;
     {
         pt_regs ro, rr; get_regs(pid, &ro); memcpy(&rr, &ro, sizeof(rr));
         rr.pstate &= ~(uint64_t)(3u << 10);
@@ -561,51 +550,85 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
             int64_t fd_ret = (int64_t)rp.regs[0];
             zerr("remote_dlopen: openat test fd=%lld (neg=errno, >=0=ok)", (long long)fd_ret);
             if (fd_ret >= 0) {
-                // close fd via syscall
-                rp.regs[8] = 57; rp.regs[0] = (uint64_t)fd_ret;
-                rp.pc = find_svc_gadget(pid);
-                if (rp.pc && set_regs(pid, &rp)) {
-                    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-                    waitpid(pid, &wst, 0);
-                }
+                saved_fd = fd_ret;
+                zerr("remote_dlopen: fd=%lld kept open for ANDROID_DLEXT_USE_LIBRARY_FD", (long long)saved_fd);
             }
         }
         set_regs(pid, &ro);
     }
     uintptr_t sc_addr = remote_buf + path_aligned;
-    struct { uint32_t insns[10]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
-    sc.insns[0] = 0x58000148u; // LDR X8, #40  (PC=0, target=40, imm19=10)
-    sc.insns[1] = 0xD503201Fu; // NOP           (X2 = dlopen_addr already set in regs)
-    sc.insns[2] = 0xD63F0100u; // BLR X8        (__loader_dlopen(X0,X1,X2))
-    sc.insns[3] = 0xAA0003F3u; // MOV X19, X0   (save handle in callee-saved reg)
-    sc.insns[4] = 0x58000108u; // LDR X8, #32   (PC=16, target=48, imm19=8)
-    sc.insns[5] = 0xD63F0100u; // BLR X8        (dlerror())
-    sc.insns[6] = 0xAA0003E1u; // MOV X1, X0    (dlerror_ptr → X1)
-    sc.insns[7] = 0xAA1303E0u; // MOV X0, X19   (handle → X0)
-    sc.insns[8] = 0xD4200000u; // BRK #0
-    sc.insns[9] = 0xD503201Fu; // NOP            (pool alignment)
-    sc.fn_dlopen  = (uint64_t)loader_dlopen_addr;
-    sc.fn_dlerror = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
 
-    if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
-        zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
+    uintptr_t caller_addr_val;
+    {
+        uintptr_t lb = ProcMem::findLibBase(pid, "libmain.so");
+        caller_addr_val = lb ? lb + 0x1000UL : dlopen_addr;
+        zerr("remote_dlopen: caller_addr=0x%lx", (unsigned long)caller_addr_val);
+    }
+
+    if (do_dlopen_target) {
+        // 72-byte shellcode: 4-arg do_dlopen + android_dlextinfo at sc_addr+72
+        //   [+0 ] LDR X8,#40  — do_dlopen_target at pool[0]+40
+        //   [+4 ] LDR X2,#44  — extinfo_ptr      at pool[1]+48
+        //   [+8 ] LDR X3,#48  — caller_addr       at pool[2]+56
+        //   [+12] BLR X8       — do_dlopen(X0=path,X1=flags,X2=extinfo,X3=caller)
+        //   [+16] MOV X19,X0  — save handle
+        //   [+20] LDR X8,#44  — dlerror_addr      at pool[3]+64
+        //   [+24] BLR X8       — dlerror()
+        //   [+28] MOV X1,X0   [+32] MOV X0,X19   [+36] BRK #0
+        struct { uint32_t insns[10]; uint64_t p0, p1, p2, p3; } sc4;
+        sc4.insns[0] = 0x58000148u; // LDR X8,#40  PC=0  imm19=10
+        sc4.insns[1] = 0x58000162u; // LDR X2,#44  PC=4  imm19=11
+        sc4.insns[2] = 0x58000183u; // LDR X3,#48  PC=8  imm19=12
+        sc4.insns[3] = 0xD63F0100u; // BLR X8
+        sc4.insns[4] = 0xAA0003F3u; // MOV X19,X0
+        sc4.insns[5] = 0x58000168u; // LDR X8,#44  PC=20 imm19=11
+        sc4.insns[6] = 0xD63F0100u; // BLR X8
+        sc4.insns[7] = 0xAA0003E1u; // MOV X1,X0
+        sc4.insns[8] = 0xAA1303E0u; // MOV X0,X19
+        sc4.insns[9] = 0xD4200000u; // BRK #0
+        sc4.p0 = (uint64_t)do_dlopen_target;
+        sc4.p1 = (uint64_t)(sc_addr + 72);
+        sc4.p2 = (uint64_t)caller_addr_val;
+        sc4.p3 = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
+        if (!ProcMem::write(sc_addr, &sc4, sizeof(sc4))) {
+            zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
+        }
+        // android_dlextinfo (48 bytes) at sc_addr+72
+        struct { uint64_t flags; uint64_t raddr; uint64_t rsz;
+                 int32_t rfd; int32_t lfd; int64_t off; uint64_t ns; } ei = {};
+        if (saved_fd >= 0) { ei.flags = 0x200ULL; ei.lfd = (int32_t)saved_fd; }
+        if (!ProcMem::write(sc_addr + 72, &ei, sizeof(ei))) {
+            zerr("remote_dlopen: write extinfo failed errno=%d", errno); return false;
+        }
+        zerr("remote_dlopen: extinfo at sc+72: flags=0x%llx lfd=%d",
+             (unsigned long long)ei.flags, ei.lfd);
+    } else {
+        // Fallback: 56-byte shellcode calling __loader_dlopen (no extinfo fd bypass)
+        struct { uint32_t insns[10]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
+        sc.insns[0] = 0x58000148u; // LDR X8,#40
+        sc.insns[1] = 0xD503201Fu; // NOP  (X2=caller pre-set in regs)
+        sc.insns[2] = 0xD63F0100u; // BLR X8
+        sc.insns[3] = 0xAA0003F3u; // MOV X19,X0
+        sc.insns[4] = 0x58000108u; // LDR X8,#32  PC=16 pool=48
+        sc.insns[5] = 0xD63F0100u; // BLR X8
+        sc.insns[6] = 0xAA0003E1u; // MOV X1,X0
+        sc.insns[7] = 0xAA1303E0u; // MOV X0,X19
+        sc.insns[8] = 0xD4200000u; // BRK #0
+        sc.insns[9] = 0xD503201Fu; // NOP
+        sc.fn_dlopen  = (uint64_t)loader_dlopen_addr;
+        sc.fn_dlerror = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
+        if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
+            zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
+        }
     }
 
     pt_regs orig, regs;
     get_regs(pid, &orig);
     memcpy(&regs, &orig, sizeof(regs));
-    regs.pstate &= ~(uint64_t)(3u << 10); // clear PSTATE.BTYPE
-    regs.regs[0] = remote_buf;   // __loader_dlopen arg0: path
-    regs.regs[1] = RTLD_NOW;    // __loader_dlopen arg1: flags
-    // caller_addr: use libmain.so+0x1000 (game namespace) so the linker resolves
-    // the load request in the main app namespace rather than the linker's own namespace.
-    // Fallback to dlopen_addr (libdl.so) if libmain_base is not available.
-    {
-        uintptr_t libmain_base = ProcMem::findLibBase(pid, "libmain.so");
-        regs.regs[2] = libmain_base ? libmain_base + 0x1000 : dlopen_addr;
-        zerr("remote_dlopen: caller_addr=0x%lx (libmain_base=0x%lx)",
-             (unsigned long)regs.regs[2], (unsigned long)libmain_base);
-    }
+    regs.pstate &= ~(uint64_t)(3u << 10);
+    regs.regs[0] = remote_buf;
+    regs.regs[1] = RTLD_NOW;
+    if (!do_dlopen_target) regs.regs[2] = caller_addr_val;
     regs.pc = sc_addr;
 
     if (!set_regs(pid, &regs)) {
@@ -639,24 +662,40 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     if (n_patches > 0)
         zerr("remote_dlopen: re-applied %d ACE hooks after shellcode", n_patches);
 
+    // Capture handle+dlerror from BRK stop state BEFORE any register modifications.
+    uintptr_t handle = 0, err_ptr = 0, stop_pc = 0;
+    {
+        pt_regs post; get_regs(pid, &post);
+        handle  = (uintptr_t)post.regs[0];
+        err_ptr = (uintptr_t)post.regs[1];
+        stop_pc = (uintptr_t)post.pc;
+    }
+    zerr("remote_dlopen: handle=0x%lx dlerror_ptr=0x%lx stop_pc=0x%lx",
+         (unsigned long)handle, (unsigned long)err_ptr, (unsigned long)stop_pc);
+
+    // Close the fd kept open for ANDROID_DLEXT_USE_LIBRARY_FD
+    if (saved_fd >= 0) {
+        pt_regs rcl; get_regs(pid, &rcl);
+        rcl.regs[8] = 57; rcl.regs[0] = (uint64_t)saved_fd;
+        rcl.pc = find_svc_gadget(pid);
+        if (rcl.pc && set_regs(pid, &rcl)) {
+            ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+            int cwst = 0; waitpid(pid, &cwst, 0);
+            zerr("remote_dlopen: closed fd=%lld", (long long)saved_fd);
+        }
+    }
+
     set_regs(pid, &orig);
 
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-        pt_regs crash; get_regs(pid, &crash);
-        zerr("remote_dlopen: bad stop sig=%d crash_PC=0x%lx",
-             WSTOPSIG(status), (unsigned long)crash.pc);
+        zerr("remote_dlopen: bad stop sig=%d stop_pc=0x%lx",
+             WSTOPSIG(status), (unsigned long)stop_pc);
         siginfo_t si = {};
         if (ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si) == 0)
             zerr("remote_dlopen: SIGINFO si_signo=%d si_code=%d si_addr=0x%lx",
                  si.si_signo, si.si_code, (unsigned long)(uintptr_t)si.si_addr);
         return false;
     }
-
-    pt_regs post; get_regs(pid, &post);
-    uintptr_t handle  = (uintptr_t)post.regs[0];
-    uintptr_t err_ptr = (uintptr_t)post.regs[1];
-
-    zerr("remote_dlopen: handle=0x%lx dlerror_ptr=0x%lx", (unsigned long)handle, (unsigned long)err_ptr);
     if (err_ptr) {
         char err_str[256] = {};
         if (ProcMem::read(err_ptr, err_str, sizeof(err_str) - 1))
