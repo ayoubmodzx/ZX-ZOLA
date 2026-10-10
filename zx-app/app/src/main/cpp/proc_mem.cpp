@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <cstdint>
 
 static int g_mem_fd = -1;
 
@@ -72,6 +73,28 @@ uintptr_t ProcMem::findSymbol(int pid, const char *lib_name, const char *sym_nam
     dlclose(handle);
 
     return remote_base + offset;
+}
+
+uintptr_t ProcMem::findCtrlByMagic(int pid) {
+    uintptr_t base = findLibBase(pid, "libzx_payload.so"); // memfd:zx alias handled
+    if (!base) return 0;
+
+    static const uint64_t kTag[2] = {
+        0xDEADBEEFC0DE5A5AULL, 0x5A5AFACE00000012ULL
+    };
+
+    // Scan 4KB chunks with 15-byte overlap to catch boundary-split matches.
+    // .data is usually within the first 2MB; scan up to 8MB to be safe.
+    const size_t CHUNK = 4096;
+    uint8_t buf[CHUNK];
+    for (size_t off = 0; off < 8u * 1024u * 1024u; off += CHUNK - 15u) {
+        if (!read(base + off, buf, CHUNK)) continue;
+        for (size_t i = 0; i + 16u <= CHUNK; i++) {
+            if (memcmp(buf + i, kTag, 16) == 0)
+                return base + off + i + 16u; // ctrl.cmd is 16 bytes after tag
+        }
+    }
+    return 0;
 }
 
 uintptr_t ProcMem::findSymbolFromPath(int pid, const char *remote_lib_name,

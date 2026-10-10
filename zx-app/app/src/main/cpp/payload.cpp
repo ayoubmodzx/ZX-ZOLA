@@ -19,21 +19,25 @@
 static const char kBuildTag[] __attribute__((used)) = "ZX-BUILD-v7";
 
 // Control struct — written by injector via /proc/PID/mem.
-// IMPORTANT: struct definition and variable definition are SEPARATE.
-// Clang applies __attribute__ between '}' and the variable name to the TYPE,
-// not the variable — so a combined "struct { } __attribute__((visibility)) var"
-// leaves the variable itself hidden.  Separating them makes the attribute
-// unambiguously land on the variable, ensuring it appears in .dynsym as DEFINED.
+// NOT exported as a symbol: exporting it caused __g_sdktbl1 to appear as UND
+// in the payload's .dynsym (LLD + NDK r27 bug/quirk), causing dlopen to fail.
+// Instead: injector locates the struct by scanning for the 16-byte magic tag
+// placed immediately before the ctrl fields in __g_block.  No .dynsym entry,
+// no import, dlopen succeeds cleanly.
 struct ZxCtrl {
     std::atomic<int> cmd{0};
     std::atomic<int> enable{0};
     std::atomic<int> intensity{0};
 };
 
-extern "C"
-__attribute__((visibility("default")))
-__attribute__((used))
-ZxCtrl __g_sdktbl1;
+static struct ZxCtrlBlock {
+    volatile uint64_t tag[2];
+    ZxCtrl ctrl;
+} __g_block __attribute__((used)) = {
+    {0xDEADBEEFC0DE5A5AULL, 0x5A5AFACE00000012ULL},
+    {}
+};
+#define __g_sdktbl1 (__g_block.ctrl)
 
 static void *ctrl_loop(void *) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
