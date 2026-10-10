@@ -34,37 +34,47 @@ private:
     AsyncWorker *m_worker = nullptr;
     bool         m_ready  = false;
 
+    // Class pointers — names confirmed from global-metadata.dat (IL2CPP v31)
     struct Classes {
-        Il2CppClass *Player    = nullptr;
-        Il2CppClass *Character = nullptr;
-        Il2CppClass *Health    = nullptr;
-        Il2CppClass *Weapon    = nullptr;
-        Il2CppClass *Bullet    = nullptr;
-        Il2CppClass *Recoil    = nullptr;
-        Il2CppClass *Camera    = nullptr;
-        Il2CppClass *Aim       = nullptr;
-        Il2CppClass *Grass     = nullptr;
-        Il2CppClass *Vehicle   = nullptr;
-        Il2CppClass *Loot      = nullptr;
+        Il2CppClass *GameVarDef       = nullptr;  // game movement/camera config
+        Il2CppClass *WeaponAttachment = nullptr;  // UGCAttachmentRepItem
+        Il2CppClass *WeaponData       = nullptr;  // weapon score/stat class (lazy)
+        Il2CppClass *CharCtrl         = nullptr;  // UnityEngine.CharacterController
+        Il2CppClass *OpSetting        = nullptr;  // OperationSettingInfo
     } m_cls;
 
+    // Fields from GameVarDef — static config, confirmed from global-metadata.dat
     struct Fields {
-        FieldInfo *moveSpeed    = nullptr;
-        FieldInfo *jumpForce    = nullptr;
-        FieldInfo *recoilForce  = nullptr;
-        FieldInfo *bulletSpread = nullptr;
-        FieldInfo *fireRate     = nullptr;
-        FieldInfo *fov          = nullptr;
-        FieldInfo *grassEnable  = nullptr;
-        FieldInfo *maxHealth    = nullptr;
-        FieldInfo *vehicleSpeed = nullptr;
+        FieldInfo *runSpeed        = nullptr;  // RunSpeed
+        FieldInfo *dashSpeedScale  = nullptr;  // DashSpeedScale
+        FieldInfo *crouchSpeed     = nullptr;  // CrouchSpeed
+        FieldInfo *creepSpeed      = nullptr;  // CreepSpeed
+        FieldInfo *stropFov        = nullptr;  // StropFOV
+        FieldInfo *activeSkillFov  = nullptr;  // ActiveSkillCameraFOV
+        // Weapon score data (lazy) — Recoil, RateOfFire, ClipSize, DamageBody, DamageHead
+        FieldInfo *recoil          = nullptr;
+        FieldInfo *rateOfFire      = nullptr;
+        FieldInfo *clipSize        = nullptr;
+        // OperationSettingInfo
+        FieldInfo *aimAssistSetting = nullptr; // AimAssist
     } m_fld;
 
+    // Methods from UGCAttachmentRepItem — property setters (confirmed in metadata)
+    // These are hooked to intercept weapon stat writes
     struct Methods {
-        MethodInfo *calcAimTarget = nullptr;
-        MethodInfo *onFireWeapon  = nullptr;
-        MethodInfo *takeDamage    = nullptr;
+        MethodInfo *setScatterMax      = nullptr;  // set_ScatterMax
+        MethodInfo *setSightAimAssist  = nullptr;  // set_SightAimAssist
+        MethodInfo *setAimAssistSnap   = nullptr;  // set_SightAimAssistSnapRange
+        MethodInfo *setFireInterval    = nullptr;  // set_FireInterval
     } m_mth;
 
     void resolveClasses();
+    void scanWeaponDataClass();
+    void hookWeaponSetters();
+
+public:
+    // State read by static hook trampolines — not part of the external API
+    bool m_noSpread  = false;
+    bool m_aimAssist = false;
+    bool m_rapidFire = false;
 };
