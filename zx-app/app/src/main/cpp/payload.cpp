@@ -18,14 +18,21 @@
 #endif
 
 // Control struct — written by injector via /proc/PID/mem.
-// visibility("default") is REQUIRED: -fvisibility=hidden is the global build flag;
-// without it __g_sdktbl1 has hidden visibility, lives only in .symtab, and the
-// classloader-namespace runtime linker sees it as an unresolved import → dlopen fails.
-extern "C" struct ZxCtrl {
+// IMPORTANT: struct definition and variable definition are SEPARATE.
+// Clang applies __attribute__ between '}' and the variable name to the TYPE,
+// not the variable — so a combined "struct { } __attribute__((visibility)) var"
+// leaves the variable itself hidden.  Separating them makes the attribute
+// unambiguously land on the variable, ensuring it appears in .dynsym as DEFINED.
+struct ZxCtrl {
     std::atomic<int> cmd{0};
     std::atomic<int> enable{0};
     std::atomic<int> intensity{0};
-} __attribute__((visibility("default"))) __attribute__((used)) __g_sdktbl1;
+};
+
+extern "C"
+__attribute__((visibility("default")))
+__attribute__((used))
+ZxCtrl __g_sdktbl1;
 
 static void *ctrl_loop(void *) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
