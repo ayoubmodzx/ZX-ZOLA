@@ -8,22 +8,20 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ─── Class/field/method names confirmed from global-metadata.dat (IL2CPP v31) ─
+// ─── All names confirmed from global-metadata.dat (IL2CPP v31) ───────────────
 //
-// GameVarDef (game movement + camera config class):
-//   RunSpeed, DashSpeedScale, CrouchSpeed, CreepSpeed, StropFOV,
-//   ActiveSkillCameraFOV — all confirmed strings at known string-pool offsets
+// GameVarDef: RunSpeed, DashSpeedScale, CrouchSpeed, CreepSpeed,
+//             StropFOV, ActiveSkillCameraFOV
 //
-// UGCAttachmentRepItem (networked weapon attachment stat component):
-//   Properties (C# auto-props with get_/set_ accessors confirmed in metadata):
-//   ScatterMax, SightAimAssist, SightAimAssistSnapRange, FireInterval,
-//   AmmoClipSize, ReloadSpeed, FastAutoReloadSpeed, SightFOVAmplifyRatio
+// UGCAttachmentRepItem (networked weapon stat component) — hooked setters:
+//   set_ScatterMax, set_ScatterSpeed, set_ScatterSpeedCrouchCreep,
+//   set_SightAimAssist, set_SightAimAssistSnapRange, set_FireInterval,
+//   set_AmmoClipSize, set_FullDamageDistance
 //
-// Weapon score data block (class name resolved lazily):
-//   RateOfFire, ReloadSpeed, ClipSize, Accuracy, Recoil, DamageBody, DamageHead
+// EWeaponScoreID (enum, NOT float fields): RateOfFire, ClipSize, Recoil, ...
 //
-// OperationSettingInfo: AimAssist (user toggle field)
-// ──────────────────────────────────────────────────────────────────────────────
+// OperationSettingInfo: AimAssist
+// ─────────────────────────────────────────────────────────────────────────────
 
 FeatureEngine &FeatureEngine::get() {
     static FeatureEngine instance;
@@ -59,15 +57,17 @@ void FeatureEngine::resolveClasses() {
         m_fld.activeSkillFov = Il2CppApi::getField(m_cls.GameVarDef, "ActiveSkillCameraFOV");
     }
 
-    // ── UGCAttachmentRepItem — weapon attachment stat component
-    //    Property setters confirmed: set_ScatterMax, set_SightAimAssist, set_FireInterval
+    // ── UGCAttachmentRepItem — all setters confirmed from global-metadata.dat
     m_cls.WeaponAttachment = Il2CppApi::getClass(img, "", "UGCAttachmentRepItem");
     if (m_cls.WeaponAttachment) {
-        m_mth.setScatterMax     = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_ScatterMax", 1);
-        m_mth.setSightAimAssist = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_SightAimAssist", 1);
-        m_mth.setAimAssistSnap  = Il2CppApi::getMethod(m_cls.WeaponAttachment,
-                                                        "set_SightAimAssistSnapRange", 1);
-        m_mth.setFireInterval   = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_FireInterval", 1);
+        m_mth.setScatterMax     = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_ScatterMax",              1);
+        m_mth.setScatterSpeed   = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_ScatterSpeed",            1);
+        m_mth.setScatterSpeedCC = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_ScatterSpeedCrouchCreep", 1);
+        m_mth.setSightAimAssist = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_SightAimAssist",          1);
+        m_mth.setAimAssistSnap  = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_SightAimAssistSnapRange", 1);
+        m_mth.setFireInterval   = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_FireInterval",            1);
+        m_mth.setAmmoClipSize   = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_AmmoClipSize",            1);
+        m_mth.setFullDamageDist = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_FullDamageDistance",      1);
         hookWeaponSetters();
     }
 
@@ -83,75 +83,70 @@ void FeatureEngine::resolveClasses() {
          m_fld.runSpeed, m_mth.setScatterMax, m_mth.setSightAimAssist);
 }
 
-// ── Lazily resolve weapon score data class (Recoil, RateOfFire, etc.) ─────────
-void FeatureEngine::scanWeaponDataClass() {
-    if (m_cls.WeaponData) return;
-    Il2CppImage *img = Il2CppApi::getImage("Assembly-CSharp");
-    if (!img) return;
-
-    static const char *kCandidates[] = {
-        "WeaponPropertyScore", "WeaponScoreData", "WeaponStatData",
-        "WeaponSkinData", "WeaponData", nullptr
-    };
-    for (int i = 0; kCandidates[i]; i++) {
-        Il2CppClass *cls = Il2CppApi::getClass(img, "", kCandidates[i]);
-        if (!cls) continue;
-        FieldInfo *recoil = Il2CppApi::getField(cls, "Recoil");
-        if (!recoil) continue;
-        m_cls.WeaponData = cls;
-        m_fld.recoil     = recoil;
-        m_fld.rateOfFire = Il2CppApi::getField(cls, "RateOfFire");
-        m_fld.clipSize   = Il2CppApi::getField(cls, "ClipSize");
-        LOGI("WeaponData resolved: %s (Recoil:%p RateOfFire:%p)",
-             kCandidates[i], m_fld.recoil, m_fld.rateOfFire);
-        break;
-    }
-}
 
 // ── Hook weapon property setters to intercept stat writes ─────────────────────
-// When the game calls set_ScatterMax(x) on any attachment, our hook replaces
-// x with 0 (no spread). Same pattern for aim-assist and fire rate.
 static void *s_origSetScatterMax     = nullptr;
+static void *s_origSetScatterSpeed   = nullptr;
+static void *s_origSetScatterSpeedCC = nullptr;
 static void *s_origSetSightAimAssist = nullptr;
+static void *s_origSetAimAssistSnap  = nullptr;
 static void *s_origSetFireInterval   = nullptr;
+static void *s_origSetAmmoClipSize   = nullptr;
+static void *s_origSetFullDamageDist = nullptr;
 static FeatureEngine *s_engine       = nullptr;
 
+// ScatterMax=0 kills bullet spread; ScatterSpeed=0 stops spread accumulating during fire
 static void hook_setScatterMax(void *self, float val) {
     if (s_engine && s_engine->m_noSpread) val = 0.0f;
-    using Fn = void(*)(void*, float);
-    reinterpret_cast<Fn>(s_origSetScatterMax)(self, val);
+    reinterpret_cast<void(*)(void*, float)>(s_origSetScatterMax)(self, val);
 }
-
+static void hook_setScatterSpeed(void *self, float val) {
+    if (s_engine && s_engine->m_noSpread) val = 0.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetScatterSpeed)(self, val);
+}
+static void hook_setScatterSpeedCC(void *self, float val) {
+    if (s_engine && s_engine->m_noSpread) val = 0.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetScatterSpeedCC)(self, val);
+}
 static void hook_setSightAimAssist(void *self, float val) {
     if (s_engine && s_engine->m_aimAssist) val = 1.0f;
-    using Fn = void(*)(void*, float);
-    reinterpret_cast<Fn>(s_origSetSightAimAssist)(self, val);
+    reinterpret_cast<void(*)(void*, float)>(s_origSetSightAimAssist)(self, val);
 }
-
+static void hook_setAimAssistSnap(void *self, float val) {
+    if (s_engine && s_engine->m_aimAssist) val = 999.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetAimAssistSnap)(self, val);
+}
 static void hook_setFireInterval(void *self, float val) {
     if (s_engine && s_engine->m_rapidFire) val = 0.01f;
-    using Fn = void(*)(void*, float);
-    reinterpret_cast<Fn>(s_origSetFireInterval)(self, val);
+    reinterpret_cast<void(*)(void*, float)>(s_origSetFireInterval)(self, val);
 }
+static void hook_setAmmoClipSize(void *self, int val) {
+    if (s_engine && s_engine->m_rapidFire) val = 999;
+    reinterpret_cast<void(*)(void*, int)>(s_origSetAmmoClipSize)(self, val);
+}
+static void hook_setFullDamageDist(void *self, float val) {
+    if (s_engine && s_engine->m_extendRange) val = 200.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetFullDamageDist)(self, val);
+}
+
+#define HOOK(mth, fn, orig, tag) \
+    if (m_mth.mth && m_mth.mth->methodPointer) \
+        eng.hookAddr(m_mth.mth->methodPointer, (void *)(fn), &(orig), (tag))
 
 void FeatureEngine::hookWeaponSetters() {
     s_engine = this;
     auto &eng = HookEngine::get();
-
-    if (m_mth.setScatterMax && m_mth.setScatterMax->methodPointer)
-        eng.hookAddr(m_mth.setScatterMax->methodPointer,
-                     (void *)hook_setScatterMax, &s_origSetScatterMax, "SetScatterMax");
-
-    if (m_mth.setSightAimAssist && m_mth.setSightAimAssist->methodPointer)
-        eng.hookAddr(m_mth.setSightAimAssist->methodPointer,
-                     (void *)hook_setSightAimAssist, &s_origSetSightAimAssist, "SetSightAA");
-
-    if (m_mth.setFireInterval && m_mth.setFireInterval->methodPointer)
-        eng.hookAddr(m_mth.setFireInterval->methodPointer,
-                     (void *)hook_setFireInterval, &s_origSetFireInterval, "SetFireIntvl");
-
-    LOGI("Weapon setter hooks installed");
+    HOOK(setScatterMax,     hook_setScatterMax,     s_origSetScatterMax,     "ScatterMax");
+    HOOK(setScatterSpeed,   hook_setScatterSpeed,   s_origSetScatterSpeed,   "ScatterSpd");
+    HOOK(setScatterSpeedCC, hook_setScatterSpeedCC, s_origSetScatterSpeedCC, "ScatterCC");
+    HOOK(setSightAimAssist, hook_setSightAimAssist, s_origSetSightAimAssist, "SightAA");
+    HOOK(setAimAssistSnap,  hook_setAimAssistSnap,  s_origSetAimAssistSnap,  "AASnap");
+    HOOK(setFireInterval,   hook_setFireInterval,   s_origSetFireInterval,   "FireIntvl");
+    HOOK(setAmmoClipSize,   hook_setAmmoClipSize,   s_origSetAmmoClipSize,   "ClipSize");
+    HOOK(setFullDamageDist, hook_setFullDamageDist, s_origSetFullDamageDist, "FullDmgDst");
+    LOGI("Weapon setter hooks installed (%zu methods)", sizeof(m_mth)/sizeof(void*));
 }
+#undef HOOK
 
 // ── MOVEMENT ──────────────────────────────────────────────────────────────────
 
@@ -224,15 +219,11 @@ void FeatureEngine::applyNoGrass(bool enable) {
 // ── COMBAT ────────────────────────────────────────────────────────────────────
 
 void FeatureEngine::applyAntiRecoil(bool enable) {
-    // Sets m_noSpread flag — hook_setScatterMax reads it on every setter call
+    // Drives three hooks: ScatterMax, ScatterSpeed, ScatterSpeedCrouchCreep
+    // All confirmed setters on UGCAttachmentRepItem from global-metadata.dat
+    // "Recoil" in the metadata is an EWeaponScoreID enum value, not a float field
     m_noSpread = enable;
-    // Also try static weapon score data if resolved
-    scanWeaponDataClass();
-    if (m_fld.recoil) {
-        float val = enable ? 0.0f : 1.0f;
-        Il2CppApi::setStaticValue(nullptr, m_fld.recoil, &val);
-    }
-    LOGI("AntiRecoil: %s", enable ? "ON" : "OFF");
+    LOGI("AntiRecoil: %s (via ScatterMax/ScatterSpeed hooks)", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyNoSpread(bool enable) {

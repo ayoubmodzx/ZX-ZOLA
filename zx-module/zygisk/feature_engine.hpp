@@ -36,45 +36,45 @@ private:
 
     // Class pointers — names confirmed from global-metadata.dat (IL2CPP v31)
     struct Classes {
-        Il2CppClass *GameVarDef       = nullptr;  // game movement/camera config
-        Il2CppClass *WeaponAttachment = nullptr;  // UGCAttachmentRepItem
-        Il2CppClass *WeaponData       = nullptr;  // weapon score/stat class (lazy)
+        Il2CppClass *GameVarDef       = nullptr;  // GameVarDef — movement/camera config singleton
+        Il2CppClass *WeaponAttachment = nullptr;  // UGCAttachmentRepItem — networked weapon stats
         Il2CppClass *CharCtrl         = nullptr;  // UnityEngine.CharacterController
         Il2CppClass *OpSetting        = nullptr;  // OperationSettingInfo
     } m_cls;
 
-    // Fields from GameVarDef — static config, confirmed from global-metadata.dat
+    // Fields — all confirmed from global-metadata.dat string pool
     struct Fields {
+        // GameVarDef movement fields
         FieldInfo *runSpeed        = nullptr;  // RunSpeed
         FieldInfo *dashSpeedScale  = nullptr;  // DashSpeedScale
         FieldInfo *crouchSpeed     = nullptr;  // CrouchSpeed
         FieldInfo *creepSpeed      = nullptr;  // CreepSpeed
+        // GameVarDef camera fields
         FieldInfo *stropFov        = nullptr;  // StropFOV
         FieldInfo *activeSkillFov  = nullptr;  // ActiveSkillCameraFOV
-        // Weapon score data (lazy) — Recoil, RateOfFire, ClipSize, DamageBody, DamageHead
-        FieldInfo *recoil          = nullptr;
-        FieldInfo *rateOfFire      = nullptr;
-        FieldInfo *clipSize        = nullptr;
         // OperationSettingInfo
         FieldInfo *aimAssistSetting = nullptr; // AimAssist
     } m_fld;
 
     // Methods from UGCAttachmentRepItem — property setters (confirmed in metadata)
-    // These are hooked to intercept weapon stat writes
     struct Methods {
-        MethodInfo *setScatterMax      = nullptr;  // set_ScatterMax
-        MethodInfo *setSightAimAssist  = nullptr;  // set_SightAimAssist
-        MethodInfo *setAimAssistSnap   = nullptr;  // set_SightAimAssistSnapRange
-        MethodInfo *setFireInterval    = nullptr;  // set_FireInterval
+        MethodInfo *setScatterMax           = nullptr;  // set_ScatterMax
+        MethodInfo *setScatterSpeed         = nullptr;  // set_ScatterSpeed
+        MethodInfo *setScatterSpeedCC       = nullptr;  // set_ScatterSpeedCrouchCreep
+        MethodInfo *setSightAimAssist       = nullptr;  // set_SightAimAssist
+        MethodInfo *setAimAssistSnap        = nullptr;  // set_SightAimAssistSnapRange
+        MethodInfo *setFireInterval         = nullptr;  // set_FireInterval
+        MethodInfo *setAmmoClipSize         = nullptr;  // set_AmmoClipSize
+        MethodInfo *setFullDamageDist       = nullptr;  // set_FullDamageDistance
     } m_mth;
 
     void resolveClasses();
-    void scanWeaponDataClass();
     void hookWeaponSetters();
 
 public:
     // State read by static hook trampolines — not part of the external API
-    bool m_noSpread  = false;
-    bool m_aimAssist = false;
-    bool m_rapidFire = false;
+    bool  m_noSpread    = false;
+    bool  m_aimAssist   = false;
+    bool  m_rapidFire   = false;
+    bool  m_extendRange = false;
 };
