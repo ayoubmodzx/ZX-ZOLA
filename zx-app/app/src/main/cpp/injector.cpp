@@ -802,6 +802,19 @@ int main(int argc, char *argv[]) {
     // Check if payload is already loaded in target
     uintptr_t payload_base = ProcMem::findLibBase(pid, "libzx_payload.so");
 
+    // Original payload path on disk (never deleted — tmp staging copy is separate).
+    // Used by findSymbolFromPath to resolve __g_sdktbl1's offset from the ELF file.
+    char payload_path_orig[512] = {};
+    if (argc >= 5 && argv[4][0] != '\0') {
+        strncpy(payload_path_orig, argv[4], sizeof(payload_path_orig) - 1);
+    } else {
+        char argv0[512];
+        strncpy(argv0, argv[0], sizeof(argv0) - 1);
+        argv0[sizeof(argv0) - 1] = '\0';
+        snprintf(payload_path_orig, sizeof(payload_path_orig),
+                 "%s/libzx_payload.so", dirname(argv0));
+    }
+
     if (!payload_base) {
         // First activation — inject the payload
         char payload_path[512];
@@ -873,8 +886,11 @@ int main(int argc, char *argv[]) {
     }
 
     // Send command to payload via shared memory flag
-    // The payload polls a small control struct it mmap'd at a known offset
-    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, "libzx_payload.so", "__g_sdktbl1");
+    // The payload polls a small control struct it mmap'd at a known offset.
+    // findSymbolFromPath resolves the offset from the on-disk .so and adds it
+    // to the remote base found in /proc/maps (which shows "memfd:zx", not the soname).
+    uintptr_t ctrl_addr = ProcMem::findSymbolFromPath(
+        pid, "libzx_payload.so", "__g_sdktbl1", payload_path_orig);
     if (ctrl_addr) {
         // Write enable (+4) and intensity (+8) before cmd (+0) so the payload never
         // reads a non-zero cmd with stale enable/intensity values (write-ordering fix)

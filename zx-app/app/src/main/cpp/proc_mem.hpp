@@ -25,4 +25,10 @@ namespace ProcMem {
 
     // Find a specific symbol offset inside a library using /proc/PID/mem
     uintptr_t findSymbol(int pid, const char *lib_name, const char *sym_name);
+
+    // Like findSymbol but loads the symbol offset from a known local path instead
+    // of relying on the soname being in the injector's linker namespace.
+    // Use this for memfd-injected libs that appear as "memfd:zx" in /proc/maps.
+    uintptr_t findSymbolFromPath(int pid, const char *remote_lib_name,
+                                 const char *sym_name, const char *local_path);
 }

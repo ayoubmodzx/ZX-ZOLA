@@ -38,9 +38,14 @@ uintptr_t ProcMem::findLibBase(int pid, const char *lib_name) {
     char   line[512];
     uintptr_t base = 0;
 
+    // memfd-injected payload shows up as "/memfd:zx (deleted)" in maps,
+    // not as "libzx_payload.so".  Accept either form.
+    const char *alt_name = nullptr;
+    if (strcmp(lib_name, "libzx_payload.so") == 0) alt_name = "memfd:zx";
+
     while (fgets(line, sizeof(line), fp)) {
-        if (!strstr(line, lib_name)) continue;
-        // Only first mapping (text segment)
+        if (!strstr(line, lib_name) && !(alt_name && strstr(line, alt_name))) continue;
+        // Only first executable/read-only mapping (text segment)
         if (!strstr(line, "r-xp") && !strstr(line, "r--p")) continue;
         sscanf(line, "%lx", &base);
         break;
@@ -50,11 +55,9 @@ uintptr_t ProcMem::findLibBase(int pid, const char *lib_name) {
 }
 
 uintptr_t ProcMem::findSymbol(int pid, const char *lib_name, const char *sym_name) {
-    // 1. Find base in target process
     uintptr_t remote_base = findLibBase(pid, lib_name);
     if (!remote_base) return 0;
 
-    // 2. Load the same .so locally to get the symbol offset
     void *handle = dlopen(lib_name, RTLD_LAZY | RTLD_NOLOAD);
     if (!handle) handle = dlopen(lib_name, RTLD_LAZY);
     if (!handle) return 0;
@@ -62,11 +65,32 @@ uintptr_t ProcMem::findSymbol(int pid, const char *lib_name, const char *sym_nam
     void *local_sym = dlsym(handle, sym_name);
     if (!local_sym) { dlclose(handle); return 0; }
 
-    // 3. Local base of same lib
     Dl_info info;
     dladdr(local_sym, &info);
     uintptr_t local_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+    uintptr_t offset = reinterpret_cast<uintptr_t>(local_sym) - local_base;
+    dlclose(handle);
 
+    return remote_base + offset;
+}
+
+uintptr_t ProcMem::findSymbolFromPath(int pid, const char *remote_lib_name,
+                                      const char *sym_name, const char *local_path) {
+    // Remote base: findLibBase already handles the "libzx_payload.so" → "memfd:zx" alias
+    uintptr_t remote_base = findLibBase(pid, remote_lib_name);
+    if (!remote_base) return 0;
+
+    // Load local copy by path (not soname) so this works even if the injector
+    // never had the lib in its own linker namespace (e.g. after memfd injection).
+    void *handle = dlopen(local_path, RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) return 0;
+
+    void *local_sym = dlsym(handle, sym_name);
+    if (!local_sym) { dlclose(handle); return 0; }
+
+    Dl_info info;
+    dladdr(local_sym, &info);
+    uintptr_t local_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
     uintptr_t offset = reinterpret_cast<uintptr_t>(local_sym) - local_base;
     dlclose(handle);
 
