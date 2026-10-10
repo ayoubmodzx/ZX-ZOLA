@@ -170,6 +170,9 @@ static void install_ffutil_bypass() {
 static constexpr int   MAX_FAKE_FDS = 32;
 static std::atomic<int> g_fds[MAX_FAKE_FDS];
 
+enum PType { P_NONE, P_MAPS, P_SMAPS, P_STATUS };
+static PType fd_ptype[MAX_FAKE_FDS];
+
 static void fd_add(int fd) {
     for (int i = 0; i < MAX_FAKE_FDS; i++) {
         int exp = -1;
@@ -179,11 +182,10 @@ static void fd_add(int fd) {
 static void fd_del(int fd) {
     for (int i = 0; i < MAX_FAKE_FDS; i++) {
         int exp = fd;
-        g_fds[i].compare_exchange_strong(exp, -1);
+        if (g_fds[i].compare_exchange_strong(exp, -1))
+            fd_ptype[i] = P_NONE;
     }
 }
-
-enum PType { P_NONE, P_MAPS, P_SMAPS, P_STATUS };
 
 static PType classify(const char *path) {
     if (!path || strncmp(path, "/proc/", 6) != 0) return P_NONE;
@@ -293,8 +295,29 @@ static int build_fake_status(int real_fd) {
     return mfd;
 }
 
-static int (*orig_openat)(int, const char*, int, ...) = nullptr;
-static int (*orig_close)(int)                         = nullptr;
+static int  (*orig_openat)(int, const char*, int, ...) = nullptr;
+static int  (*orig_open)(const char*, int, ...)        = nullptr;
+static FILE*(*orig_fopen)(const char*, const char*)    = nullptr;
+static int  (*orig_close)(int)                         = nullptr;
+
+static int open_proc_path(const char *path, int flags) {
+    if (orig_openat)
+        return orig_openat(AT_FDCWD, path, flags);
+    return (int)syscall(__NR_openat, AT_FDCWD, path, flags);
+}
+
+static int dispatch_proc_fd(int rfd, PType pt) {
+    int mfd = -1;
+    switch (pt) {
+        case P_MAPS:   mfd = build_fake_maps(rfd);   break;
+        case P_SMAPS:  mfd = build_fake_smaps(rfd);  break;
+        case P_STATUS: mfd = build_fake_status(rfd); break;
+        default: return rfd;
+    }
+    if (mfd < 0) return -1;
+    fd_add(mfd);
+    return mfd;
+}
 
 static int hook_openat(int dirfd, const char *path, int flags, ...) {
     int rfd;
@@ -310,17 +333,41 @@ static int hook_openat(int dirfd, const char *path, int flags, ...) {
         rfd = (int)syscall(__NR_openat, dirfd, path, flags);
     }
     if (rfd < 0) return rfd;
+    PType pt = classify(path);
+    return dispatch_proc_fd(rfd, pt);
+}
 
-    int mfd = -1;
-    switch (classify(path)) {
-        case P_MAPS:   mfd = build_fake_maps(rfd);   break;
-        case P_SMAPS:  mfd = build_fake_smaps(rfd);  break;
-        case P_STATUS: mfd = build_fake_status(rfd); break;
-        default: return rfd;
+static int hook_open(const char *path, int flags, ...) {
+    int rfd;
+    if (orig_open) {
+        if (flags & O_CREAT) {
+            va_list ap; va_start(ap, flags);
+            mode_t m = va_arg(ap, mode_t); va_end(ap);
+            rfd = orig_open(path, flags, m);
+        } else {
+            rfd = orig_open(path, flags);
+        }
+    } else {
+        rfd = open_proc_path(path, flags);
     }
-    if (mfd < 0) return -1;
-    fd_add(mfd);
-    return mfd;
+    if (rfd < 0) return rfd;
+    PType pt = classify(path);
+    return dispatch_proc_fd(rfd, pt);
+}
+
+static FILE *hook_fopen(const char *path, const char *mode) {
+    PType pt = classify(path);
+    if (pt == P_NONE) {
+        return orig_fopen ? orig_fopen(path, mode) : nullptr;
+    }
+    // open the real fd, build a sanitised memfd, wrap it in FILE*
+    int rfd = open_proc_path(path, O_RDONLY);
+    if (rfd < 0) return orig_fopen ? orig_fopen(path, mode) : nullptr;
+    int mfd = dispatch_proc_fd(rfd, pt);
+    if (mfd < 0) return nullptr;
+    FILE *fp = fdopen(mfd, "r");
+    if (!fp) { close(mfd); return nullptr; }
+    return fp;
 }
 
 static int hook_close(int fd) {
@@ -328,19 +375,98 @@ static int hook_close(int fd) {
     return orig_close ? orig_close(fd) : (int)syscall(__NR_close, fd);
 }
 
+// ── dl_iterate_phdr hook: hide our injected payload from module scanner ───────
+#include <link.h>
+static int (*orig_dl_iterate_phdr)(int(*)(struct dl_phdr_info*, size_t, void*), void*) = nullptr;
+
+struct DlIterCtx {
+    int  (*cb)(struct dl_phdr_info*, size_t, void*);
+    void *data;
+};
+
+static int dl_iter_filter(struct dl_phdr_info *info, size_t sz, void *arg) {
+    auto *ctx = reinterpret_cast<DlIterCtx*>(arg);
+    const char *name = info->dlpi_name ? info->dlpi_name : "";
+
+    // Hide our payload by name patterns
+    OBF_DECODE(pay,  "libzx_payload.so");
+    OBF_DECODE(pfx,  "zx_payload");
+    OBF_DECODE(mfd1, "memfd:zx");
+    OBF_DECODE(tmp1, "zxpl_");
+    if (strstr(name, pay)  || strstr(name, pfx) ||
+        strstr(name, mfd1) || strstr(name, tmp1))
+        return 0;  // skip — invisible to caller
+
+    // Also hide anonymous maps that belong to our RWX trampoline pool
+    if (name[0] == '\0' && info->dlpi_phdr) {
+        uintptr_t load_addr = info->dlpi_addr;
+        if (addr_is_ours(load_addr)) return 0;
+    }
+
+    return ctx->cb(info, sz, ctx->data);
+}
+
+static int hook_dl_iterate_phdr(int (*cb)(struct dl_phdr_info*, size_t, void*), void *data) {
+    DlIterCtx ctx = { cb, data };
+    if (orig_dl_iterate_phdr)
+        return orig_dl_iterate_phdr(dl_iter_filter, &ctx);
+    return dl_iterate_phdr(dl_iter_filter, &ctx);
+}
+
+// ── tp_syscall_imp hook (libanort Tencent syscall shim) ───────────────────────
+// Signature: long tp_syscall_imp(long nr, long a0, long a1, long a2, long a3, long a4, long a5)
+static long (*orig_tp_syscall)(long,long,long,long,long,long,long) = nullptr;
+
+static long hook_tp_syscall(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
+    // Intercept openat(__NR_openat=56) calls targeting /proc paths
+    if (nr == 56) {
+        const char *path = reinterpret_cast<const char*>(a1);
+        PType pt = (path && path[0] == '/') ? classify(path) : P_NONE;
+        if (pt != P_NONE) {
+            long rfd = orig_tp_syscall ? orig_tp_syscall(nr,a0,a1,a2,a3,a4,a5)
+                                       : syscall(nr,a0,a1,a2,a3,a4,a5);
+            if (rfd < 0) return rfd;
+            int mfd = dispatch_proc_fd((int)rfd, pt);
+            return mfd >= 0 ? mfd : -1;
+        }
+    }
+    return orig_tp_syscall ? orig_tp_syscall(nr,a0,a1,a2,a3,a4,a5)
+                           : syscall(nr,a0,a1,a2,a3,a4,a5);
+}
+
 static void install_proc_hider() {
-    for (int i = 0; i < MAX_FAKE_FDS; i++) g_fds[i].store(-1);
+    for (int i = 0; i < MAX_FAKE_FDS; i++) { g_fds[i].store(-1); fd_ptype[i] = P_NONE; }
 
     OBF_DECODE(libc, "libc.so");
     void *h = dlopen(libc, RTLD_LAZY | RTLD_NOLOAD);
     if (!h) h = dlopen(libc, RTLD_LAZY);
     if (!h) { LE("L2: libc not found"); return; }
 
-    void *fn_oa = dlsym(h, "openat");
-    void *fn_cl = dlsym(h, "close");
-    if (fn_oa) DobbyHook(fn_oa, (void*)hook_openat, (void**)&orig_openat);
-    if (fn_cl) DobbyHook(fn_cl, (void*)hook_close,  (void**)&orig_close);
-    LI("L2 /proc hider OK (maps+smaps+status, TracerPid=0)");
+    auto hk = [&](const char *sym, void *rep, void **orig_out) {
+        void *a = dlsym(h, sym);
+        if (a) DobbyHook(a, rep, orig_out);
+    };
+
+    hk("openat",  (void*)hook_openat, (void**)&orig_openat);
+    hk("open",    (void*)hook_open,   (void**)&orig_open);
+    hk("fopen",   (void*)hook_fopen,  (void**)&orig_fopen);
+    hk("close",   (void*)hook_close,  (void**)&orig_close);
+    // Also hook the hardened libc variants that ACE imports
+    hk("__openat_2", (void*)hook_openat, nullptr);
+    hk("__open_2",   (void*)hook_open,   nullptr);
+    // dl_iterate_phdr — module scanner bypass
+    void *fn_phdr = dlsym(RTLD_DEFAULT, "dl_iterate_phdr");
+    if (fn_phdr) DobbyHook(fn_phdr, (void*)hook_dl_iterate_phdr, (void**)&orig_dl_iterate_phdr);
+
+    // tp_syscall_imp in libanort.so — Tencent's direct syscall shim
+    OBF_DECODE(anort, "libanort.so");
+    void *hrt = dlopen(anort, RTLD_LAZY | RTLD_NOLOAD);
+    if (hrt) {
+        void *tpsysc = dlsym(hrt, "tp_syscall_imp");
+        if (tpsysc) DobbyHook(tpsysc, (void*)hook_tp_syscall, (void**)&orig_tp_syscall);
+    }
+
+    LI("L2 /proc hider OK (maps+smaps+status, dl_iterate_phdr, tp_syscall, TracerPid=0)");
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -446,6 +572,18 @@ static void install_anosdk_extended(void *h) {
             LI("L3 internal hook: %s", k_internal[i]);
         }
     }
+
+    // Block libanort unwind/stack-inspect exports used for call-chain hooking detection
+    OBF_DECODE(anort_s, "libanort.so");
+    void *hrt2 = dlopen(anort_s, RTLD_LAZY | RTLD_NOLOAD);
+    if (hrt2) {
+        static const char *k_rt[] = { "unwind_xx_ioctl", "unwind_xx_info_query", nullptr };
+        for (int i = 0; k_rt[i]; i++) {
+            void *a = dlsym(hrt2, k_rt[i]);
+            if (a) { DobbyHook(a, (void*)hook_ScanNullify, nullptr); found++; }
+        }
+    }
+
     LI("L3 AnoSDK extended OK (%d internal hooks)", found);
 }
 
