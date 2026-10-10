@@ -1,5 +1,5 @@
 /*
- * stealth_ext3.cpp — Layers 18–27: Deep syscall surface hardening
+ * stealth_ext3.cpp — Layers 18–30: Deep syscall surface hardening
  *
  * Binary analysis findings addressed here:
  *
@@ -38,7 +38,13 @@
  * Layer 24: getauxval filter — AT_SECURE=0, scrub hook-revealing vals
  * Layer 25: /proc/self/status fd tracker — multi-read coherent spoof
  * Layer 26: ms_hook_opcode scanner NOP-patch (MOV W0,#0 / RET)
- * Layer 27: direct SVC openat in libanogs.so — pattern-scan + DobbyHook
+ * Layer 27: direct SVC openat  — MOVZ x8,#56  + SVC #0 @ 0x3f02b0
+ * Layer 28: direct SVC read    — MOVZ x8,#63  + SVC #0 @ 0x3f02d0
+ * Layer 29: direct SVC kill    — MOVZ x8,#62  + SVC #0 @ 0x3f0270
+ * Layer 30: direct SVC mincore — MOVZ x8,#232 + SVC #0 @ 0x3f01e0
+ *   (All stubs are frameless leaves — DobbyHook at MOVZ itself.)
+ *   Redirected through already-hooked libc symbols so upstream
+ *   layers (TracerPid spoof, kill gate, mincore spoof) fire naturally.
  */
 
 #include "stealth_ext3.hpp"
@@ -77,6 +83,12 @@
 #endif
 #ifndef __NR_readlinkat
 #define __NR_readlinkat 78
+#endif
+#ifndef __NR_kill
+#define __NR_kill 62
+#endif
+#ifndef __NR_mincore
+#define __NR_mincore 232
 #endif
 
 #define TAG "ZX-STX3"
@@ -561,80 +573,119 @@ static int find_scanner_offsets(uintptr_t lib_base, size_t lib_sz,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Layer 27 — direct SVC openat in libanogs.so
+// Layers 27-30 — direct SVC stub hooks (libanogs.so frameless leaf table)
 //
-// libanogs.so has a single bare MOVZ x8,#56 / SVC #0 sequence at file offset
-// 0x3f02b0 that bypasses every libc PLT hook we install (Layers 1, 2, 18).
-// It is the ONLY such sequence in the entire library — 8-byte pattern is unique.
+// Binary decode of 0x3f01e0-0x3f02e4 reveals eight tiny stubs, one per NR:
+//   NR=232 mincore   NR=167 prctl   NR=57 close   NR=62 kill
+//   NR=226 mprotect  NR=56  openat  NR=63 read    (+ generic syscall relay)
+// Each is MOVZ x8,#NR / SVC #0 / error-check / RET — no frame.
+// Dobby hooks the MOVZ (function entry) so the trampoline overwrites it.
 //
-// Fix: scan libanogs text at runtime, walk back to function entry, DobbyHook
-// the entry to redirect through the already-hooked libc openat so that our
-// /proc/self/maps sanitiser and TracerPid spoof run automatically.
+// Redirect strategy: call dlsym(RTLD_DEFAULT, sym) which resolves to Dobby's
+// trampoline for the already-hooked libc symbol, so every upstream layer
+// (TracerPid spoof, kill gate, etc.) fires without duplicating logic here.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// {MOVZ x8, #56 (LE)}  {SVC #0 (LE)}
-static const uint8_t k_svc_openat_pat[8] = {
-    0x08, 0x07, 0x80, 0xd2,
-    0x01, 0x00, 0x00, 0xd4
-};
+// Generic stub finder: scan for an 8-byte MOVZ+SVC pattern and return
+// the hook entry-point VA.  All stubs here are frameless — we hook the
+// MOVZ itself rather than walking back to an STP frame entry.
+static uintptr_t find_svc_stub(uintptr_t lib_base, size_t lib_sz,
+                                const uint8_t pat[8]) {
+    if (!lib_base || lib_sz < 8) return 0;
+    uintptr_t end = lib_base + lib_sz - 8;
+    for (uintptr_t p = lib_base; p <= end; p += 4) {
+        if (__builtin_memcmp((void*)p, pat, 8) == 0) {
+            // Try STP X29,X30 walk-back first; fall back to MOVZ for leaves.
+            uintptr_t back = (p >= lib_base + 512) ? p - 512 : lib_base;
+            for (uintptr_t q = p; q >= back; q -= 4) {
+                uint32_t instr;
+                __builtin_memcpy(&instr, (void*)q, 4);
+                if ((instr & 0xFFC07FFF) == 0xA9807BFD) return q;
+            }
+            return p;  // frameless leaf — hook MOVZ directly
+        }
+    }
+    return 0;
+}
 
+// ── Layer 27: direct SVC openat (NR=56) ─────────────────────────────────────
+static const uint8_t k_svc_openat_pat[8] = {
+    0x08, 0x07, 0x80, 0xd2,   // MOVZ x8, #56
+    0x01, 0x00, 0x00, 0xd4    // SVC  #0
+};
 using FnOpenatSvc = int(*)(int, const char*, int, ...);
 static FnOpenatSvc g_orig_direct_svc_openat = nullptr;
 
-// Redirects through the hooked libc openat so Layers 2 and 18 fire naturally,
-// sanitising /proc/self/maps and spoofing TracerPid without duplicating logic.
 static int hook_direct_svc_openat(int dirfd, const char *path, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list ap; va_start(ap, flags);
         mode = va_arg(ap, int); va_end(ap);
     }
-    // dlsym(DEFAULT, "openat") resolves to the hooked libc symbol (Dobby has
-    // already overwritten the first instructions with a trampoline), so calling
-    // through it runs our full Layer 2 / 18 filtering chain.
     static FnOpenatSvc s_libc_openat = nullptr;
     if (!s_libc_openat) {
         void *sym = dlsym(RTLD_DEFAULT, "openat");
         s_libc_openat = sym ? (FnOpenatSvc)sym : nullptr;
     }
     if (s_libc_openat) return s_libc_openat(dirfd, path, flags, mode);
-    // Last-resort: raw syscall (no filtering, but at least doesn't crash)
     return (int)syscall(__NR_openat, dirfd, path, flags, mode);
 }
 
-// Returns the function entry VA containing the SVC openat pattern, or 0.
-static uintptr_t find_direct_svc_openat_fn(uintptr_t lib_base, size_t lib_sz) {
-    if (!lib_base || lib_sz < 8) return 0;
-    uintptr_t end = lib_base + lib_sz - 8;
+// ── Layer 28: direct SVC read (NR=63) ────────────────────────────────────────
+static const uint8_t k_svc_read_pat[8] = {
+    0xe8, 0x07, 0x80, 0xd2,   // MOVZ x8, #63
+    0x01, 0x00, 0x00, 0xd4    // SVC  #0
+};
+using FnReadSvc = ssize_t(*)(int, void*, size_t);
+static FnReadSvc g_orig_direct_svc_read = nullptr;
 
-    // 1. Find unique 8-byte pattern (4-byte aligned scan)
-    uintptr_t svc_va = 0;
-    for (uintptr_t p = lib_base; p <= end; p += 4) {
-        if (__builtin_memcmp((void*)p, k_svc_openat_pat, 8) == 0) {
-            svc_va = p;
-            break;
-        }
+static ssize_t hook_direct_svc_read(int fd, void *buf, size_t count) {
+    // Resolve once — points at Dobby trampoline for libc read (Layer 18b).
+    static FnReadSvc s_libc_read = nullptr;
+    if (!s_libc_read) {
+        void *sym = dlsym(RTLD_DEFAULT, "read");
+        s_libc_read = sym ? (FnReadSvc)sym : nullptr;
     }
-    if (!svc_va) return 0;
+    if (s_libc_read) return s_libc_read(fd, buf, count);
+    return (ssize_t)syscall(__NR_read, fd, buf, count);
+}
 
-    // 2. Walk back up to 512 bytes looking for ARM64 function entry.
-    //    Standard frame entry: STP X29, X30, [SP, #-imm]!
-    //    Encoding fixed bits:  (instr & 0xFFC07FFF) == 0xA9807BFD
-    uintptr_t back = (svc_va >= lib_base + 512) ? svc_va - 512 : lib_base;
-    for (uintptr_t q = svc_va; q >= back; q -= 4) {
-        uint32_t instr;
-        __builtin_memcpy(&instr, (void*)q, 4);
-        if ((instr & 0xFFC07FFF) == 0xA9807BFD) {
-            LI("L27: fn entry found via STP walk: base+0x%lx",
-               (unsigned long)(q - lib_base));
-            return q;
-        }
+// ── Layer 29: direct SVC kill (NR=62) ────────────────────────────────────────
+static const uint8_t k_svc_kill_pat[8] = {
+    0xc8, 0x07, 0x80, 0xd2,   // MOVZ x8, #62
+    0x01, 0x00, 0x00, 0xd4    // SVC  #0
+};
+using FnKillSvc = int(*)(pid_t, int);
+static FnKillSvc g_orig_direct_svc_kill = nullptr;
+
+static int hook_direct_svc_kill(pid_t pid, int sig) {
+    static FnKillSvc s_libc_kill = nullptr;
+    if (!s_libc_kill) {
+        void *sym = dlsym(RTLD_DEFAULT, "kill");
+        s_libc_kill = sym ? (FnKillSvc)sym : nullptr;
     }
+    if (s_libc_kill) return s_libc_kill(pid, sig);
+    return (int)syscall(__NR_kill, pid, sig);
+}
 
-    // 3. No frame entry found — likely a frameless leaf.  Hook the MOVZ itself.
-    LI("L27: no STP frame found; hooking MOVZ at base+0x%lx",
-       (unsigned long)(svc_va - lib_base));
-    return svc_va;
+// ── Layer 30: direct SVC mincore (NR=232) ────────────────────────────────────
+static const uint8_t k_svc_mincore_pat[8] = {
+    0x08, 0x1d, 0x80, 0xd2,   // MOVZ x8, #232
+    0x01, 0x00, 0x00, 0xd4    // SVC  #0
+};
+using FnMincoreSvc = int(*)(void*, size_t, unsigned char*);
+static FnMincoreSvc g_orig_direct_svc_mincore = nullptr;
+
+// Return all pages as resident — hides RWX hooks and injected pages from
+// AnoSDK's mincore-based page-residency detector.
+static int hook_direct_svc_mincore(void *addr, size_t length,
+                                    unsigned char *vec) {
+    (void)addr;
+    if (vec && length > 0) {
+        size_t pages = (length + 4095u) / 4096u;
+        __builtin_memset(vec, 1, pages);
+    }
+    return 0;
 }
 
 static void *scanner_patch_thread(void*) {
@@ -674,20 +725,39 @@ static void *scanner_patch_thread(void*) {
            patched, n, (unsigned long)ano_base);
     }
 
-    // ── Layer 27: DobbyHook the direct SVC openat function ───────────────────
-    uintptr_t fn27 = find_direct_svc_openat_fn(ano_base, lib_sz);
-    if (!fn27) {
-        LE("L27: direct SVC openat not found — pattern not in mapped range");
-    } else {
-        int r = DobbyHook((void*)fn27,
-                          (void*)hook_direct_svc_openat,
-                          (void**)&g_orig_direct_svc_openat);
+    // Helper: find stub + DobbyHook in one call; logs success/fail.
+    struct SvcLayer {
+        int          layer;
+        const uint8_t *pat;
+        void         *hook_fn;
+        void        **orig_out;
+        const char   *sym_name; // for log only
+    };
+    const SvcLayer svc_layers[] = {
+        { 27, k_svc_openat_pat,  (void*)hook_direct_svc_openat,
+                                  (void**)&g_orig_direct_svc_openat,  "openat"  },
+        { 28, k_svc_read_pat,    (void*)hook_direct_svc_read,
+                                  (void**)&g_orig_direct_svc_read,    "read"    },
+        { 29, k_svc_kill_pat,    (void*)hook_direct_svc_kill,
+                                  (void**)&g_orig_direct_svc_kill,    "kill"    },
+        { 30, k_svc_mincore_pat, (void*)hook_direct_svc_mincore,
+                                  (void**)&g_orig_direct_svc_mincore, "mincore" },
+    };
+    for (const auto &sl : svc_layers) {
+        uintptr_t fn = find_svc_stub(ano_base, lib_sz, sl.pat);
+        if (!fn) {
+            LE("L%d: direct SVC %s — pattern not in mapped range",
+               sl.layer, sl.sym_name);
+            continue;
+        }
+        int r = DobbyHook((void*)fn, sl.hook_fn, sl.orig_out);
         if (r == 0)
-            LI("L27: direct SVC openat hooked @ %p (base+0x%lx)",
-               (void*)fn27, (unsigned long)(fn27 - ano_base));
+            LI("L%d: direct SVC %s hooked @ %p (base+0x%lx)",
+               sl.layer, sl.sym_name, (void*)fn,
+               (unsigned long)(fn - ano_base));
         else
-            LE("L27: DobbyHook failed for direct SVC openat @ %p (err=%d)",
-               (void*)fn27, r);
+            LE("L%d: DobbyHook failed for direct SVC %s @ %p (err=%d)",
+               sl.layer, sl.sym_name, (void*)fn, r);
     }
 
     return nullptr;
@@ -768,5 +838,5 @@ void install_stealth_ext3() {
     // patches ms_hook_opcode scanner entry to MOV W0,#0 / RET
     launch_scanner_patch();
 
-    LI("L18-27 installed: openat/read/close/ioctl/execve/getenv/uname/statfs/getauxval + scanner-nop + svc-openat-hook");
+    LI("L18-30 installed: openat/read/close/ioctl/execve/getenv/uname/statfs/getauxval + scanner-nop + svc-openat/read/kill/mincore hooks (deferred)");
 }
