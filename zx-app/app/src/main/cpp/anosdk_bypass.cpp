@@ -63,6 +63,7 @@ static void install_ano_bypass() {
     // lambda already falls through to DobbySymbolResolver (dl_iterate_phdr
     // + ELF scan) which finds symbols across namespace boundaries.
     void *h = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) dlerror(); // consume RTLD_NOLOAD failure — prevents stale error reaching injector's dlerror read
 
     // Helper: resolve sym, hook if found
     auto hook = [&](const char *sym, void *replacement, void **orig) {
