@@ -596,7 +596,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         // android_dlextinfo (48 bytes) at sc_addr+72
         struct { uint64_t flags; uint64_t raddr; uint64_t rsz;
                  int32_t rfd; int32_t lfd; int64_t off; uint64_t ns; } ei = {};
-        if (saved_fd >= 0) { ei.flags = 0x200ULL; ei.lfd = (int32_t)saved_fd; }
+        if (saved_fd >= 0) { ei.flags = 0x10ULL; ei.lfd = (int32_t)saved_fd; }  // ANDROID_DLEXT_USE_LIBRARY_FD=0x10
         if (!ProcMem::write(sc_addr + 72, &ei, sizeof(ei))) {
             zerr("remote_dlopen: write extinfo failed errno=%d", errno); return false;
         }
