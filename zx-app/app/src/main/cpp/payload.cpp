@@ -8,7 +8,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/prctl.h>
-#include <atomic>
+#include <stdatomic.h>
 
 #define TAG "ZX-PAYLOAD"
 #ifndef ZX_RELEASE
@@ -17,12 +17,17 @@
 #define LOG(...) ((void)0)
 #endif
 
-// Control struct — written by injector via /proc/PID/mem
+// Control struct — written by injector via /proc/PID/mem.
+// visibility("default") is REQUIRED: -fvisibility=hidden is the global build flag;
+// without this override the symbol is hidden in .symtab only and the classloader
+// namespace linker sees it as an unresolved import, failing the dlopen.
+// _Atomic int (C11) is used instead of std::atomic to avoid any C++ template
+// external-symbol dependencies that could surface under -nostdlib++.
 extern "C" struct ZxCtrl {
-    std::atomic<int> cmd{0};
-    std::atomic<int> enable{0};
-    std::atomic<int> intensity{0}; // 0-100, for risk slider features
-} __g_sdktbl1;
+    _Atomic int cmd;
+    _Atomic int enable;
+    _Atomic int intensity;
+} __attribute__((visibility("default"))) __attribute__((used)) __g_sdktbl1 = {0, 0, 0};
 
 static void *ctrl_loop(void *) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
@@ -44,10 +49,10 @@ static void *ctrl_loop(void *) {
     int  last_cmd_seen  = 0;
     bool last_enable    = false;
     while (true) {
-        int cmd = __g_sdktbl1.cmd.load(std::memory_order_acquire);
+        int cmd = atomic_load_explicit(&__g_sdktbl1.cmd, memory_order_acquire);
         if (cmd != 0) {
-            bool en        = __g_sdktbl1.enable.load(std::memory_order_relaxed) != 0;
-            int  intensity = __g_sdktbl1.intensity.load(std::memory_order_relaxed);
+            bool en        = atomic_load_explicit(&__g_sdktbl1.enable,     memory_order_relaxed) != 0;
+            int  intensity = atomic_load_explicit(&__g_sdktbl1.intensity,  memory_order_relaxed);
 
             bool state_changed     = (cmd != last_cmd_seen) || (en != last_enable);
             bool intensity_changed = (intensity != last_intensity) || state_changed;
@@ -55,14 +60,14 @@ static void *ctrl_loop(void *) {
             if (state_changed)
                 Features::apply(cmd, en);
             if (intensity_changed)
-                Features::applyIntensity(cmd, intensity); // handles intensity=0 correctly
+                Features::applyIntensity(cmd, intensity);
 
-            last_cmd_seen  = en ? cmd : 0; // reset so re-enable fires apply() again
+            last_cmd_seen  = en ? cmd : 0;
             last_enable    = en;
             last_intensity = intensity;
-            __g_sdktbl1.cmd.store(0, std::memory_order_release);
+            atomic_store_explicit(&__g_sdktbl1.cmd, 0, memory_order_release);
         }
-        usleep(50000); // 50ms poll — negligible CPU
+        usleep(50000);
     }
     return nullptr;
 }
