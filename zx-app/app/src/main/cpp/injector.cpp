@@ -759,7 +759,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         const char *bname = strrchr(so_path, '/');
         bname = bname ? bname + 1 : so_path;
         while (mf && fgets(mline, sizeof(mline), mf))
-            if (strstr(mline, bname)) { in_maps = true; break; }
+            if (strstr(mline, bname) || strstr(mline, "memfd:zx")) { in_maps = true; break; }
         if (mf) fclose(mf);
         zerr("remote_dlopen: maps_check: in_maps=%d basename=%s", in_maps, bname);
     }
@@ -770,9 +770,9 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: __loader_dlopen@0x%lx bytes: %08x %08x %08x %08x",
              (unsigned long)loader_dlopen_addr, ldi[0], ldi[1], ldi[2], ldi[3]);
     }
-    // Valid handle: non-zero AND fits in 32 bits (random obfuscated cookie on Android 10+)
-    // OR the library simply appeared in maps (handle may be a cookie that looks like -4)
-    bool ok = (handle != 0 && handle <= 0xFFFFFFFFULL) || in_maps;
+    // Valid handle: non-zero (64-bit on Android 10+, no 32-bit limit)
+    // OR library appeared in maps (memfd injection: handle is real but > 32 bits)
+    bool ok = handle != 0 || in_maps;
     if (!ok)
         zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d", (unsigned long)handle, in_maps);
     return ok;

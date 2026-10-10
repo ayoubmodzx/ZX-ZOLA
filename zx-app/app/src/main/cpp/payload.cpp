@@ -43,6 +43,11 @@ static void *ctrl_loop(void *) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
     sleep(3);
 
+    // Install after dlopen call stack is fully unwound — hooking libc functions
+    // (open/close/dl_iterate_phdr) during dlopen execution corrupts the call stack
+    // and causes SIGSEGV with non-canonical PC.
+    AntiDetect::install();
+
     if (!Il2Cpp::init()) {
         LOG("Il2Cpp init failed");
         return nullptr;
@@ -84,8 +89,6 @@ __attribute__((constructor(102)))
 static void payload_init() {
     LOG("build=%s", kBuildTag);
     LOG("ZX-ZOLA payload injected");
-    // Anti-detection runs first — before any IL2CPP or feature work
-    AntiDetect::install();
     pthread_t t;
     pthread_create(&t, nullptr, ctrl_loop, nullptr);
     pthread_detach(t);
