@@ -526,12 +526,9 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: linker bases unknown — skipping full scan");
     }
 
-    // ANDROID_DLEXT_USE_LIBRARY_FD fix: call do_dlopen(path, flags, extinfo, caller)
-    // directly with extinfo.flags=0x200 and extinfo.library_fd = fd from openat.
-    // The linker namespace path check runs only when fd==-1 (inside open_library()).
-    // Providing a real fd bypasses that check entirely. Falls back to __loader_dlopen
-    // (no extinfo) if do_dlopen_target is unavailable.
-    // Test: open the staged file in FF's process to capture a valid fd.
+    // ANDROID_DLEXT_USE_LIBRARY_FD (0x10): call do_dlopen with extinfo.library_fd.
+    // Linker uses the fd for file I/O instead of re-opening by path — bypasses
+    // namespace path checks. fd is later bounced to a memfd to bypass noexec mount.
     // AT_FDCWD=-100, O_RDONLY=0
     int64_t saved_fd = -1;
     {
@@ -557,6 +554,53 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         set_regs(pid, &ro);
     }
     uintptr_t sc_addr = remote_buf + path_aligned;
+
+    // Bounce the tmp file through a memfd to bypass /data/local/tmp noexec mount.
+    // mmap(PROT_EXEC, fd) from a noexec-mounted file → EACCES on segment 2.
+    // memfd pages are not filesystem-backed so the kernel never checks noexec.
+    if (saved_fd >= 0) {
+        uintptr_t svc = find_svc_gadget(pid);
+        if (svc) {
+            // Write memfd name into sc_addr scratch area (overwritten by shellcode later)
+            const char mfd_name[] = "zx";
+            ProcMem::write(sc_addr, mfd_name, sizeof(mfd_name));
+
+            // Helper: run one SVC in FF's process, restore registers, return x0
+            auto do_svc = [&](uint64_t nr,
+                              uint64_t a0 = 0, uint64_t a1 = 0,
+                              uint64_t a2 = 0, uint64_t a3 = 0) -> int64_t {
+                pt_regs ro, rr; get_regs(pid, &ro); memcpy(&rr, &ro, sizeof(rr));
+                rr.pstate &= ~(uint64_t)(3u << 10);
+                rr.regs[8]=nr; rr.regs[0]=a0; rr.regs[1]=a1;
+                rr.regs[2]=a2; rr.regs[3]=a3;
+                rr.pc = svc;
+                if (!set_regs(pid, &rr)) { set_regs(pid, &ro); return -EINVAL; }
+                ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+                int wst=0; waitpid(pid, &wst, 0);
+                pt_regs rp; get_regs(pid, &rp);
+                set_regs(pid, &ro);
+                return (int64_t)rp.regs[0];
+            };
+
+            // memfd_create(name, MFD_EXEC|MFD_CLOEXEC=0x11)
+            // Kernel <6.3 doesn't know MFD_EXEC → EINVAL; retry with MFD_CLOEXEC=1
+            int64_t mfd = do_svc(279, sc_addr, 0x11u);
+            if (mfd < 0 && mfd > -4096)
+                mfd = do_svc(279, sc_addr, 1u);
+            zerr("remote_dlopen: memfd_create ret=%lld", (long long)mfd);
+
+            if (mfd >= 0) {
+                // sendfile(memfd, tmpfd, NULL, 64MB) — copies entire payload
+                int64_t sf = do_svc(71, (uint64_t)mfd, (uint64_t)saved_fd, 0, 64u*1024*1024);
+                zerr("remote_dlopen: sendfile(memfd=%lld, tmpfd=%lld) ret=%lld",
+                     (long long)mfd, (long long)saved_fd, (long long)sf);
+                do_svc(62, (uint64_t)mfd, 0, 0);  // lseek(memfd, 0, SEEK_SET)
+                do_svc(57, (uint64_t)saved_fd);    // close tmp fd
+                saved_fd = mfd;
+                zerr("remote_dlopen: using memfd=%lld (no-noexec, exec-mappable)", (long long)saved_fd);
+            }
+        }
+    }
 
     uintptr_t caller_addr_val;
     {
