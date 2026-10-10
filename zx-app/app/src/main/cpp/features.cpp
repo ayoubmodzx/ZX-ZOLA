@@ -153,48 +153,55 @@ static Il2CppClass *findClassByFields(const FieldPattern *p, int n, const char *
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void discoverClasses() {
-    g_cls.playerState = Il2Cpp::cls("CSPlayerState");
-    if (g_cls.playerState) LOG("CSPlayerState OK");
-    else ERR("CSPlayerState not found");
+    // Confirmed from global-metadata.dat analysis: main player class is COW.GamePlay::Player
+    g_cls.playerState = Il2Cpp::cls("Player", "COW.GamePlay");
+    if (g_cls.playerState) LOG("COW.GamePlay::Player OK");
+    else ERR("COW.GamePlay::Player not found — god mode / damage hook won't work");
 
+    // Weapon fire class: most weapon data fields are obfuscated in this build.
+    // Try known unobfuscated field combos first; fall back to single-field scan.
     static const char *kFireNames[][3] = {
-        {"fireRate",    "recoilX",    "recoilY"},
-        {"FireRate",    "RecoilX",    "RecoilY"},
-        {"m_fireRate",  "m_recoilH",  "m_recoilV"},
-        {"fireInterval","kickX",      "kickY"},
+        {"FireInterval", "Damage",   nullptr},   // AccumulateDamageEvent has FireInterval
+        {"fireInterval", "damage",   nullptr},
+        {"fireRate",     "recoilX",  "recoilY"}, // legacy — won't find in this build
+        {"FireRate",     "RecoilX",  "RecoilY"},
         {nullptr, nullptr, nullptr}
     };
     for (int i = 0; kFireNames[i][0] && !g_cls.weaponFire; i++) {
-        FieldPattern pat[] = {
+        int nPat = kFireNames[i][2] ? 3 : 2;
+        FieldPattern pat[3] = {
             {kFireNames[i][0], &g_cls.offFireRate},
             {kFireNames[i][1], &g_cls.offRecoilH},
             {kFireNames[i][2], &g_cls.offRecoilV},
         };
-        g_cls.weaponFire = findClassByFields(pat, 3, "weaponFire");
-        if (g_cls.weaponFire) {
-            static const char *kS[] = {"spread","Spread","bulletSpread","disperseAngle",nullptr};
-            for (const char **s = kS; *s; s++) {
-                FieldInfo *f = Il2Cpp::getField(g_cls.weaponFire, *s);
-                if (f && Il2Cpp::fieldTypeId(f) == IL2CPP_TYPE_R4) {
-                    g_cls.offSpread = Il2Cpp::fieldOffset(f); break;
-                }
+        g_cls.weaponFire = findClassByFields(pat, nPat, "weaponFire");
+    }
+    if (g_cls.weaponFire) {
+        static const char *kS[] = {"Spread","spread","bulletSpread","disperseAngle",nullptr};
+        for (const char **s = kS; *s; s++) {
+            FieldInfo *f = Il2Cpp::getField(g_cls.weaponFire, *s);
+            if (f && Il2Cpp::fieldTypeId(f) == IL2CPP_TYPE_R4) {
+                g_cls.offSpread = Il2Cpp::fieldOffset(f); break;
             }
         }
+        // Ammo fields on weapon class (names vary by build)
+        static const char *kAmmo[]   = {"Ammo","ammo","m_curBulletNum","curBullet",nullptr};
+        static const char *kMaxAmmo[]= {"MaxAmmo","maxAmmo","m_maxBulletNum","maxBullet","Magazine",nullptr};
+        static const char *kReload[] = {"reloadTime","ReloadTime","m_reloadTime","ReloadDuration",nullptr};
+        for (const char **n = kAmmo;    *n; n++) if (auto *f = Il2Cpp::getField(g_cls.weaponFire, *n)) { g_cls.offAmmo      = Il2Cpp::fieldOffset(f); break; }
+        for (const char **n = kMaxAmmo; *n; n++) if (auto *f = Il2Cpp::getField(g_cls.weaponFire, *n)) { g_cls.offMaxAmmo   = Il2Cpp::fieldOffset(f); break; }
+        for (const char **n = kReload;  *n; n++) if (auto *f = Il2Cpp::getField(g_cls.weaponFire, *n)) { g_cls.offReloadTime= Il2Cpp::fieldOffset(f); break; }
     }
 
-    // Ammo fields
-    if (g_cls.weaponFire) {
-        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_curBulletNum"))  g_cls.offAmmo       = Il2Cpp::fieldOffset(f);
-        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_maxBulletNum"))  g_cls.offMaxAmmo    = Il2Cpp::fieldOffset(f);
-        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_reloadTime"))    g_cls.offReloadTime = Il2Cpp::fieldOffset(f);
-    }
-    // Health fields
-    g_cls.healthCls = Il2Cpp::cls("CSCharacterHealth");
-    if (!g_cls.healthCls) g_cls.healthCls = Il2Cpp::cls("PlayerHealth");
-    if (g_cls.healthCls) {
-        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_curHp"))     g_cls.offHP        = Il2Cpp::fieldOffset(f);
-        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_maxHp"))     g_cls.offMaxHP     = Il2Cpp::fieldOffset(f);
-        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_isKnocked")) g_cls.offIsKnocked = Il2Cpp::fieldOffset(f);
+    // Health: COW.GamePlay::Player has TakeDamage + get_CurHP/get_MaxHP property getters.
+    // No separate health class exists in this build — direct HP fields are obfuscated.
+    // God mode and anti-damage work via TakeDamage hook on Player (see hookAntiDamage).
+    g_cls.healthCls = g_cls.playerState;
+    // offHP / offMaxHP remain -1 (no direct field access); use property getter invoke instead.
+    // offIsKnocked: try IsFrozenKnockDown field on Player (confirmed in metadata)
+    if (g_cls.playerState) {
+        if (auto *f = Il2Cpp::getField(g_cls.playerState, "IsFrozenKnockDown"))
+            g_cls.offIsKnocked = Il2Cpp::fieldOffset(f);
     }
 
     g_cls.ready = true;
@@ -265,17 +272,22 @@ struct RiskClasses {
 static RiskClasses g_risk;
 
 static void discoverRiskClasses() {
-    static const char *kMoveNames[][2] = {
-        {"moveSpeed", "jumpForce"}, {"MoveSpeed", "JumpForce"},
-        {"m_moveSpeed", "m_jumpForce"}, {"speed", "jumpHeight"},
-        {nullptr, nullptr}
-    };
-    for (int i = 0; kMoveNames[i][0] && !g_risk.playerMove; i++) {
+    // Confirmed from metadata: COW.GamePlay::VerticleViewPlayer has MoveSpeed field (index 7)
+    // No jumpForce field exists in this game build — offJumpForce stays -1
+    g_risk.playerMove = Il2Cpp::cls("VerticleViewPlayer", "COW.GamePlay");
+    if (g_risk.playerMove) {
+        if (auto *f = Il2Cpp::getField(g_risk.playerMove, "MoveSpeed"))
+            g_risk.offMoveSpeed = Il2Cpp::fieldOffset(f);
+        g_risk.offJumpForce = -1;
+        LOG("VerticleViewPlayer OK  MoveSpeed offset=%d", g_risk.offMoveSpeed);
+    } else {
+        // fallback: scan any class that has both MoveSpeed and IsFiring (confirmed VerticleViewPlayer fields)
         FieldPattern pat[] = {
-            {kMoveNames[i][0], &g_risk.offMoveSpeed},
-            {kMoveNames[i][1], &g_risk.offJumpForce},
+            {"MoveSpeed", &g_risk.offMoveSpeed},
+            {"IsFiring",  nullptr},
         };
-        g_risk.playerMove = findClassByFields(pat, 2, "playerMove");
+        g_risk.playerMove = findClassByFields(pat, 2, "playerMove-fallback");
+        g_risk.offJumpForce = -1;
     }
 
     static const char *kVeh[][2] = {
@@ -532,11 +544,21 @@ static void hookTakeDamage(void *self, float dmg, void *info) {
 }
 
 static void hookAntiDamage() {
-    static const char *kCls[] = {
-        "CSPlayerState","PlayerHealth","HealthSystem","PlayerHP","CharacterHealth",nullptr
+    // Confirmed from metadata: TakeDamage is at method offset 3 on COW.GamePlay::Player
+    // Attempt direct lookup first before generic name scan
+    struct CandEntry { const char *name; const char *ns; };
+    static const CandEntry kCls[] = {
+        {"Player",         "COW.GamePlay"},
+        {"VerticleViewPlayer", "COW.GamePlay"},
+        {"CSPlayerState",  ""},
+        {"PlayerHealth",   ""},
+        {"HealthSystem",   ""},
+        {"PlayerHP",       ""},
+        {"CharacterHealth",""},
+        {nullptr,          nullptr}
     };
-    for (const char **cn = kCls; *cn; cn++) {
-        Il2CppClass *c = Il2Cpp::cls(*cn);
+    for (const CandEntry *ce = kCls; ce->name; ce++) {
+        Il2CppClass *c = Il2Cpp::cls(ce->name, ce->ns);
         if (!c) continue; // LE-4: never fall back to playerState — wrong class
         static const char *kMeth[] = {
             "TakeDamage","OnTakeDamage","ReceiveDamage","ApplyDamage","HurtPlayer",nullptr
@@ -547,7 +569,7 @@ static void hookAntiDamage() {
                 void *orig = nullptr;
                 DobbyHook(m->methodPointer, (void*)hookTakeDamage, &orig);
                 g_origTakeDamage = (FnTakeDamage)orig;
-                LOG("Hooked damage: %s::%s @ %p", *cn, *mn, m->methodPointer);
+                LOG("Hooked damage: %s::%s @ %p", ce->name, *mn, m->methodPointer);
                 return;
             }
         }
@@ -557,7 +579,8 @@ static void hookAntiDamage() {
 static void hookRiskFeatures() {
     discoverRiskClasses();
     if (g_risk.playerMove) {
-        static const char *kUpd[] = {"Update","FixedUpdate","Move","OnMove",nullptr};
+        // Confirmed: VerticleViewPlayer has OnFixedUpdate[31] and LateUpdate[32]
+        static const char *kUpd[] = {"OnFixedUpdate","LateUpdate","OnUpdate","Update","FixedUpdate","Move","OnMove",nullptr};
         for (const char **mn = kUpd; *mn; mn++) {
             MethodInfo *m = Il2Cpp::getMethod(g_risk.playerMove, *mn, 0);
             if (m && m->methodPointer) {
@@ -814,16 +837,25 @@ void Features::init() {
     }
     // NW-2: Auto Revive — find StartRevive method pointer without double-hooking
     {
-        static const char *kRevCls[] = {"CSPlayerState","PlayerController","CharacterRevive",nullptr};
-        for (const char **cn = kRevCls; *cn; cn++) {
-            Il2CppClass *c = Il2Cpp::cls(*cn);
+        // Confirmed from metadata: DoRevive is method[56] on COW.GamePlay::VerticleViewPlayer
+        struct RevEntry { const char *name; const char *ns; };
+        static const RevEntry kRevCls[] = {
+            {"VerticleViewPlayer", "COW.GamePlay"},
+            {"Player",             "COW.GamePlay"},
+            {"CSPlayerState",      ""},
+            {"PlayerController",   ""},
+            {"CharacterRevive",    ""},
+            {nullptr,              nullptr}
+        };
+        for (const RevEntry *re = kRevCls; re->name; re++) {
+            Il2CppClass *c = Il2Cpp::cls(re->name, re->ns);
             if (!c) continue;
-            static const char *kRev[] = {"StartRevive","DoRevive","ReviveMate","RevivePlayer","TryRevive",nullptr};
+            static const char *kRev[] = {"DoRevive","StartRevive","ReviveMate","RevivePlayer","TryRevive",nullptr};
             for (const char **mn = kRev; *mn; mn++) {
                 MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
                 if (m && m->methodPointer) {
                     g_origStartRevive = (StartReviveFn)m->methodPointer;
-                    LOG("StartRevive found: %s::%s @ %p", *cn, *mn, m->methodPointer);
+                    LOG("StartRevive found: %s::%s @ %p", re->name, *mn, m->methodPointer);
                     goto rev_done;
                 }
             }
