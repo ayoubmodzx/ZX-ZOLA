@@ -30,6 +30,10 @@ target_link_libraries(zx_payload log dl GLESv3 EGL)
 # not resolve libc++_shared.so for external libraries.  Bundle the C++ runtime
 # statically so the .so has zero libc++ DT_NEEDED entries.
 target_link_options(zx_payload PRIVATE
+    # Force __g_sdktbl1 into .dynsym even under -fvisibility=hidden + -flto.
+    # The attribute on the declaration is correct but LTO can still drop the
+    # export; --export-dynamic-symbol guarantees it survives the link pass.
+    -Wl,--export-dynamic-symbol=__g_sdktbl1
     -nostdlib++
     -l:libc++_static.a
     -l:libc++abi.a
