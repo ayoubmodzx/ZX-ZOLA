@@ -695,8 +695,20 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: restored %d/%d ACE hooks before shellcode", actually_patched, n_patches);
 
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
+    int status = 0;
+    // Loop until the shellcode hits BRK #0 (SIGTRAP).
+    // Background threads can deliver SIGCHLD (dying fork child) or other
+    // async signals to the tracee while dlopen runs.  Each non-SIGTRAP
+    // ptrace-stop means the shellcode was interrupted, not finished.
+    // We suppress the signal (pass 0) and CONT — dlopen resumes in-place.
+    for (int _wi = 0; _wi < 64; ++_wi) {
+        waitpid(pid, &status, 0);
+        if (!WIFSTOPPED(status)) break;        // process died — bad
+        if (WSTOPSIG(status) == SIGTRAP) break; // hit BRK #0
+        zerr("remote_dlopen: non-SIGTRAP stop sig=%d (iter %d), continuing shellcode",
+             WSTOPSIG(status), _wi);
+        ptrace(PTRACE_CONT, pid, nullptr, nullptr); // suppress signal, resume dlopen
+    }
 
     // Re-apply ACE's hook instructions after shellcode stops at BRK #0.
     for (int i = 0; i < n_patches; i++) {
