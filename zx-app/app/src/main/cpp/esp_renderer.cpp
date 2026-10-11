@@ -298,6 +298,20 @@ static FnCamRender g_origOnPostRender = nullptr;
 static void update_hs_target(void *cam);  // defined below
 
 static void hook_OnPostRender(void *cam) {
+    // Log first call so we know the render hook is actually firing
+    static std::atomic<int> s_call_count{0};
+    int n = ++s_call_count;
+    if (n <= 3 || (n % 300) == 0) {
+        pthread_mutex_lock(&g_mu);
+        int cached = g_cache_n;
+        pthread_mutex_unlock(&g_mu);
+        LI("OnPostRender call #%d cam=%p esp_on=%d cache_n=%d w2s_valid=%d",
+           n, cam,
+           (int)g_esp_on.load(std::memory_order_relaxed),
+           cached,
+           (int)g_w2s_valid.load(std::memory_order_relaxed));
+    }
+
     // Call original first
     if (g_origOnPostRender) g_origOnPostRender(cam);
     if (!g_esp_on.load(std::memory_order_relaxed)) return;
@@ -329,11 +343,11 @@ static void hook_OnPostRender(void *cam) {
         // Read cached enemies
         pthread_mutex_lock(&g_mu);
         EnemyData snap[MAX_ENM];
-        int n = g_cache_n;
-        memcpy(snap, g_cache, sizeof(EnemyData) * (size_t)n);
+        int snap_n = g_cache_n;
+        memcpy(snap, g_cache, sizeof(EnemyData) * (size_t)snap_n);
         pthread_mutex_unlock(&g_mu);
 
-        for (int i = 0; i < n; i++) {
+        for (int i = 0; i < snap_n; i++) {
             const EnemyData &e = snap[i];
             if (!e.valid) continue;
 
@@ -493,13 +507,23 @@ static void *position_updater(void *) {
     // s_mGetTransform resolved in resolve_unity_methods() called from ESP::init()
 
     int local_team = -1;
+    int cycle = 0;
 
     while (true) {
         usleep(50000); // 50ms — smooth update, no CPU burn
+        cycle++;
 
         Il2CppObject **players = nullptr;
         int player_count = 0;
+
+        if (cycle <= 5 || (cycle % 20) == 0)
+            LI("updater cycle %d: calling findObjectsOfType", cycle);
+
         Il2Cpp::findObjectsOfType(playerCls, &players, &player_count);
+
+        if (cycle <= 5 || (cycle % 20) == 0)
+            LI("updater cycle %d: findObjectsOfType returned %d players ptr=%p",
+               cycle, player_count, players);
 
         // Update local player reference
         g_local_player = (void*)Il2Cpp::getLocalInstance(playerCls);
@@ -508,6 +532,10 @@ static void *position_updater(void *) {
         // Refresh local team ID each cycle in case squad changes mid-match
         if (g_local_player && team_off > 0)
             local_team = Il2Cpp::readField<int32_t>(g_local_player, team_off);
+
+        if (cycle <= 5 || (cycle % 20) == 0)
+            LI("updater cycle %d: local=%p local_team=%d alive_off=%d team_off=%d",
+               cycle, g_local_player, local_team, alive_off, team_off);
 
         EnemyData new_cache[MAX_ENM];
         int nc = 0;
@@ -525,10 +553,17 @@ static void *position_updater(void *) {
             // Check alive status via cached field offset (no repeated getField call)
             if (alive_off > 0 && !Il2Cpp::readField<bool>((void*)p, alive_off)) continue;
 
+            if (cycle <= 3 || (cycle % 20) == 0)
+                LI("  player[%d]=%p alive OK — calling get_transform", i, p);
+
             // Get transform via cached Component.get_transform
             Il2CppObject *tr = nullptr;
             if (s_mGetTransform && s_mGetTransform->methodPointer)
                 tr = Il2Cpp::invoke0(s_mGetTransform, p);
+
+            if (cycle <= 3 || (cycle % 20) == 0)
+                LI("  player[%d] tr=%p", i, tr);
+
             if (!tr) continue;
 
             EnemyData ed{};
@@ -537,6 +572,7 @@ static void *position_updater(void *) {
             // instead of 36 Il2Cpp::newString() calls every 50ms (GC pressure eliminated)
             BoneCache *bc = lookup_bone_cache((void*)p);
             if (!bc && s_bone_cache_n < MAX_ENM) {
+                LI("  player[%d] new bone cache entry, resolving bones...", i);
                 bc = &s_bone_cache[s_bone_cache_n++];
                 bc->player_ptr = (void*)p;
                 bc->head_b  = find_bone(tr, k_head_names);
@@ -545,6 +581,8 @@ static void *position_updater(void *) {
                 bc->rsh_b   = find_bone(tr, k_rsh_names);
                 bc->lft_b   = find_bone(tr, k_lft_names);
                 bc->rft_b   = find_bone(tr, k_rft_names);
+                LI("  player[%d] bones: head=%p chest=%p lsh=%p rsh=%p lft=%p rft=%p",
+                   i, bc->head_b, bc->chest_b, bc->lsh_b, bc->rsh_b, bc->lft_b, bc->rft_b);
             }
             Il2CppObject *head_b  = bc ? bc->head_b  : nullptr;
             Il2CppObject *chest_b = bc ? bc->chest_b : nullptr;
@@ -565,6 +603,10 @@ static void *position_updater(void *) {
             ed.dist      = dist3(local_pos, root_pos);
             ed.valid     = true;
 
+            if (cycle <= 3 || (cycle % 20) == 0)
+                LI("  player[%d] pos=(%.1f,%.1f,%.1f) dist=%.1fm",
+                   i, root_pos.x, root_pos.y, root_pos.z, ed.dist);
+
             new_cache[nc++] = ed;
         }
 
@@ -572,6 +614,9 @@ static void *position_updater(void *) {
             evict_stale_bone_cache(players, player_count);
             free(players);
         }
+
+        if (cycle <= 5 || (cycle % 20) == 0)
+            LI("updater cycle %d: nc=%d enemies written to cache", cycle, nc);
 
         pthread_mutex_lock(&g_mu);
         memcpy(g_cache, new_cache, sizeof(EnemyData) * (size_t)nc);
@@ -657,16 +702,31 @@ void ESP::init() {
     g_getW = (FnGetWidth)  resolve("UnityEngine.Screen::get_width()");
     g_getH = (FnGetHeight) resolve("UnityEngine.Screen::get_height()");
 
-    LI("GL icalls: Begin=%p End=%p Vertex3=%p W2S=%p W2Sv2=%p",
-       g_glBegin, g_glEnd, g_glVertex3, g_w2s, g_w2s_v2);
+    LI("ESP::init icalls ---");
+    LI("  GL::Begin    = %p", g_glBegin);
+    LI("  GL::End      = %p", g_glEnd);
+    LI("  GL::Vertex3  = %p", g_glVertex3);
+    LI("  GL::Color    = %p", g_glColor);
+    LI("  GL::Push     = %p", g_glPush);
+    LI("  GL::Pop      = %p", g_glPop);
+    LI("  GL::LoadOrtho= %p", g_glOrtho);
+    LI("  W2S_v1       = %p", g_w2s);
+    LI("  W2S_v2       = %p", g_w2s_v2);
+    LI("  w2s_valid    = %d", (int)g_w2s_valid.load());
+    LI("  get_main     = %p", g_getMain);
+    LI("  get_width    = %p", g_getW);
+    LI("  get_height   = %p", g_getH);
 
     // Resolve UnityEngine.Transform/Component methods (namespace required — not in Assembly-CSharp)
     resolve_unity_methods();
 
     // Hook Camera.OnPostRender — Camera is UnityEngine.Camera, namespace "UnityEngine"
     Il2CppClass *camCls = Il2Cpp::cls("Camera", "UnityEngine");
+    LI("ESP::init camCls=%p", camCls);
     if (camCls) {
         MethodInfo *opr = Il2Cpp::getMethod(camCls, "OnPostRender", 0);
+        LI("ESP::init OnPostRender method=%p ptr=%p",
+           opr, opr ? opr->methodPointer : nullptr);
         if (opr && opr->methodPointer) {
             DobbyHook(opr->methodPointer,
                       (void*)hook_OnPostRender,
