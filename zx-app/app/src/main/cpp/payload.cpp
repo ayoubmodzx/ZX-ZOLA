@@ -60,7 +60,10 @@ extern "C" void zx_buf_write(const char *msg) {
 
 static void *ctrl_loop(void *) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
-    sleep(3);
+    // 200ms: dlopen fully unwinds in ~50ms, so this is a 4x margin.
+    // Anti-detect MUST be installed before ACE's maps scanner fires (<100ms after injection).
+    // The old sleep(3) left memfd:zx visible for 3 seconds — ACE killed us in <100ms.
+    usleep(200000);
 
     // Install after dlopen call stack is fully unwound — hooking libc functions
     // (open/close/dl_iterate_phdr) during dlopen execution corrupts the call stack
