@@ -133,6 +133,24 @@ static inline bool is_lethal_sig(int s) {
     return s == SIGKILL || s == SIGABRT || s == SIGTERM;
 }
 
+// Direct inline SVC passthrough — bypasses g_orig_tp_syscall trampoline.
+// g_orig_tp_syscall is broken when injector pre-patches tp_syscall_imp with
+// MOV X0,XZR;RET before dlopen: Dobby saves those bytes as the "original",
+// so every passthrough call via g_orig_tp_syscall silently returns 0.
+// This helper issues SVC #0 directly without touching the Dobby trampoline.
+static __attribute__((always_inline)) long tp_svc_passthrough(
+        long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a1;
+    register long x1 __asm__("x1") = a2;
+    register long x2 __asm__("x2") = a3;
+    register long x3 __asm__("x3") = a4;
+    register long x4 __asm__("x4") = a5;
+    register long x5 __asm__("x5") = a6;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5) : "memory","cc");
+    return x0;
+}
+
 static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
     switch ((int)nr) {
     // ptrace — block entirely
@@ -181,8 +199,7 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
         uintptr_t q_s = (uintptr_t)a1;
         size_t    q_n = (size_t)a2;
         uint8_t  *vec = (uint8_t*)a3;
-        if (!g_orig_tp_syscall) { errno = EFAULT; return -1L; }
-        long r = g_orig_tp_syscall(nr, a1, a2, a3, a4, a5, a6);
+        long r = tp_svc_passthrough(nr, a1, a2, a3, a4, a5, a6);
         // Patch vec: mark any page in our RWX registry as resident
         if (r == 0 && vec) {
             size_t npages = (q_n + 4095) / 4096;
@@ -199,8 +216,7 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
     default: break;
     }
 
-    if (!g_orig_tp_syscall) return -1L;
-    return g_orig_tp_syscall(nr, a1, a2, a3, a4, a5, a6);
+    return tp_svc_passthrough(nr, a1, a2, a3, a4, a5, a6);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

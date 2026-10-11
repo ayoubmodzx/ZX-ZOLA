@@ -530,10 +530,12 @@ static int find_scanner_offsets(uintptr_t lib_base, size_t lib_sz,
 
     uintptr_t str_page = str_va & ~(uintptr_t)0xFFF;
 
-    // 2. Scan code region for ADRP Xn, <str_page>
+    // 2. Scan full code section for ADRP Xn, <str_page>
+    // NOTE: in this libanogs.so version all ADRP refs to the marker string are
+    // ~1.2MB AFTER the string (code at 0x1b6380+, string at 0x8dce4).
+    // Scanning only backward from str_va (old 0x80000 window) finds nothing.
     uintptr_t code_lo = lib_base;
-    uintptr_t code_hi = str_va;
-    if (code_hi - code_lo > 0x80000) code_lo = code_hi - 0x80000;
+    uintptr_t code_hi = lib_base + scan_cap;
 
     int found = 0;
     for (uintptr_t pc = code_lo; pc < code_hi && found < max_out; pc += 4) {
