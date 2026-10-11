@@ -32,6 +32,7 @@
 #include "stealth_ext7.hpp"
 #include "dobby_stub.hpp"
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -57,12 +58,8 @@
 #endif
 
 #define TAG "ZX-ADET"
-#ifndef ZX_RELEASE
-#define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#else
-#define LI(...) ((void)0)
-#define LE(...) ((void)0)
+#define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 #endif
 
 // ═════════════════════════════════════════════════════════════════════════════

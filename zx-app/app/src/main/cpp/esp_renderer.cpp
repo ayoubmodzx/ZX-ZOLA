@@ -34,8 +34,7 @@
 // Math types
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct Vec3  { float x, y, z; };
-struct Color { float r, g, b, a; };
+// Vec2, Vec3, Color from zx_types.hpp (included via esp_renderer.hpp)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Screen-space icall function pointers (world→screen projection + screen size)
@@ -547,6 +546,7 @@ static void *position_updater(void *) {
 
         g_local_player = (void*)Il2Cpp::getLocalInstance(playerCls);
         Vec3 local_pos = get_local_pos();
+        g_local_world_pos = local_pos;
 
         if (g_local_player && team_off > 0)
             local_team = Il2Cpp::readField<int32_t>(g_local_player, team_off);
@@ -645,6 +645,8 @@ static void *position_updater(void *) {
 
 static std::atomic<bool> g_hs_target_valid{false};
 static Vec2              g_hs_target_screen{};
+static Vec3              g_hs_world_head{};
+static Vec3              g_local_world_pos{};
 
 static void update_hs_target(void *cam) {
     if (!g_hs_on.load() || !cam) { g_hs_target_valid = false; return; }
@@ -661,7 +663,7 @@ static void update_hs_target(void *cam) {
         float cx = (float)g_sw * 0.5f;
         float cy = (float)g_sh * 0.5f;
         float d  = sqrtf((s.x-cx)*(s.x-cx) + (s.y-cy)*(s.y-cy));
-        if (d < best_dist) { best_dist = d; best_pos = s; found = true; }
+        if (d < best_dist) { best_dist = d; best_pos = s; found = true; g_hs_world_head = g_cache[i].head; }
     }
     pthread_mutex_unlock(&g_mu);
 
@@ -669,8 +671,10 @@ static void update_hs_target(void *cam) {
     if (found) g_hs_target_screen = best_pos;
 }
 
-Vec2 ESP::getHeadTarget() { return g_hs_target_screen; }
-bool ESP::hasHeadTarget()  { return g_hs_target_valid.load(); }
+Vec2 ESP::getHeadTarget()    { return g_hs_target_screen; }
+bool ESP::hasHeadTarget()    { return g_hs_target_valid.load(); }
+Vec3 ESP::getHeadWorldPos()  { return g_hs_world_head; }
+Vec3 ESP::getLocalPos()      { return g_local_world_pos; }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Init — resolve icalls and install Camera hook

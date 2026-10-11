@@ -39,6 +39,7 @@
 #include "dobby_stub.hpp"
 
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <link.h>          // dl_iterate_phdr, dl_phdr_info
 #include <unistd.h>
@@ -55,13 +56,9 @@
 // dl_iterate_phdr callback type (not defined by name in NDK <link.h>)
 typedef int (*phdr_cb_t)(struct dl_phdr_info *, size_t, void *);
 
-#ifndef ZX_RELEASE
-#define LI(...) __android_log_print(ANDROID_LOG_INFO,  "ZX", __VA_ARGS__)
-#define LE(...) __android_log_print(ANDROID_LOG_ERROR, "ZX", __VA_ARGS__)
-#else
-#define LI(...) ((void)0)
-#define LE(...) ((void)0)
-#endif
+#define TAG "ZX-STX5"
+#define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Payload library name (compile-time XOR so it never appears in .rodata)

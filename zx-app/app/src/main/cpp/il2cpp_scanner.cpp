@@ -2,13 +2,14 @@
 #include <dlfcn.h>
 #include <cstring>
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <unordered_map>
 #include <string>
 #include <pthread.h>
 
 #define TAG "ZX-IL2"
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define ERR(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LOG(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define ERR(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ── il2cpp function pointer table ────────────────────────────────────────────
 

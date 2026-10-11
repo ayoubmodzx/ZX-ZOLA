@@ -14,18 +14,14 @@
  */
 #include "dobby_stub.hpp"
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <cstring>
 #include <cstdio>
 
 #define TAG "ZX-ANO"
-#ifndef ZX_RELEASE
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define ERR(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#else
-#define LOG(...) ((void)0)
-#define ERR(...) ((void)0)
-#endif
+#define LOG(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define ERR(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // Original function pointers
 static int   (*orig_Ioctl)(int,void*,int)            = nullptr;

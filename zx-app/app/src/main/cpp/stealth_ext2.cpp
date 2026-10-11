@@ -14,6 +14,7 @@
 #include "dobby_stub.hpp"
 #include "anti_detect.hpp"
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -36,13 +37,8 @@
 #include <link.h>
 
 #define TAG "ZX-STX2"
-#ifndef ZX_RELEASE
-#define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#else
-#define LI(...) ((void)0)
-#define LE(...) ((void)0)
-#endif
+#define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ARM64 syscall numbers
 #ifndef __NR_ptrace

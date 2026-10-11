@@ -1,7 +1,7 @@
 #pragma once
 #include <cstdint>
+#include "zx_types.hpp"
 
-struct Vec2 { float x, y; };
 struct Il2CppObject;
 
 namespace ESP {
@@ -10,4 +10,6 @@ namespace ESP {
     void setHeadshotAssist(bool on);
     Vec2 getHeadTarget();
     bool hasHeadTarget();
+    Vec3 getHeadWorldPos();  // world-space position of closest visible enemy head
+    Vec3 getLocalPos();      // local player world position (updated every 50ms)
 }

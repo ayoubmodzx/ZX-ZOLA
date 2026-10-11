@@ -8,25 +8,21 @@
 #include "il2cpp_scanner.hpp"
 #include "dobby_stub.hpp"
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <atomic>
 #include <cstring>
 #include <cmath>
 
 #define TAG "ZX-FEAT"
-#ifndef ZX_RELEASE
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define ERR(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#else
-#define LOG(...) ((void)0)
-#define ERR(...) ((void)0)
-#endif
+#define LOG(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define ERR(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Math helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct Vec3 { float x, y, z; };
+// Vec3 from esp_renderer.hpp → zx_types.hpp
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Game class cache
@@ -700,11 +696,20 @@ static GetFireDirFn g_origGetFireDir = nullptr;
 static Vec3 hookGetFireDir(void *self) {
     Vec3 orig = g_origGetFireDir ? g_origGetFireDir(self) : Vec3{0,0,1};
     if (!g_silentAim.load(std::memory_order_relaxed)) return orig;
-    // CE-1: hasHeadTarget/getHeadTarget declared in esp_renderer.hpp
     if (!ESP::hasHeadTarget()) return orig;
-    Vec2 head = ESP::getHeadTarget();
-    (void)head; // screen-space target; aim assist uses head.x, head.y
-    return orig;
+
+    Vec3 head   = ESP::getHeadWorldPos();
+    Vec3 origin = ESP::getLocalPos();
+
+    float dx  = head.x - origin.x;
+    float dy  = head.y - origin.y;
+    float dz  = head.z - origin.z;
+    float len = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (len < 0.5f) return orig;  // sanity: ignore if head is <0.5m away (bad data)
+
+    LOG("SilentAim: origin=(%.1f,%.1f,%.1f) head=(%.1f,%.1f,%.1f) dist=%.1f",
+        origin.x, origin.y, origin.z, head.x, head.y, head.z, len);
+    return Vec3{dx/len, dy/len, dz/len};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
