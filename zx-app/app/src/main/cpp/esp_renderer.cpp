@@ -60,7 +60,7 @@ using FnW2S_v2    = void(*)(void* cam, Vec3* worldPos, int eye, Vec3* out); // U
 using FnGetMain   = void*(*)();      // Camera.get_main()
 using FnGetWidth  = int(*)();        // Screen.get_width()
 using FnGetHeight = int(*)();        // Screen.get_height()
-using FnCamRender = void(*)(void*);  // Camera.OnPostRender(Camera)
+using FnCamRender = void(*)(void*, void*); // Camera.OnPostRender: thisPtr + MethodInfo*
 
 static FnGLBegin     g_glBegin   = nullptr;
 static FnGLEnd       g_glEnd     = nullptr;
@@ -295,9 +295,27 @@ static void gl_restore(const GlSave &s) {
 
 static FnCamRender g_origOnPostRender = nullptr;
 
+// EGL context check — guards raw GL calls in Vulkan-renderer builds.
+// Vulkan renderer: no EGL context is bound on the render thread, any
+// glGet*/glEnable call will segfault or return GL_INVALID_OPERATION.
+static void *s_eglGetCurrentCtxFn = nullptr;
+static bool  s_egl_init            = false;
+
+static bool has_egl_context() {
+    if (!s_egl_init) {
+        s_egl_init = true;
+        void *egl = dlopen("libEGL.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (egl) s_eglGetCurrentCtxFn = dlsym(egl, "eglGetCurrentContext");
+        LI("EGL: lib=%p getCtx=%p", egl, s_eglGetCurrentCtxFn);
+    }
+    if (!s_eglGetCurrentCtxFn) return false;
+    typedef void* (*Fn)();
+    return ((Fn)s_eglGetCurrentCtxFn)() != nullptr;
+}
+
 static void update_hs_target(void *cam);  // defined below
 
-static void hook_OnPostRender(void *cam) {
+static void hook_OnPostRender(void *cam, void *mi) {
     // Log first call so we know the render hook is actually firing
     static std::atomic<int> s_call_count{0};
     int n = ++s_call_count;
@@ -312,13 +330,23 @@ static void hook_OnPostRender(void *cam) {
            (int)g_w2s_valid.load(std::memory_order_relaxed));
     }
 
-    // Call original first
-    if (g_origOnPostRender) g_origOnPostRender(cam);
+    // Call original first — pass MethodInfo* (mi) through so IL2CPP doesn't see garbage x1
+    if (g_origOnPostRender) g_origOnPostRender(cam, mi);
     if (!g_esp_on.load(std::memory_order_relaxed)) return;
 
     // Refresh screen size — guard against 0 during early frames
     if (g_getW) { int w = g_getW(); if (w > 0) g_sw = w; }
     if (g_getH) { int h = g_getH(); if (h > 0) g_sh = h; }
+
+    // Guard: skip all raw-GL and Unity-GL-icall work when no EGL context is bound.
+    // On Vulkan / Metal renderer, OnPostRender still fires but there is no OpenGL
+    // context on the render thread — any glGet* or GL icall will segfault.
+    if (!has_egl_context()) {
+        if (n <= 3) LI("OnPostRender #%d: no EGL ctx (Vulkan renderer?) — skipping draw", n);
+        // Still update head-target so aim-assist has fresh data
+        update_hs_target(cam);
+        return;
+    }
 
     // Save GL state
     GlSave saved;
@@ -729,7 +757,7 @@ void ESP::init() {
            opr, opr ? opr->methodPointer : nullptr);
         if (opr && opr->methodPointer) {
             DobbyHook(opr->methodPointer,
-                      (void*)hook_OnPostRender,
+                      (void*)(FnCamRender)hook_OnPostRender,
                       (void**)&g_origOnPostRender);
             LI("Camera.OnPostRender hooked @ %p", opr->methodPointer);
         } else {
