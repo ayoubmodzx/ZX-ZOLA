@@ -138,6 +138,7 @@ static inline bool is_lethal_sig(int s) {
 // MOV X0,XZR;RET before dlopen: Dobby saves those bytes as the "original",
 // so every passthrough call via g_orig_tp_syscall silently returns 0.
 // This helper issues SVC #0 directly without touching the Dobby trampoline.
+#if defined(__aarch64__)
 static __attribute__((always_inline)) long tp_svc_passthrough(
         long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
     register long x8 __asm__("x8") = nr;
@@ -150,6 +151,20 @@ static __attribute__((always_inline)) long tp_svc_passthrough(
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5) : "memory","cc");
     return x0;
 }
+#else  // armeabi-v7a: syscall nr in r7, args in r0-r5
+static __attribute__((always_inline)) long tp_svc_passthrough(
+        long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+    register long r7 __asm__("r7") = nr;
+    register long r0 __asm__("r0") = a1;
+    register long r1 __asm__("r1") = a2;
+    register long r2 __asm__("r2") = a3;
+    register long r3 __asm__("r3") = a4;
+    register long r4 __asm__("r4") = a5;
+    register long r5 __asm__("r5") = a6;
+    __asm__ volatile("svc #0" : "+r"(r0) : "r"(r7),"r"(r1),"r"(r2),"r"(r3),"r"(r4),"r"(r5) : "memory","cc");
+    return r0;
+}
+#endif
 
 static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
     switch ((int)nr) {
