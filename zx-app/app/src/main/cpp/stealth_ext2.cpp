@@ -217,6 +217,11 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
     case __NR_process_vm_readv:
         errno = EPERM; return -1L;
 
+    // exit_group — ACE calls this via tp_syscall_imp after detecting hooks.
+    // Swallow it so the process keeps running; payload hooks finish installing.
+    case __NR_exit_group:
+        return 0L;
+
     // mincore(addr, len, vec) — a1=addr, a2=len, a3=vec
     // Return all-resident for our tracked RWX pages, passthrough rest
     case __NR_mincore: {

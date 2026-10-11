@@ -881,6 +881,49 @@ int main(int argc, char *argv[]) {
             }
         }
 
+        // Pre-patch libanogs.so direct-SVC kill stub (ELF offset 0x3f0270) and
+        // scanner entries (0x1b9ce4, 0x1ba72c) BEFORE dlopen so they never fire.
+        // Kill stub confirmed from run 5: "L29: direct SVC kill hooked @ base+0x3f0270".
+        // Scanner NOP-patch closes the window before stealth_ext3 constructor runs.
+        {
+            uintptr_t anogs_base = ProcMem::findLibBase(pid, "libanogs.so");
+            zerr("main: libanogs.so base=0x%lx", (unsigned long)anogs_base);
+            if (anogs_base) {
+                // Kill SVC stub at ELF offset 0x3f0270 — MOV X0,XZR; RET
+                uintptr_t kill_stub = anogs_base + 0x3f0270UL;
+                bool p0 = remote_poke_insn(pid, kill_stub,     0xAA1F03E0u); // MOV X0,XZR
+                bool p1 = remote_poke_insn(pid, kill_stub + 4, 0xD65F03C0u); // RET
+                if (p0 && p1)
+                    zerr("main: libanogs kill stub @ 0x%lx pre-patched", (unsigned long)kill_stub);
+                else
+                    zerr("main: WARNING libanogs kill stub pre-patch FAILED p0=%d p1=%d", (int)p0, (int)p1);
+
+                // openat SVC stub at 0x3f02b0 — same treatment
+                uintptr_t openat_stub = anogs_base + 0x3f02b0UL;
+                bool q0 = remote_poke_insn(pid, openat_stub,     0xAA1F03E0u);
+                bool q1 = remote_poke_insn(pid, openat_stub + 4, 0xD65F03C0u);
+                zerr("main: libanogs openat stub @ 0x%lx pre-patched q0=%d q1=%d",
+                     (unsigned long)openat_stub, (int)q0, (int)q1);
+
+                // read SVC stub at 0x3f02d0 — same treatment
+                uintptr_t read_stub = anogs_base + 0x3f02d0UL;
+                bool r0 = remote_poke_insn(pid, read_stub,     0xAA1F03E0u);
+                bool r1 = remote_poke_insn(pid, read_stub + 4, 0xD65F03C0u);
+                zerr("main: libanogs read stub @ 0x%lx pre-patched r0=%d r1=%d",
+                     (unsigned long)read_stub, (int)r0, (int)r1);
+
+                // Scanner entry points — NOP with RET so scan loop never executes
+                uintptr_t scn1 = anogs_base + 0x1b9ce4UL;
+                uintptr_t scn2 = anogs_base + 0x1ba72cUL;
+                bool s1 = remote_poke_insn(pid, scn1, 0xD65F03C0u); // RET
+                bool s2 = remote_poke_insn(pid, scn2, 0xD65F03C0u); // RET
+                zerr("main: libanogs scanners pre-patched scn1=%d@0x%lx scn2=%d@0x%lx",
+                     (int)s1, (unsigned long)scn1, (int)s2, (unsigned long)scn2);
+            } else {
+                zerr("main: WARNING libanogs.so not found — kill stub pre-patch skipped");
+            }
+        }
+
         bool ok = remote_dlopen(pid, payload_path);
         thaw_threads();
         ptrace_detach(pid);
