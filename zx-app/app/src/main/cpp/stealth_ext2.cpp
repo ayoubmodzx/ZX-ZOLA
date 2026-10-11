@@ -151,17 +151,26 @@ static __attribute__((always_inline)) long tp_svc_passthrough(
     __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5) : "memory","cc");
     return x0;
 }
-#else  // armeabi-v7a: syscall nr in r7, args in r0-r5
+#else  // armeabi-v7a Thumb-2: r7 is the frame pointer and is reserved.
+// Named register variable for r7 is rejected by clang. Save/restore r7
+// around the svc instruction explicitly so the compiler is never confused.
 static __attribute__((always_inline)) long tp_svc_passthrough(
         long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
-    register long r7 __asm__("r7") = nr;
     register long r0 __asm__("r0") = a1;
     register long r1 __asm__("r1") = a2;
     register long r2 __asm__("r2") = a3;
     register long r3 __asm__("r3") = a4;
     register long r4 __asm__("r4") = a5;
     register long r5 __asm__("r5") = a6;
-    __asm__ volatile("svc #0" : "+r"(r0) : "r"(r7),"r"(r1),"r"(r2),"r"(r3),"r"(r4),"r"(r5) : "memory","cc");
+    __asm__ volatile(
+        "push {r7}\n\t"
+        "mov  r7, %1\n\t"
+        "svc  #0\n\t"
+        "pop  {r7}"
+        : "+r"(r0)
+        : "r"(nr), "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5)
+        : "memory", "cc"
+    );
     return r0;
 }
 #endif
