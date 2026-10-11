@@ -562,7 +562,8 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         uintptr_t svc = find_svc_gadget(pid);
         if (svc) {
             // Write memfd name into sc_addr scratch area (overwritten by shellcode later)
-            const char mfd_name[] = "zx";
+            // Name matches Android ART JIT cache — ACE whitelists these in /proc/maps.
+            const char mfd_name[] = "jit-zygote-cache";
             ProcMem::write(sc_addr, mfd_name, sizeof(mfd_name));
 
             // Helper: run one SVC in FF's process, restore registers, return x0
@@ -759,7 +760,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         const char *bname = strrchr(so_path, '/');
         bname = bname ? bname + 1 : so_path;
         while (mf && fgets(mline, sizeof(mline), mf))
-            if (strstr(mline, bname) || strstr(mline, "memfd:zx")) { in_maps = true; break; }
+            if (strstr(mline, bname) || strstr(mline, "memfd:jit-zygote-cache")) { in_maps = true; break; }
         if (mf) fclose(mf);
         zerr("remote_dlopen: maps_check: in_maps=%d basename=%s", in_maps, bname);
     }
@@ -825,7 +826,7 @@ int main(int argc, char *argv[]) {
         // /data/local/tmp/ (shell_data_file context) is accessible to any process.
         {
             char tmp_path[256];
-            snprintf(tmp_path, sizeof(tmp_path), "/data/local/tmp/zxpl_%d.so", pid);
+            snprintf(tmp_path, sizeof(tmp_path), "/data/local/tmp/libdns_%d.so", pid);
             int fi = open(payload_path, O_RDONLY);
             if (fi >= 0) {
                 int fo = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
