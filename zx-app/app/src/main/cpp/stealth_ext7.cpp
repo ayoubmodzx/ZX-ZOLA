@@ -62,6 +62,7 @@
 #include <cstdint>
 #include <cerrno>
 #include <atomic>
+#include <elf.h>
 
 #define TAG "ZX-STX7"
 #define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
@@ -193,6 +194,89 @@ static void *hook_AnoDelData4(int t, int *len, int f, int g)
 //   3. Walk back to STP X29,X30 function entry
 //   4. Patch: MOV W0,#0 + RET
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Safety helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Returns true if the function at `fn` has ≥ 4 non-trivial ARM64 instructions
+// before the first RET/SVC — Dobby needs at least 16 bytes for its trampoline.
+static bool is_hookable_arm64(const void *fn) {
+    if (!fn) return false;
+    const uint32_t *w = (const uint32_t*)fn;
+    if (w[0] == 0xD65F03C0u) return false;        // bare RET
+    if ((w[0] & 0xFFE0001Fu) == 0xD4000001u) return false; // SVC #0
+    int depth = 0;
+    for (int i = 0; i < 8; i++) {
+        if (w[i] == 0xD65F03C0u) break;
+        depth++;
+    }
+    return depth >= 4;
+}
+
+// Patch libanogs.so's GOT entry for a named import symbol.
+// More targeted than DobbyHook on the bionic global: only intercepts calls
+// originating inside libanogs.so itself.
+static bool anogs_patch_got_import(uintptr_t ano_base, const char *sym_name, void *new_fn) {
+    if (!ano_base || !sym_name || !new_fn) return false;
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr*)ano_base;
+    if (ehdr->e_ident[EI_MAG0] != ELFMAG0 || ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
+        ehdr->e_ident[EI_MAG2] != ELFMAG2 || ehdr->e_ident[EI_MAG3] != ELFMAG3 ||
+        ehdr->e_ident[EI_CLASS] != ELFCLASS64) return false;
+
+    const Elf64_Phdr *phdr = (const Elf64_Phdr*)(ano_base + ehdr->e_phoff);
+    const Elf64_Dyn  *dyn  = nullptr;
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_DYNAMIC) {
+            dyn = (const Elf64_Dyn*)(ano_base + phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) return false;
+
+    uintptr_t rela_ptr = 0, rela_sz = 0;
+    uintptr_t jrel_ptr = 0, jrel_sz = 0;
+    uintptr_t sym_ptr  = 0, str_ptr = 0;
+
+    for (const Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+            case DT_RELA:     rela_ptr = ano_base + d->d_un.d_ptr; break;
+            case DT_RELASZ:   rela_sz  = d->d_un.d_val;            break;
+            case DT_JMPREL:   jrel_ptr = ano_base + d->d_un.d_ptr; break;
+            case DT_PLTRELSZ: jrel_sz  = d->d_un.d_val;            break;
+            case DT_SYMTAB:   sym_ptr  = ano_base + d->d_un.d_ptr; break;
+            case DT_STRTAB:   str_ptr  = ano_base + d->d_un.d_ptr; break;
+            default: break;
+        }
+    }
+    if (!sym_ptr || !str_ptr) return false;
+
+    const Elf64_Sym *symtab = (const Elf64_Sym*)sym_ptr;
+    const char      *strtab = (const char*)str_ptr;
+    size_t           nlen   = strlen(sym_name);
+
+    uintptr_t tbls[2] = { rela_ptr, jrel_ptr };
+    size_t    szs[2]  = { rela_sz,  jrel_sz  };
+
+    for (int t = 0; t < 2; t++) {
+        if (!tbls[t] || !szs[t]) continue;
+        size_t cnt = szs[t] / sizeof(Elf64_Rela);
+        const Elf64_Rela *rel = (const Elf64_Rela*)tbls[t];
+        for (size_t i = 0; i < cnt; i++) {
+            uint32_t sidx = ELF64_R_SYM(rel[i].r_info);
+            if (!sidx) continue;
+            if (strncmp(strtab + symtab[sidx].st_name, sym_name, nlen + 1) != 0) continue;
+            uintptr_t *got = (uintptr_t*)(ano_base + rel[i].r_offset);
+            uintptr_t  pg  = (uintptr_t)got & ~(uintptr_t)0xFFF;
+            if (mprotect((void*)pg, 0x2000, PROT_READ | PROT_WRITE) != 0) return false;
+            *got = (uintptr_t)new_fn;
+            __builtin___clear_cache((char*)got, (char*)(got + 1));
+            mprotect((void*)pg, 0x2000, PROT_READ);
+            return true;
+        }
+    }
+    return false;
+}
 
 static bool patch_page_rwx(uintptr_t addr, uint32_t i0, uint32_t i1) {
     uintptr_t page = addr & ~(uintptr_t)0xFFF;
@@ -644,28 +728,54 @@ static void launch_ext7_scanner() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void install_stealth_ext7() {
+    LI("L54-61 enter");
+
+    // Resolve libanogs.so base early — needed for GOT patching.
+    uintptr_t ano_base = 0;
+    size_t    ano_sz   = 0;
+    {
+        PhdrCtx7 ctx{"libanogs.so", 0, 0};
+        dl_iterate_phdr(phdr_find7, &ctx);
+        ano_base = ctx.base;
+        ano_sz   = ctx.total_sz ? ctx.total_sz : 8 * 1024 * 1024;
+    }
+    LI("L54-61: ano_base=0x%lx sz=0x%lx", (unsigned long)ano_base, (unsigned long)ano_sz);
+
     // ── Layer 54: inotify_init / inotify_init1 ───────────────────────────────
-    void *sym_ii  = dlsym(RTLD_DEFAULT, "inotify_init");
-    void *sym_ii1 = dlsym(RTLD_DEFAULT, "inotify_init1");
-    if (sym_ii)  DobbyHook(sym_ii,  (void*)hook_inotify_init,  (void**)&g_orig_inotify_init);
-    if (sym_ii1) DobbyHook(sym_ii1, (void*)hook_inotify_init1, (void**)&g_orig_inotify_init1);
+    // Both bionic wrappers are ≤ 12 bytes on arm64 — too short for Dobby inline
+    // trampolines. Use GOT patching inside libanogs instead.
+    if (ano_base) {
+        bool pi0 = anogs_patch_got_import(ano_base, "inotify_init",  (void*)hook_inotify_init);
+        bool pi1 = anogs_patch_got_import(ano_base, "inotify_init1", (void*)hook_inotify_init1);
+        LI("L54: GOT patch inotify_init=%d inotify_init1=%d", (int)pi0, (int)pi1);
+    } else {
+        void *sym_ii  = dlsym(RTLD_DEFAULT, "inotify_init");
+        void *sym_ii1 = dlsym(RTLD_DEFAULT, "inotify_init1");
+        if (sym_ii  && is_hookable_arm64(sym_ii))
+            DobbyHook(sym_ii,  (void*)hook_inotify_init,  (void**)&g_orig_inotify_init);
+        else LI("L54: inotify_init not hookable sym=%p", sym_ii);
+        if (sym_ii1 && is_hookable_arm64(sym_ii1))
+            DobbyHook(sym_ii1, (void*)hook_inotify_init1, (void**)&g_orig_inotify_init1);
+        else LI("L54: inotify_init1 not hookable sym=%p", sym_ii1);
+    }
+    LI("L54 done");
 
     // ── Layer 55: remaining AnoSDK exports ───────────────────────────────────
-    // Use RTLD_NOLOAD first (already-loaded namespace), fall through to NULL
+    LI("L55 start");
     void *ano = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
     if (!ano) dlerror();
 
     auto try_ano = [&](const char *sym, void *rep, void **orig) {
         void *addr = ano ? dlsym(ano, sym) : nullptr;
         if (!addr) {
-            // Try versioned symbol
             char buf[128];
             snprintf(buf, sizeof(buf), "%s@@ANO", sym);
             addr = ano ? dlsym(ano, buf) : nullptr;
         }
         if (!addr) addr = DobbySymbolResolver("libanogs.so", sym);
-        if (addr) DobbyHook(addr, rep, orig);
-        else      LI("L55: sym not found: %s (will be inactive)", sym);
+        if (addr && is_hookable_arm64(addr)) DobbyHook(addr, rep, orig);
+        else if (addr) LI("L55: sym %s too short for Dobby", sym);
+        else           LI("L55: sym not found: %s", sym);
     };
 
     try_ano("AnoSDKRegistInfoListener",    (void*)hook_AnoRegistListener,  (void**)&g_orig_AnoRegistListener);
@@ -675,55 +785,97 @@ void install_stealth_ext7() {
     try_ano("AnoSDKDelReportData",         (void*)hook_AnoDelData,         (void**)&g_orig_AnoDelData);
     try_ano("AnoSDKDelReportData3",        (void*)hook_AnoDelData3,        (void**)&g_orig_AnoDelData3);
     try_ano("AnoSDKDelReportData4",        (void*)hook_AnoDelData4,        (void**)&g_orig_AnoDelData4);
+    LI("L55 done");
 
     // ── Layer 56: deferred ms_scan_start / ms_hook_opcode NOP-patch ──────────
     launch_ext7_scanner();
+    LI("L56 launched");
 
     // ── Layer 57: kill / tgkill ───────────────────────────────────────────────
-    void *sym_kill = dlsym(RTLD_DEFAULT, "kill");
-    if (sym_kill) DobbyHook(sym_kill, (void*)hook_kill, (void**)&g_orig_kill);
-
-    // tgkill has no libc wrapper on all Android versions; resolve via RTLD_DEFAULT
+    LI("L57 start");
+    void *sym_kill   = dlsym(RTLD_DEFAULT, "kill");
     void *sym_tgkill = dlsym(RTLD_DEFAULT, "tgkill");
-    if (!sym_tgkill) sym_tgkill = (void*)(uintptr_t)syscall; // fallback: won't match
-    if (sym_tgkill && sym_tgkill != (void*)(uintptr_t)syscall)
+    if (sym_kill && is_hookable_arm64(sym_kill))
+        DobbyHook(sym_kill, (void*)hook_kill, (void**)&g_orig_kill);
+    else LI("L57: kill not hookable sym=%p", sym_kill);
+    if (sym_tgkill && is_hookable_arm64(sym_tgkill))
         DobbyHook(sym_tgkill, (void*)hook_tgkill, (void**)&g_orig_tgkill);
+    else LI("L57: tgkill not hookable sym=%p", sym_tgkill);
+    LI("L57 done");
 
     // ── Layer 58: abort / _exit / exit ────────────────────────────────────────
-    void *sym_abort = dlsym(RTLD_DEFAULT, "abort");
-    void *sym__exit = dlsym(RTLD_DEFAULT, "_exit");
-    void *sym_exit  = dlsym(RTLD_DEFAULT, "exit");
-    if (sym_abort) DobbyHook(sym_abort, (void*)hook_abort,  (void**)&g_orig_abort);
-    if (sym__exit) DobbyHook(sym__exit, (void*)hook__exit,  (void**)&g_orig__exit);
-    if (sym_exit)  DobbyHook(sym_exit,  (void*)hook_exit,   (void**)&g_orig_exit);
+    // bionic's _exit is 8-12 bytes — Dobby would corrupt adjacent code.
+    // Patch libanogs.so's GOT entries directly so only libanogs calls are
+    // intercepted. Store bionic originals for non-libanogs fallback paths.
+    LI("L58 start");
+    if (ano_base) {
+        bool pa = anogs_patch_got_import(ano_base, "abort",  (void*)hook_abort);
+        bool pe = anogs_patch_got_import(ano_base, "_exit",  (void*)hook__exit);
+        bool px = anogs_patch_got_import(ano_base, "exit",   (void*)hook_exit);
+        LI("L58: GOT abort=%d _exit=%d exit=%d", (int)pa, (int)pe, (int)px);
+        if (!g_orig_abort)  g_orig_abort  = (FnAbort)dlsym(RTLD_DEFAULT, "abort");
+        if (!g_orig__exit)  g_orig__exit  = (FnExit) dlsym(RTLD_DEFAULT, "_exit");
+        if (!g_orig_exit)   g_orig_exit   = (FnExit) dlsym(RTLD_DEFAULT, "exit");
+    } else {
+        void *sym_abort = dlsym(RTLD_DEFAULT, "abort");
+        void *sym__exit = dlsym(RTLD_DEFAULT, "_exit");
+        void *sym_exit  = dlsym(RTLD_DEFAULT, "exit");
+        LI("L58: no ano_base fallback abort=%p _exit=%p exit=%p", sym_abort, sym__exit, sym_exit);
+        if (sym_abort && is_hookable_arm64(sym_abort))
+            DobbyHook(sym_abort, (void*)hook_abort,  (void**)&g_orig_abort);
+        if (sym__exit && is_hookable_arm64(sym__exit))
+            DobbyHook(sym__exit, (void*)hook__exit,  (void**)&g_orig__exit);
+        else LI("L58: _exit too short, skipping DobbyHook");
+        if (sym_exit  && is_hookable_arm64(sym_exit))
+            DobbyHook(sym_exit,  (void*)hook_exit,   (void**)&g_orig_exit);
+    }
+    LI("L58 done");
 
     // ── Layer 59: sigaction / signal ─────────────────────────────────────────
+    LI("L59 start");
     void *sym_sa = dlsym(RTLD_DEFAULT, "sigaction");
     void *sym_sg = dlsym(RTLD_DEFAULT, "signal");
-    if (sym_sa) DobbyHook(sym_sa, (void*)hook_sigaction, (void**)&g_orig_sigaction);
-    if (sym_sg) DobbyHook(sym_sg, (void*)hook_signal,    (void**)&g_orig_signal);
+    if (sym_sa && is_hookable_arm64(sym_sa))
+        DobbyHook(sym_sa, (void*)hook_sigaction, (void**)&g_orig_sigaction);
+    else LI("L59: sigaction not hookable sym=%p", sym_sa);
+    if (sym_sg && is_hookable_arm64(sym_sg))
+        DobbyHook(sym_sg, (void*)hook_signal, (void**)&g_orig_signal);
+    else LI("L59: signal not hookable sym=%p", sym_sg);
+    LI("L59 done");
 
     // ── Layer 60: opendir / fdopendir / readdir / closedir ───────────────────
-    void *sym_od  = dlsym(RTLD_DEFAULT, "opendir");
-    void *sym_fod = dlsym(RTLD_DEFAULT, "fdopendir");
-    void *sym_rd  = dlsym(RTLD_DEFAULT, "readdir");
-    void *sym_rd64= dlsym(RTLD_DEFAULT, "readdir64");
-    void *sym_cd  = dlsym(RTLD_DEFAULT, "closedir");
-    if (sym_od)   DobbyHook(sym_od,   (void*)hook_opendir,   (void**)&g_orig_opendir);
-    if (sym_fod)  DobbyHook(sym_fod,  (void*)hook_fdopendir, (void**)&g_orig_fdopendir);
-    if (sym_rd)   DobbyHook(sym_rd,   (void*)hook_readdir,   (void**)&g_orig_readdir);
-    if (sym_rd64) DobbyHook(sym_rd64, (void*)hook_readdir64, (void**)&g_orig_readdir64);
-    if (sym_cd)   DobbyHook(sym_cd,   (void*)hook_closedir,  (void**)&g_orig_closedir);
+    LI("L60 start");
+    void *sym_od   = dlsym(RTLD_DEFAULT, "opendir");
+    void *sym_fod  = dlsym(RTLD_DEFAULT, "fdopendir");
+    void *sym_rd   = dlsym(RTLD_DEFAULT, "readdir");
+    void *sym_rd64 = dlsym(RTLD_DEFAULT, "readdir64");
+    void *sym_cd   = dlsym(RTLD_DEFAULT, "closedir");
+    if (sym_od   && is_hookable_arm64(sym_od))
+        DobbyHook(sym_od,   (void*)hook_opendir,   (void**)&g_orig_opendir);
+    if (sym_fod  && is_hookable_arm64(sym_fod))
+        DobbyHook(sym_fod,  (void*)hook_fdopendir, (void**)&g_orig_fdopendir);
+    if (sym_rd   && is_hookable_arm64(sym_rd))
+        DobbyHook(sym_rd,   (void*)hook_readdir,   (void**)&g_orig_readdir);
+    if (sym_rd64 && is_hookable_arm64(sym_rd64))
+        DobbyHook(sym_rd64, (void*)hook_readdir64, (void**)&g_orig_readdir64);
+    if (sym_cd   && is_hookable_arm64(sym_cd))
+        DobbyHook(sym_cd,   (void*)hook_closedir,  (void**)&g_orig_closedir);
+    LI("L60 done");
 
     // ── Layer 61: chmod / fchmod / fchmodat ───────────────────────────────────
-    void *sym_cmod   = dlsym(RTLD_DEFAULT, "chmod");
-    void *sym_fcmod  = dlsym(RTLD_DEFAULT, "fchmod");
-    void *sym_fcmodat= dlsym(RTLD_DEFAULT, "fchmodat");
-    if (sym_cmod)    DobbyHook(sym_cmod,    (void*)hook_chmod,    (void**)&g_orig_chmod);
-    if (sym_fcmod)   DobbyHook(sym_fcmod,   (void*)hook_fchmod,   (void**)&g_orig_fchmod);
-    if (sym_fcmodat) DobbyHook(sym_fcmodat, (void*)hook_fchmodat, (void**)&g_orig_fchmodat);
+    LI("L61 start");
+    void *sym_cmod    = dlsym(RTLD_DEFAULT, "chmod");
+    void *sym_fcmod   = dlsym(RTLD_DEFAULT, "fchmod");
+    void *sym_fcmodat = dlsym(RTLD_DEFAULT, "fchmodat");
+    if (sym_cmod    && is_hookable_arm64(sym_cmod))
+        DobbyHook(sym_cmod,    (void*)hook_chmod,    (void**)&g_orig_chmod);
+    if (sym_fcmod   && is_hookable_arm64(sym_fcmod))
+        DobbyHook(sym_fcmod,   (void*)hook_fchmod,   (void**)&g_orig_fchmod);
+    if (sym_fcmodat && is_hookable_arm64(sym_fcmodat))
+        DobbyHook(sym_fcmodat, (void*)hook_fchmodat, (void**)&g_orig_fchmodat);
+    LI("L61 done");
 
     ensure_ranges7();
 
-    LI("L54-61: inotify-kill/AnoSDK-complete/scanner-ext/kill-abort-sigact/opendir/chmod hooks installed");
+    LI("L54-61: all hooks installed");
 }
