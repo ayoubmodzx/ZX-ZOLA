@@ -41,6 +41,10 @@ static void*         (*p_class_get_type)(Il2CppClass*)                          
 static Il2CppObject* (*p_type_get_object)(void*)                                 = nullptr;
 static Il2CppObject* (*p_string_new_utf8)(const char*)                           = nullptr;
 
+struct Il2CppThread;
+static Il2CppThread* (*p_thread_attach)(Il2CppDomain*)  = nullptr;
+static void          (*p_thread_detach)(Il2CppThread*)  = nullptr;
+
 static Il2CppImage *g_img    = nullptr;
 static Il2CppImage *g_unity  = nullptr;  // UnityEngine.CoreModule
 static std::unordered_map<std::string, Il2CppClass*> g_cls_cache;
@@ -85,6 +89,8 @@ bool Il2Cpp::init() {
     BIND_OPT(p_class_get_type,   "il2cpp_class_get_type")
     BIND_OPT(p_type_get_object,  "il2cpp_type_get_object")
     BIND_OPT(p_string_new_utf8,  "il2cpp_string_new")
+    BIND_OPT(p_thread_attach,    "il2cpp_thread_attach")
+    BIND_OPT(p_thread_detach,    "il2cpp_thread_detach")
 
     Il2CppDomain *dom = p_domain_get();
     if (!dom) { ERR("il2cpp domain not ready"); return false; }
@@ -224,6 +230,20 @@ Il2CppObject *Il2Cpp::invoke1(MethodInfo *m, Il2CppObject *obj, void *arg0) {
 Il2CppObject *Il2Cpp::newString(const char *str) {
     if (!str || !p_string_new_utf8) return nullptr;
     return p_string_new_utf8(str);
+}
+
+// ── thread attach/detach ──────────────────────────────────────────────────────
+// Must be called on any background pthread before il2cpp_runtime_invoke.
+// The GC scans only attached threads; an unattached thread calling managed code
+// causes a segfault when the GC walks the (unknown) stack.
+Il2CppThread *Il2Cpp::attachThread() {
+    if (!p_thread_attach || !p_domain_get) return nullptr;
+    Il2CppDomain *dom = p_domain_get();
+    if (!dom) return nullptr;
+    return p_thread_attach(dom);
+}
+void Il2Cpp::detachThread(Il2CppThread *t) {
+    if (p_thread_detach && t) p_thread_detach(t);
 }
 
 // ── getFieldBool ──────────────────────────────────────────────────────────────

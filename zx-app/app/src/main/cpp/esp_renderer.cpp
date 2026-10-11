@@ -454,6 +454,14 @@ static void *position_updater(void *) {
     // Wait for il2cpp full init
     sleep(4);
 
+    // Attach this pthread to the IL2CPP GC before ANY il2cpp_runtime_invoke call.
+    // An unattached thread causes a GC stack-scan segfault the instant managed code runs.
+    Il2CppThread *il2cpp_thr = Il2Cpp::attachThread();
+    if (!il2cpp_thr) {
+        LE("position_updater: il2cpp_thread_attach failed — ESP cache disabled");
+        return nullptr;
+    }
+
     // Confirmed from metadata: COW.GamePlay::Player is the actual class in this build.
     // CSPlayerState was a legacy name from older FF versions — it does not exist here.
     Il2CppClass *playerCls = Il2Cpp::cls("Player", "COW.GamePlay");
