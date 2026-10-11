@@ -29,6 +29,7 @@
 #include "stealth_ext4.hpp"
 #include "stealth_ext5.hpp"
 #include "stealth_ext6.hpp"
+#include "stealth_ext7.hpp"
 #include "dobby_stub.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
@@ -638,7 +639,8 @@ void AntiDetect::install() {
     install_stealth_ext4();     // Layers 27-43
     install_stealth_ext5();     // Layers 44-48
     install_stealth_ext6();     // Layers 49-53
-    zx_scrub_trampolines();     // Layer 4 — scrub ALL 53 layers' trampolines at once
+    install_stealth_ext7();     // Layers 54-61
+    zx_scrub_trampolines();     // Layer 4 — scrub ALL 61 layers' trampolines at once
 
-    LI("AntiDetect: all 53 layers active");
+    LI("AntiDetect: all 61 layers active");
 }
