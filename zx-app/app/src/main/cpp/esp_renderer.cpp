@@ -58,6 +58,8 @@ static FnGetHeight g_getH   = nullptr;
 static std::atomic<bool> g_esp_on{false};
 static std::atomic<bool> g_hs_on{false};
 static std::atomic<bool> g_w2s_valid{false};
+static Vec3              g_hs_world_head{};   // nearest visible enemy head (world space)
+static Vec3              g_local_world_pos{}; // local player position (world space)
 
 // Screen size — declared here so gles_flush() can reference them
 static int g_sw = 1080, g_sh = 1920;
@@ -645,8 +647,6 @@ static void *position_updater(void *) {
 
 static std::atomic<bool> g_hs_target_valid{false};
 static Vec2              g_hs_target_screen{};
-static Vec3              g_hs_world_head{};
-static Vec3              g_local_world_pos{};
 
 static void update_hs_target(void *cam) {
     if (!g_hs_on.load() || !cam) { g_hs_target_valid = false; return; }
