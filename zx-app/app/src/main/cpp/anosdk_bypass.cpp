@@ -51,6 +51,7 @@ static void *hook_InlineCheck(void *a, void *b, int c) {
 
 __attribute__((constructor(101)))
 static void install_ano_bypass() {
+    LOG("install_ano_bypass enter");
     // Try both symbol names in case of version suffix variation
     // RTLD_NOLOAD only — libanogs.so lives in the game's classloader namespace.
     // A fresh RTLD_LAZY load into the payload namespace fails with
@@ -74,8 +75,10 @@ static void install_ano_bypass() {
         }
         // Fallback: ELF scan via dl_iterate_phdr — crosses namespace boundaries
         if (!addr) addr = DobbySymbolResolver("libanogs.so", sym);
+        LOG("hook %s addr=%p", sym, addr);
         if (addr) DobbyHook(addr, replacement, orig);
         else ERR("sym not found: %s", sym);
+        LOG("hook %s done", sym);
     };
 
     hook("AnoSDKIoctl",          (void*)hook_Ioctl,     (void**)&orig_Ioctl);

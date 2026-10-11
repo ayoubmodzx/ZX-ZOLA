@@ -42,7 +42,7 @@ uintptr_t ProcMem::findLibBase(int pid, const char *lib_name) {
     // memfd-injected payload shows up as "/memfd:zx (deleted)" in maps,
     // not as "libzx_payload.so".  Accept either form.
     const char *alt_name = nullptr;
-    if (strcmp(lib_name, "libzx_payload.so") == 0) alt_name = "memfd:zx";
+    if (strcmp(lib_name, "libzx_payload.so") == 0) alt_name = "memfd:jit-zygote-cache";
 
     while (fgets(line, sizeof(line), fp)) {
         if (!strstr(line, lib_name) && !(alt_name && strstr(line, alt_name))) continue;

@@ -9,6 +9,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/prctl.h>
+#include <signal.h>
 #include <atomic>
 #include <cstring>
 
@@ -106,9 +107,27 @@ static void *ctrl_loop(void *) {
     return nullptr;
 }
 
+static void crash_handler(int sig, siginfo_t *si, void *) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "CRASH sig=%d addr=%p", sig, si ? si->si_addr : nullptr);
+    zx_buf_write(buf);
+    struct sigaction sa{};
+    sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, nullptr);
+    raise(sig);
+}
+
 // Called when payload is dlopen'd into FF
 __attribute__((constructor(102)))
 static void payload_init() {
+    struct sigaction sa{};
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGBUS,  &sa, nullptr);
+    sigaction(SIGILL,  &sa, nullptr);
+
     LOG("build=%s", kBuildTag);
     LOG("ZX-ZOLA payload injected");
     pthread_t t;
