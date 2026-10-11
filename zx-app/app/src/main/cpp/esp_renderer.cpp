@@ -393,17 +393,36 @@ static const char *k_rsh_names[]   = { "RightArm","r_arm","Bip001 R Clavicle","m
 static const char *k_lft_names[]   = { "LeftFoot","l_foot","Bip001 L Foot","mixamo:LeftFoot","foot_l",nullptr };
 static const char *k_rft_names[]   = { "RightFoot","r_foot","Bip001 R Foot","mixamo:RightFoot","foot_r",nullptr };
 
+// Cached UnityEngine method pointers — resolved once, never per-frame/per-50ms
+// Unity classes live in "UnityEngine" namespace; cls("Transform") without namespace
+// searches Assembly-CSharp only and returns nullptr for engine types.
+static MethodInfo *s_mTransformFind     = nullptr; // Transform.Find(string)
+static MethodInfo *s_mGetPosition       = nullptr; // Transform.get_position()
+static MethodInfo *s_mGetTransform      = nullptr; // Component.get_transform()
+
+static void resolve_unity_methods() {
+    Il2CppClass *trCls  = Il2Cpp::cls("Transform",  "UnityEngine");
+    Il2CppClass *cmpCls = Il2Cpp::cls("Component",  "UnityEngine");
+    if (trCls) {
+        s_mTransformFind = Il2Cpp::getMethod(trCls, "Find",         1);
+        s_mGetPosition   = Il2Cpp::getMethod(trCls, "get_position", 0);
+    }
+    if (cmpCls) {
+        s_mGetTransform  = Il2Cpp::getMethod(cmpCls, "get_transform", 0);
+    }
+    LI("unity methods: Find=%p get_position=%p get_transform=%p",
+       s_mTransformFind ? s_mTransformFind->methodPointer : nullptr,
+       s_mGetPosition   ? s_mGetPosition->methodPointer   : nullptr,
+       s_mGetTransform  ? s_mGetTransform->methodPointer  : nullptr);
+}
+
 // Get a child Transform by bone name candidates — searches all candidate names
 static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
-    if (!transform) return nullptr;
-    MethodInfo *findM = Il2Cpp::getMethod(
-        Il2Cpp::cls("Transform"), "Find", 1);
-    if (!findM || !findM->methodPointer) return nullptr;
-
+    if (!transform || !s_mTransformFind || !s_mTransformFind->methodPointer) return nullptr;
     for (int i = 0; names[i]; i++) {
         Il2CppObject *nameStr = Il2Cpp::newString(names[i]);
         if (!nameStr) continue;
-        Il2CppObject *bone = Il2Cpp::invoke1(findM, transform, nameStr);
+        Il2CppObject *bone = Il2Cpp::invoke1(s_mTransformFind, transform, nameStr);
         if (bone) return bone;
     }
     return nullptr;
@@ -411,10 +430,9 @@ static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
 
 static Vec3 get_position(Il2CppObject *transform) {
     Vec3 pos{};
-    MethodInfo *m = Il2Cpp::getMethod(Il2Cpp::cls("Transform"), "get_position", 0);
-    if (!m || !m->methodPointer) return pos;
-    // invoke0 returns a boxed Vector3; unbox by skipping the 16-byte Il2CppObject header
-    Il2CppObject *boxed = Il2Cpp::invoke0(m, transform);
+    if (!s_mGetPosition || !s_mGetPosition->methodPointer) return pos;
+    // il2cpp_runtime_invoke boxes value-type returns; Vector3 data sits after the 16-byte header
+    Il2CppObject *boxed = Il2Cpp::invoke0(s_mGetPosition, transform);
     if (boxed) __builtin_memcpy(&pos, (char*)boxed + sizeof(Il2CppObject), sizeof(Vec3));
     return pos;
 }
@@ -426,10 +444,8 @@ static float dist3(Vec3 a, Vec3 b) {
 
 // Find local player's position (to compute distances)
 static Vec3 get_local_pos() {
-    if (!g_local_player) return {};
-    MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component"), "get_transform", 0);
-    if (!getT || !getT->methodPointer) return {};
-    Il2CppObject *tr = Il2Cpp::invoke0(getT, (Il2CppObject*)g_local_player);
+    if (!g_local_player || !s_mGetTransform || !s_mGetTransform->methodPointer) return {};
+    Il2CppObject *tr = Il2Cpp::invoke0(s_mGetTransform, (Il2CppObject*)g_local_player);
     if (!tr) return {};
     return get_position(tr);
 }
@@ -466,7 +482,7 @@ static void *position_updater(void *) {
         }
     }
 
-    MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component"), "get_transform", 0);
+    // s_mGetTransform resolved in resolve_unity_methods() called from ESP::init()
 
     int local_team = -1;
 
@@ -501,10 +517,10 @@ static void *position_updater(void *) {
             // Check alive status via cached field offset (no repeated getField call)
             if (alive_off > 0 && !Il2Cpp::readField<bool>((void*)p, alive_off)) continue;
 
-            // Get transform
+            // Get transform via cached Component.get_transform
             Il2CppObject *tr = nullptr;
-            if (getT && getT->methodPointer)
-                tr = Il2Cpp::invoke0(getT, p);
+            if (s_mGetTransform && s_mGetTransform->methodPointer)
+                tr = Il2Cpp::invoke0(s_mGetTransform, p);
             if (!tr) continue;
 
             EnemyData ed{};
@@ -636,8 +652,11 @@ void ESP::init() {
     LI("GL icalls: Begin=%p End=%p Vertex3=%p W2S=%p W2Sv2=%p",
        g_glBegin, g_glEnd, g_glVertex3, g_w2s, g_w2s_v2);
 
-    // Hook Camera.OnPostRender
-    Il2CppClass *camCls = Il2Cpp::cls("Camera");
+    // Resolve UnityEngine.Transform/Component methods (namespace required — not in Assembly-CSharp)
+    resolve_unity_methods();
+
+    // Hook Camera.OnPostRender — Camera is UnityEngine.Camera, namespace "UnityEngine"
+    Il2CppClass *camCls = Il2Cpp::cls("Camera", "UnityEngine");
     if (camCls) {
         MethodInfo *opr = Il2Cpp::getMethod(camCls, "OnPostRender", 0);
         if (opr && opr->methodPointer) {
@@ -646,8 +665,10 @@ void ESP::init() {
                       (void**)&g_origOnPostRender);
             LI("Camera.OnPostRender hooked @ %p", opr->methodPointer);
         } else {
-            LE("Camera.OnPostRender method not found");
+            LE("Camera.OnPostRender method not found — rendering hook inactive");
         }
+    } else {
+        LE("UnityEngine.Camera class not found — rendering hook inactive");
     }
 
     // Start background position updater thread
