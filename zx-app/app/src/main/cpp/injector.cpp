@@ -855,6 +855,32 @@ int main(int argc, char *argv[]) {
 
         if (!ptrace_attach(pid)) { ProcMem::close(); return 3; }
         freeze_threads(pid);       // stop anti-cheat threads during injection
+
+        // Pre-patch tp_syscall_imp → MOV X0,XZR; RET  BEFORE dlopen fires constructors.
+        // DobbySymbolResolver in constructor-100 takes ~50-100ms (full dl_iterate_phdr
+        // scan), leaving a window where ACE can call tp_syscall_imp to send SIGKILL.
+        // Writing a silent 8-byte trampoline here closes that window entirely — all
+        // tp_syscall_imp calls return 0 until constructor-100 installs the Dobby hook.
+        // libanort.so tp_syscall_imp is at ELF offset 0x146940 (binary-verified).
+        {
+            uintptr_t anort_base = ProcMem::findLibBase(pid, "libanort.so");
+            zerr("main: libanort.so base=0x%lx", (unsigned long)anort_base);
+            if (anort_base) {
+                uintptr_t tp_addr = anort_base + 0x146940UL;
+                // ARM64 LE: MOV X0,XZR=0xAA1F03E0  RET=0xD65F03C0
+                bool p0 = remote_poke_insn(pid, tp_addr,     0xAA1F03E0u);
+                bool p1 = remote_poke_insn(pid, tp_addr + 4, 0xD65F03C0u);
+                if (p0 && p1)
+                    zerr("main: tp_syscall_imp @ 0x%lx pre-patched MOV X0,XZR; RET",
+                         (unsigned long)tp_addr);
+                else
+                    zerr("main: WARNING tp_syscall_imp pre-patch FAILED p0=%d p1=%d",
+                         (int)p0, (int)p1);
+            } else {
+                zerr("main: WARNING libanort.so NOT FOUND — tp pre-patch skipped!");
+            }
+        }
+
         bool ok = remote_dlopen(pid, payload_path);
         thaw_threads();
         ptrace_detach(pid);
