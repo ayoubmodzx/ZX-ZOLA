@@ -14,6 +14,7 @@
 #include "esp_renderer.hpp"
 #include "il2cpp_scanner.hpp"
 #include "dobby_stub.hpp"
+#include "zx_logbuf.hpp"
 
 #include <GLES3/gl3.h>
 #include <android/log.h>
@@ -26,8 +27,8 @@
 #include <dlfcn.h>
 
 #define TAG "ZX-ESP"
-#define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Math types

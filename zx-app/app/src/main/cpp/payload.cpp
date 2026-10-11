@@ -4,14 +4,16 @@
 #include "il2cpp_scanner.hpp"
 #include "features.hpp"
 #include "esp_renderer.hpp"
+#include "zx_logbuf.hpp"
 #include <android/log.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/prctl.h>
 #include <atomic>
+#include <cstring>
 
 #define TAG "ZX-PAYLOAD"
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#define LOG(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
 
 // Version marker — visible in logcat if this binary actually loaded.
 // If you see "ZX-PAYLOAD: build=v7" the new binary is running.
@@ -30,14 +32,31 @@ struct ZxCtrl {
     std::atomic<int> intensity{0};
 };
 
+static constexpr uint32_t ZX_LOG_BUF_SZ = 8192;
+
 static struct ZxCtrlBlock {
-    volatile uint64_t tag[2];
-    ZxCtrl ctrl;
+    volatile uint64_t tag[2];   // offset 0  — 16 bytes (magic, MUST stay first)
+    ZxCtrl ctrl;                // offset 16 — 12 bytes (cmd/enable/intensity)
+    uint32_t log_wp;            // offset 28 — monotonically increasing write cursor
+    char     log_buf[ZX_LOG_BUF_SZ]; // offset 32 — circular byte log ring
 } __g_block __attribute__((used)) = {
     {0xDEADBEEFC0DE5A5AULL, 0x5A5AFACE00000012ULL},
-    {}
+    {}, 0, {}
 };
 #define __g_sdktbl1 (__g_block.ctrl)
+
+// Called by any TU inside the payload .so (via zx_logbuf.hpp).
+// Writes msg + '\n' into the ring buffer; injector polls it via /proc/PID/mem.
+extern "C" void zx_buf_write(const char *msg) {
+    if (!msg || !*msg) return;
+    uint32_t mlen = (uint32_t)strlen(msg);
+    if (mlen > 255) mlen = 255;
+    uint32_t wp = __atomic_fetch_add(&__g_block.log_wp, mlen + 1, __ATOMIC_RELAXED);
+    for (uint32_t i = 0; i < mlen; i++)
+        __g_block.log_buf[(wp + i) % ZX_LOG_BUF_SZ] = msg[i];
+    __g_block.log_buf[(wp + mlen) % ZX_LOG_BUF_SZ] = '\n';
+    __atomic_thread_fence(__ATOMIC_RELEASE);
+}
 
 static void *ctrl_loop(void *) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);

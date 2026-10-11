@@ -885,6 +885,45 @@ int main(int argc, char *argv[]) {
         ProcMem::write(ctrl_addr + 8, &intensity_val, sizeof(int));
         ProcMem::write(ctrl_addr,     &cmd,           sizeof(int)); // cmd last as trigger
         LOG("Command sent: cmd=%d enable=%d intensity=%d", cmd, enable_val, intensity_val);
+
+        // Stream payload ring-buffer log → stderr so ZxEngine shows it in the console.
+        // ZxCtrlBlock layout (ctrl_addr = &ctrl.cmd = __g_block + 16):
+        //   ctrl_addr + 0  = ctrl.cmd       (4 bytes)
+        //   ctrl_addr + 4  = ctrl.enable    (4 bytes)
+        //   ctrl_addr + 8  = ctrl.intensity (4 bytes)
+        //   ctrl_addr + 12 = log_wp         (uint32_t monotonic write cursor)
+        //   ctrl_addr + 16 = log_buf        (char[8192] circular ring)
+        constexpr uint32_t LOG_BUF_SZ = 8192;
+        char chunk[LOG_BUF_SZ];
+        uint32_t last_wp = 0;
+        ProcMem::read(ctrl_addr + 12, &last_wp, sizeof(last_wp));
+        zerr("payload-log: start (wp=%u, polling 15s max)", last_wp);
+        int idle = 0;
+        for (int tick = 0; tick < 150; tick++) {    // 150 × 100ms = 15s max
+            usleep(100000);
+            uint32_t cur_wp = 0;
+            if (!ProcMem::read(ctrl_addr + 12, &cur_wp, sizeof(cur_wp))) {
+                zerr("payload-log: process gone");
+                break;
+            }
+            if (cur_wp == last_wp) {
+                // stop after 5s idle once we've been running >3s total
+                if (++idle >= 50 && tick >= 30) { zerr("payload-log: idle stop"); break; }
+                continue;
+            }
+            idle = 0;
+            uint32_t n = cur_wp - last_wp;
+            if (n > LOG_BUF_SZ) n = LOG_BUF_SZ;   // wrapped: read a full buffer's worth
+            ProcMem::read(ctrl_addr + 16, chunk, LOG_BUF_SZ);
+            for (uint32_t i = 0; i < n; i++) {
+                char c = chunk[(last_wp + i) % LOG_BUF_SZ];
+                fputc((c >= 0x20 || c == '\n' || c == '\t') ? c : '\n', stderr);
+            }
+            if (chunk[(last_wp + n - 1) % LOG_BUF_SZ] != '\n') fputc('\n', stderr);
+            fflush(stderr);
+            last_wp = cur_wp;
+        }
+        zerr("payload-log: end (wp=%u)", last_wp);
     }
 
     ProcMem::close();
