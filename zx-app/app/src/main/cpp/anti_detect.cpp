@@ -60,7 +60,6 @@
 #define TAG "ZX-ADET"
 #define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
 #define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
-#endif
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Layer 6 — Compile-time XOR string obfuscation
