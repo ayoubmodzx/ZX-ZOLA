@@ -455,6 +455,25 @@ static bool hk2(void *lib, const char *sym, void *rep, void **orig) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Early constructor — hooks tp_syscall_imp at priority 100 (BEFORE anosdk_bypass
+// at 101 and payload_init at 102).  This closes the window where Dobby trampolines
+// are live but ACE's raw-SVC scanner is unhoooked.  libanort.so is already loaded
+// in the target process before injection, so DobbySymbolResolver always finds it.
+// No libc hooks here — safe to call inside dlopen's call stack.
+// ═════════════════════════════════════════════════════════════════════════════
+
+__attribute__((constructor(100)))
+static void early_hook_tp_syscall() {
+    void *tp = DobbySymbolResolver("libanort.so", "tp_syscall_imp");
+    if (tp) {
+        int rc = DobbyHook(tp, (void*)hook_tp_syscall, (void**)&g_orig_tp_syscall);
+        LI("early L13 tp_syscall_imp @ %p hook_rc=%d", tp, rc);
+    } else {
+        LE("early L13 tp_syscall_imp NOT FOUND — SIGKILL window open!");
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Public install
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -466,31 +485,21 @@ void install_stealth_ext2() {
     if (!libc)  libc = dlopen(libc_s, RTLD_LAZY);
     void *anort = dlopen(anort_s, RTLD_LAZY | RTLD_NOLOAD);
 
-    // ── Layer 13 — tp_syscall_imp (libanort.so direct SVC) ──────────────────
-    // dlopen RTLD_NOLOAD fails when libanort.so lives in the app's classloader
-    // namespace (different from the payload's namespace).  DobbySymbolResolver
-    // uses dl_iterate_phdr which crosses all namespace boundaries — use it as
-    // the primary path and fall back to dlsym only when RTLD_NOLOAD succeeds.
-    {
-        void *tp = nullptr;
-
-        // Primary: namespace-crossing ELF scan — always works regardless of namespace
-        tp = DobbySymbolResolver("libanort.so", "tp_syscall_imp");
-        LI("L13 DobbySymbolResolver tp_syscall_imp=%p", tp);
-
-        // Fallback: dlsym — succeeds only when libanort.so is in our namespace
-        if (!tp && anort) {
-            tp = dlsym(anort, "tp_syscall_imp");
-            LI("L13 dlsym fallback tp_syscall_imp=%p", tp);
-        }
-
+    // ── Layer 13 — tp_syscall_imp (already hooked by early_hook_tp_syscall) ───
+    // The priority-100 constructor ran before anosdk_bypass, so g_orig_tp_syscall
+    // is already set.  Verify and log; no re-hook needed (Dobby would crash on double-hook).
+    if (g_orig_tp_syscall) {
+        LI("L13 tp_syscall_imp already hooked (early ctor) orig=%p", (void*)g_orig_tp_syscall);
+    } else {
+        // Early ctor failed — last-chance attempt with DobbySymbolResolver
+        void *tp = DobbySymbolResolver("libanort.so", "tp_syscall_imp");
+        if (!tp && anort) tp = dlsym(anort, "tp_syscall_imp");
         if (tp) {
-            if (DobbyHook(tp, (void*)hook_tp_syscall, (void**)&g_orig_tp_syscall) == 0)
-                LI("L13 tp_syscall_imp hooked @ %p", tp);
-            else
-                LE("L13 tp_syscall_imp hook FAILED @ %p", tp);
+            int rc = DobbyHook(tp, (void*)hook_tp_syscall, (void**)&g_orig_tp_syscall);
+            if (rc == 0) LI("L13 tp_syscall_imp late-hooked @ %p", tp);
+            else         LE("L13 tp_syscall_imp late-hook FAILED @ %p rc=%d", tp, rc);
         } else {
-            LE("L13 tp_syscall_imp NOT FOUND — anort_handle=%p SIGKILL risk!", anort);
+            LE("L13 tp_syscall_imp NOT FOUND — SIGKILL risk! anort_handle=%p", anort);
         }
     }
 
