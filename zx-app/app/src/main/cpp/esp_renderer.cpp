@@ -438,37 +438,68 @@ static void *position_updater(void *) {
     // Wait for il2cpp full init
     sleep(4);
 
-    Il2CppClass *playerCls = Il2Cpp::cls("CSPlayerState");
+    // Confirmed from metadata: COW.GamePlay::Player is the actual class in this build.
+    // CSPlayerState was a legacy name from older FF versions — it does not exist here.
+    Il2CppClass *playerCls = Il2Cpp::cls("Player", "COW.GamePlay");
+    if (!playerCls) playerCls = Il2Cpp::cls("CSPlayerState"); // legacy fallback
     if (!playerCls) {
-        LE("CSPlayerState not found in position_updater");
+        LE("Player class not found in position_updater — ESP disabled");
         return nullptr;
+    }
+    LI("position_updater using player class: %s", Il2Cpp::className(playerCls));
+
+    // Cache field lookups once — not inside the 50ms hot loop
+    FieldInfo *aliveF = Il2Cpp::getField(playerCls, "IsAlive");
+    if (!aliveF) aliveF = Il2Cpp::getField(playerCls, "isAlive");
+    int32_t alive_off = aliveF ? Il2Cpp::fieldOffset(aliveF) : -1;
+
+    // Team ID field — filter teammates; common names across FF builds
+    int32_t team_off = -1;
+    {
+        static const char *kT[] = {
+            "TeamID","teamId","campId","CampID","camp",
+            "m_teamId","m_CampID","m_campId","teamIndex", nullptr
+        };
+        for (const char **n = kT; *n; n++) {
+            FieldInfo *f = Il2Cpp::getField(playerCls, *n);
+            if (f) { team_off = Il2Cpp::fieldOffset(f); break; }
+        }
     }
 
     MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component"), "get_transform", 0);
 
+    int local_team = -1;
+
     while (true) {
         usleep(50000); // 50ms — smooth update, no CPU burn
 
-        // Find all CSPlayerState instances
         Il2CppObject **players = nullptr;
         int player_count = 0;
         Il2Cpp::findObjectsOfType(playerCls, &players, &player_count);
 
         // Update local player reference
-        g_local_player = Il2Cpp::getLocalInstance(playerCls);
+        g_local_player = (void*)Il2Cpp::getLocalInstance(playerCls);
         Vec3 local_pos = get_local_pos();
+
+        // Refresh local team ID each cycle in case squad changes mid-match
+        if (g_local_player && team_off > 0)
+            local_team = Il2Cpp::readField<int32_t>(g_local_player, team_off);
 
         EnemyData new_cache[MAX_ENM];
         int nc = 0;
 
         for (int i = 0; i < player_count && nc < MAX_ENM; i++) {
             Il2CppObject *p = players[i];
-            if (!p || p == g_local_player) continue;
+            if (!p || (void*)p == g_local_player) continue;
 
-            // Check alive status
-            FieldInfo *aliveF = Il2Cpp::getField(playerCls, "IsAlive");
-            bool alive = aliveF ? Il2Cpp::getFieldBool(p, aliveF) : true;
-            if (!alive) continue;
+            // Skip teammates — same team ID as local player
+            if (local_team >= 0 && team_off > 0) {
+                int32_t pteam = Il2Cpp::readField<int32_t>((void*)p, team_off);
+                if (pteam == local_team) continue;
+            }
+
+            // Check alive status via cached field offset (no repeated getField call)
+            if (alive_off > 0 && !Il2Cpp::readField<bool>((void*)p, alive_off)) continue;
 
             // Get transform
             Il2CppObject *tr = nullptr;
@@ -480,10 +511,10 @@ static void *position_updater(void *) {
 
             // Cache bone transforms — resolves IL2CPP string names once per new player
             // instead of 36 Il2Cpp::newString() calls every 50ms (GC pressure eliminated)
-            BoneCache *bc = lookup_bone_cache(p);
+            BoneCache *bc = lookup_bone_cache((void*)p);
             if (!bc && s_bone_cache_n < MAX_ENM) {
                 bc = &s_bone_cache[s_bone_cache_n++];
-                bc->player_ptr = p;
+                bc->player_ptr = (void*)p;
                 bc->head_b  = find_bone(tr, k_head_names);
                 bc->chest_b = find_bone(tr, k_chest_names);
                 bc->lsh_b   = find_bone(tr, k_lsh_names);
