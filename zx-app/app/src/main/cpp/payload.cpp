@@ -70,6 +70,7 @@ static void *ctrl_loop(void *) {
     // (open/close/dl_iterate_phdr) during dlopen execution corrupts the call stack
     // and causes SIGSEGV with non-canonical PC.
     AntiDetect::install();
+    LOG("AntiDetect install complete — starting Il2Cpp init");
 
     if (!Il2Cpp::init()) {
         LOG("Il2Cpp init failed");

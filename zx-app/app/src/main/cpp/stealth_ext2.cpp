@@ -126,6 +126,8 @@ static bool rwx_contains(uintptr_t addr) {
 
 using FnTpSyscall = long(*)(long, long, long, long, long, long, long);
 static FnTpSyscall g_orig_tp_syscall = nullptr;
+// Stored at hook install time so forked children can still reference the original PID
+static pid_t g_protected_pid = 0;
 
 static inline bool is_lethal_sig(int s) {
     return s == SIGKILL || s == SIGABRT || s == SIGTERM;
@@ -143,10 +145,22 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
     case __NR_inotify_add_watch:
         errno = EPERM; return -1L;
 
+    // clone / fork — block all fork() attempts from ACE (SVC level)
+    // fork() on ARM64 is clone(SIGCHLD, 0, ...) = syscall 220.
+    // Blocking here prevents the child-process maps-scanner that sends SIGKILL
+    // to the parent from a PID our kill-block doesn't cover.
+    case 220: // __NR_clone
+        errno = EPERM; return -1L;
+
     // kill(pid, sig) — a1=pid, a2=sig
+    // Block lethal signals to: self, broadcast (0/-1), or our stored protected PID
+    // The protected PID covers the forked-child scenario where child != getpid()
     case __NR_kill:
-        if (is_lethal_sig((int)a2) && ((pid_t)a1 == getpid() || (pid_t)a1 == 0))
-            return 0L;
+        if (is_lethal_sig((int)a2)) {
+            pid_t t = (pid_t)a1;
+            if (t == 0 || t == -1 || t == getpid() || (g_protected_pid && t == g_protected_pid))
+                return 0L;
+        }
         break;
 
     // tkill(tid, sig) — a1=tid, a2=sig
@@ -157,8 +171,11 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
 
     // tgkill(tgid, tid, sig) — a1=tgid, a2=tid, a3=sig
     case __NR_tgkill:
-        if (is_lethal_sig((int)a3) && (pid_t)a1 == getpid())
-            return 0L;
+        if (is_lethal_sig((int)a3)) {
+            pid_t tg = (pid_t)a1;
+            if (tg == getpid() || (g_protected_pid && tg == g_protected_pid))
+                return 0L;
+        }
         break;
 
     // process_vm_readv — block external memory read
@@ -464,10 +481,11 @@ static bool hk2(void *lib, const char *sym, void *rep, void **orig) {
 
 __attribute__((constructor(100)))
 static void early_hook_tp_syscall() {
+    g_protected_pid = getpid();
     void *tp = DobbySymbolResolver("libanort.so", "tp_syscall_imp");
     if (tp) {
         int rc = DobbyHook(tp, (void*)hook_tp_syscall, (void**)&g_orig_tp_syscall);
-        LI("early L13 tp_syscall_imp @ %p hook_rc=%d", tp, rc);
+        LI("early L13 tp_syscall_imp @ %p hook_rc=%d pid=%d", tp, rc, (int)g_protected_pid);
     } else {
         LE("early L13 tp_syscall_imp NOT FOUND — SIGKILL window open!");
     }
