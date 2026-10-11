@@ -467,18 +467,31 @@ void install_stealth_ext2() {
     void *anort = dlopen(anort_s, RTLD_LAZY | RTLD_NOLOAD);
 
     // ── Layer 13 — tp_syscall_imp (libanort.so direct SVC) ──────────────────
-    if (anort) {
-        void *tp = dlsym(anort, "tp_syscall_imp");
+    // dlopen RTLD_NOLOAD fails when libanort.so lives in the app's classloader
+    // namespace (different from the payload's namespace).  DobbySymbolResolver
+    // uses dl_iterate_phdr which crosses all namespace boundaries — use it as
+    // the primary path and fall back to dlsym only when RTLD_NOLOAD succeeds.
+    {
+        void *tp = nullptr;
+
+        // Primary: namespace-crossing ELF scan — always works regardless of namespace
+        tp = DobbySymbolResolver("libanort.so", "tp_syscall_imp");
+        LI("L13 DobbySymbolResolver tp_syscall_imp=%p", tp);
+
+        // Fallback: dlsym — succeeds only when libanort.so is in our namespace
+        if (!tp && anort) {
+            tp = dlsym(anort, "tp_syscall_imp");
+            LI("L13 dlsym fallback tp_syscall_imp=%p", tp);
+        }
+
         if (tp) {
             if (DobbyHook(tp, (void*)hook_tp_syscall, (void**)&g_orig_tp_syscall) == 0)
                 LI("L13 tp_syscall_imp hooked @ %p", tp);
             else
-                LE("L13 tp_syscall_imp hook FAILED");
+                LE("L13 tp_syscall_imp hook FAILED @ %p", tp);
         } else {
-            LE("L13 tp_syscall_imp not found — libanort loaded? handle=%p", anort);
+            LE("L13 tp_syscall_imp NOT FOUND — anort_handle=%p SIGKILL risk!", anort);
         }
-    } else {
-        LE("L13 libanort.so not loaded yet — tp_syscall_imp unprotected");
     }
 
     // ── Layer 14 — fork() gate (lazy range init on first call) ──────────────
