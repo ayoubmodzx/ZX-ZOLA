@@ -145,13 +145,6 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
     case __NR_inotify_add_watch:
         errno = EPERM; return -1L;
 
-    // clone / fork — block all fork() attempts from ACE (SVC level)
-    // fork() on ARM64 is clone(SIGCHLD, 0, ...) = syscall 220.
-    // Blocking here prevents the child-process maps-scanner that sends SIGKILL
-    // to the parent from a PID our kill-block doesn't cover.
-    case 220: // __NR_clone
-        errno = EPERM; return -1L;
-
     // kill(pid, sig) — a1=pid, a2=sig
     // Block lethal signals to: self, broadcast (0/-1), or our stored protected PID
     // The protected PID covers the forked-child scenario where child != getpid()
