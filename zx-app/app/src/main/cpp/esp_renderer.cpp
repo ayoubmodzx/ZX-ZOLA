@@ -59,6 +59,9 @@ static std::atomic<bool> g_esp_on{false};
 static std::atomic<bool> g_hs_on{false};
 static std::atomic<bool> g_w2s_valid{false};
 
+// Screen size — declared here so gles_flush() can reference them
+static int g_sw = 1080, g_sh = 1920;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Pure GLES3 line renderer — compiled shader + VBO, no Unity GL icalls
 // ─────────────────────────────────────────────────────────────────────────────
@@ -204,9 +207,6 @@ static EnemyData       g_cache[MAX_ENM];
 static int             g_cache_n = 0;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static void           *g_local_player = nullptr;
-
-// Screen size (refreshed per frame from Screen.get_width/height)
-static int g_sw = 1080, g_sh = 1920;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // World → Screen projection
