@@ -42,8 +42,13 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <signal.h>
+#include <ucontext.h>
 #ifndef __NR_openat
 #define __NR_openat 56
+#endif
+#ifndef __NR_mprotect
+#define __NR_mprotect 226
 #endif
 #include <pthread.h>
 #include <cstring>
@@ -310,6 +315,72 @@ static ssize_t hook_readlink(const char *path, char *buf, size_t sz) {
         }
     }
     return r;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 10c — mprotect trap blocker
+//
+// libanogs calls mprotect(page, 4096, PROT_NONE) during its init to set up
+// an "intentional crash trap" page. When detection fires, it accesses that
+// page → SIGSEGV → process dies. We intercept mprotect from libanogs's GOT
+// and silently discard any PROT_NONE call, leaving the page accessible.
+// ═════════════════════════════════════════════════════════════════════════════
+
+using FnMprotect = int(*)(void*, size_t, int);
+static FnMprotect g_orig_mprotect = nullptr;
+
+static int hook_mprotect(void *addr, size_t len, int prot) {
+    if (prot == PROT_NONE) {
+        LI("[mprotect] blocked PROT_NONE @ %p sz=%zu — crash trap neutralised", addr, (size_t)len);
+        return 0;
+    }
+    return g_orig_mprotect ? g_orig_mprotect(addr, len, prot)
+                           : (int)syscall(__NR_mprotect, addr, len, prot);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGSEGV suppressor — catches intentional crash-trap segfaults from libanogs
+//
+// libanogs's kill mechanism: it mprotect(PROT_NONE) a page at a fixed offset
+// inside itself (observed: base+0x502000) and accesses it when detection fires.
+// We install a SA_SIGINFO SIGSEGV handler; if si_addr falls inside libanogs's
+// mapped range we advance PC by 4 (skip the faulting instruction) and return.
+// This turns a fatal SIGSEGV into a skipped instruction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static uintptr_t s_sigv_ano_base = 0;
+static uintptr_t s_sigv_ano_end  = 0;
+
+static void __attribute__((noinline))
+sigsegv_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
+    (void)sig;
+    uintptr_t fault_addr = (uintptr_t)info->si_addr;
+    if (s_sigv_ano_base && fault_addr >= s_sigv_ano_base && fault_addr < s_sigv_ano_end) {
+        // Fault is inside libanogs — intentional crash trap
+        ucontext_t *ctx = (ucontext_t*)raw_ctx;
+        // ARM64: all instructions are 4 bytes; advance past the faulting insn
+        ctx->uc_mcontext.pc += 4;
+        return; // resume execution after the faulting instruction
+    }
+    // Not from libanogs — re-deliver as default (die)
+    struct sigaction dfl = {};
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    syscall(186 /*rt_sigaction*/, SIGSEGV, &dfl, nullptr, sizeof(sigset_t));
+    raise(SIGSEGV);
+}
+
+static void install_sigsegv_suppressor(uintptr_t ano_base, uintptr_t ano_end) {
+    s_sigv_ano_base = ano_base;
+    s_sigv_ano_end  = ano_end;
+    struct sigaction sa = {};
+    sa.sa_sigaction = sigsegv_suppressor;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    // Use raw syscall to bypass any STH4 sigaction hook that might swallow this
+    syscall(186 /*rt_sigaction*/, SIGSEGV, &sa, nullptr, sizeof(sigset_t));
+    LI("SIGSEGV suppressor installed for libanogs [%lx-%lx]",
+       (unsigned long)ano_base, (unsigned long)ano_end);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -618,8 +689,23 @@ void install_stealth_ext() {
     // Must happen before L7a hooks dl_iterate_phdr
     dl_iterate_phdr(phdr_find_anogs_stx, nullptr);
     uintptr_t ano_base = s_stx_ano_base;
-    if (ano_base) LI("libanogs base: 0x%lx", (unsigned long)ano_base);
+    uintptr_t ano_end  = s_stx_ano_end;
+    if (ano_base) LI("libanogs base: 0x%lx end: 0x%lx", (unsigned long)ano_base, (unsigned long)ano_end);
     else          LE("libanogs base NOT found — GOT patching unavailable");
+
+    // Install SIGSEGV suppressor BEFORE libanogs's background threads start scanning
+    // (libanogs's crash trap fires a SIGSEGV at its own base+0x502000)
+    if (ano_base) install_sigsegv_suppressor(ano_base, ano_end);
+
+    // Pre-open the observed crash-trap page so accessing it doesn't SIGSEGV
+    // even if libanogs already called mprotect(PROT_NONE) during JNI_OnLoad
+    if (ano_base) {
+        const uintptr_t ps = (uintptr_t)getpagesize();
+        uintptr_t trap_pg = (ano_base + 0x502000u) & ~(ps - 1u);
+        int mr = (int)syscall(__NR_mprotect, (void*)trap_pg, ps,
+                              PROT_READ | PROT_WRITE);
+        LI("libanogs trap-page mprotect R/W @ 0x%lx → %d", (unsigned long)trap_pg, mr);
+    }
 
     // ── Layer 7a — dl_iterate_phdr ──────────────────────────────────────────
     // dl_iterate_phdr is NOT in libanogs's import list; DobbyHook on bionic is safe
@@ -668,15 +754,17 @@ void install_stealth_ext() {
         LI("L9 inotify nullifier installed (DobbyHook fallback — may trip scanner)");
     }
 
-    // ── Layer 10 — popen gate + access filter ───────────────────────────────
+    // ── Layer 10 — popen gate + access filter + mprotect trap blocker ──────
     // popen + access ARE in libanogs imports — same scanner risk.
     // GOT patch only; g_orig_* point directly to real bionic symbols.
-    g_orig_popen  = (FnPopen)dlsym(libc, "popen");
-    g_orig_access = (FnAccess)dlsym(libc, "access");
+    g_orig_popen    = (FnPopen)dlsym(libc, "popen");
+    g_orig_access   = (FnAccess)dlsym(libc, "access");
+    g_orig_mprotect = (FnMprotect)dlsym(libc, "mprotect");
     if (ano_base) {
-        anogs_patch_got_import(ano_base, "popen",  (void*)hook_popen);
-        anogs_patch_got_import(ano_base, "access", (void*)hook_access);
-        LI("L10 popen gate + access filter installed (GOT — no bionic trampoline)");
+        anogs_patch_got_import(ano_base, "popen",    (void*)hook_popen);
+        anogs_patch_got_import(ano_base, "access",   (void*)hook_access);
+        anogs_patch_got_import(ano_base, "mprotect", (void*)hook_mprotect);
+        LI("L10 popen/access/mprotect installed (GOT — no bionic trampoline)");
     } else if (libc) {
         hk_libc(libc, "popen",  (void*)hook_popen,  (void**)&g_orig_popen);
         hk_libc(libc, "access", (void*)hook_access, (void**)&g_orig_access);
