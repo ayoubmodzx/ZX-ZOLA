@@ -27,6 +27,7 @@
 
 #include "stealth_ext.hpp"
 #include "stealth_ext2.hpp"   // stx2_register_rwx for new trampoline pages
+#include "stealth_ext7.hpp"   // anogs_patch_got_import, is_hookable_arm64
 #include "dobby_stub.hpp"
 #include "anti_detect.hpp"
 #include <android/log.h>
@@ -613,18 +614,34 @@ void install_stealth_ext() {
 
     void *ano = dlopen(ano_name, RTLD_LAZY | RTLD_NOLOAD);
 
+    // Resolve libanogs base address synchronously — needed for GOT patching
+    // Must happen before L7a hooks dl_iterate_phdr
+    dl_iterate_phdr(phdr_find_anogs_stx, nullptr);
+    uintptr_t ano_base = s_stx_ano_base;
+    if (ano_base) LI("libanogs base: 0x%lx", (unsigned long)ano_base);
+    else          LE("libanogs base NOT found — GOT patching unavailable");
+
     // ── Layer 7a — dl_iterate_phdr ──────────────────────────────────────────
+    // dl_iterate_phdr is NOT in libanogs's import list; DobbyHook on bionic is safe
     if (libc) hk_libc(libc, "dl_iterate_phdr",
         (void*)hook_dl_iterate_phdr, (void**)&g_orig_iter_phdr);
 
-    // ── Layer 7b — dlopen ───────────────────────────────────────────────────
-    if (libc) hk_libc(libc, "dlopen",
-        (void*)hook_dlopen, (void**)&g_orig_dlopen);
+    // ── Layer 7b — dlopen ──────────────────────────────────────────────────
+    // dlopen IS in libanogs imports — use GOT patch to avoid bionic body trampoline
+    g_orig_dlopen = (FnDlopen)dlsym(libc, "dlopen");
+    if (ano_base && g_orig_dlopen) {
+        anogs_patch_got_import(ano_base, "dlopen", (void*)hook_dlopen);
+        LI("L7b dlopen interceptor installed (GOT)");
+    } else if (libc) {
+        hk_libc(libc, "dlopen", (void*)hook_dlopen, (void**)&g_orig_dlopen);
+        LI("L7b dlopen interceptor installed (DobbyHook fallback)");
+    }
 
     // ── Layer 7c — AnoSDK missing exports ──────────────────────────────────
     if (ano) install_ano_missing(ano, ano_name);
 
     // ── Layer 8 — /proc/self/fd spoofing ───────────────────────────────────
+    // opendir/closedir/readdir/readlink NOT in libanogs imports; DobbyHook safe
     for (int i = 0; i < MAX_FD_DIRS; i++) g_fd_dirs[i].store(0);
     if (libc) {
         hk_libc(libc, "opendir",  (void*)hook_opendir,  (void**)&g_orig_opendir);
@@ -635,17 +652,35 @@ void install_stealth_ext() {
     }
 
     // ── Layer 9 — inotify nullifier ─────────────────────────────────────────
-    if (libc) {
+    // inotify_init + inotify_add_watch ARE in libanogs imports.
+    // DobbyHook on bionic puts trampolines in their bodies which libanogs's
+    // inline_hook_opcode_dismatch scanner detects immediately → process kill.
+    // GOT patch redirects only libanogs's calls; bionic bodies stay pristine.
+    g_orig_inotify_init = (FnInotifyInit)dlsym(libc, "inotify_init");
+    g_orig_inotify_add  = (FnInotifyAddWatch)dlsym(libc, "inotify_add_watch");
+    if (ano_base) {
+        anogs_patch_got_import(ano_base, "inotify_init",     (void*)hook_inotify_init);
+        anogs_patch_got_import(ano_base, "inotify_add_watch",(void*)hook_inotify_add);
+        LI("L9 inotify nullifier installed (GOT — no bionic trampoline)");
+    } else if (libc) {
         hk_libc(libc, "inotify_init",     (void*)hook_inotify_init, (void**)&g_orig_inotify_init);
         hk_libc(libc, "inotify_add_watch",(void*)hook_inotify_add,  (void**)&g_orig_inotify_add);
-        LI("L9 inotify nullifier installed");
+        LI("L9 inotify nullifier installed (DobbyHook fallback — may trip scanner)");
     }
 
     // ── Layer 10 — popen gate + access filter ───────────────────────────────
-    if (libc) {
+    // popen + access ARE in libanogs imports — same scanner risk.
+    // GOT patch only; g_orig_* point directly to real bionic symbols.
+    g_orig_popen  = (FnPopen)dlsym(libc, "popen");
+    g_orig_access = (FnAccess)dlsym(libc, "access");
+    if (ano_base) {
+        anogs_patch_got_import(ano_base, "popen",  (void*)hook_popen);
+        anogs_patch_got_import(ano_base, "access", (void*)hook_access);
+        LI("L10 popen gate + access filter installed (GOT — no bionic trampoline)");
+    } else if (libc) {
         hk_libc(libc, "popen",  (void*)hook_popen,  (void**)&g_orig_popen);
         hk_libc(libc, "access", (void*)hook_access, (void**)&g_orig_access);
-        LI("L10 popen gate + access filter installed");
+        LI("L10 popen gate + access filter installed (DobbyHook fallback — may trip scanner)");
     }
 
     // ── Layer 11 — MADV_DONTDUMP + prctl ────────────────────────────────────

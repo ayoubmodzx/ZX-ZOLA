@@ -217,7 +217,7 @@ bool is_hookable_arm64(const void *fn) {
 // Patch libanogs.so's GOT entry for a named import symbol.
 // More targeted than DobbyHook on the bionic global: only intercepts calls
 // originating inside libanogs.so itself.
-static bool anogs_patch_got_import(uintptr_t ano_base, const char *sym_name, void *new_fn) {
+bool anogs_patch_got_import(uintptr_t ano_base, const char *sym_name, void *new_fn) {
     if (!ano_base || !sym_name || !new_fn) return false;
     const Elf64_Ehdr *ehdr = (const Elf64_Ehdr*)ano_base;
     if (ehdr->e_ident[EI_MAG0] != ELFMAG0 || ehdr->e_ident[EI_MAG1] != ELFMAG1 ||
