@@ -370,25 +370,18 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     ucontext_t *ctx2 = (ucontext_t*)raw_ctx;
 #ifdef __aarch64__
     uintptr_t pc = ctx2->uc_mcontext.pc;
-    uintptr_t lr = ctx2->uc_mcontext.regs[30];
 #elif defined(__arm__)
     uintptr_t pc = ctx2->uc_mcontext.arm_pc;
-    uintptr_t lr = ctx2->uc_mcontext.arm_lr;
 #else
-    uintptr_t pc = 0, lr = 0;
+    uintptr_t pc = 0;
 #endif
 
     if (s_sigv_ano_base && fault_addr >= s_sigv_ano_base && fault_addr < s_sigv_ano_end) {
         // Fault inside libanogs crash-trap pages.
-        // Strategy: skip the faulting instruction entirely (PC+4).
-        // Do NOT mprotect R/W — that lets the scanner read zero-bytes from the
-        // now-accessible page, which it detects as "crash-trap bypassed" and
-        // triggers a kill.  By skipping, the scanner gets stale register values
-        // instead of zeros: it can't distinguish this from a normal PROT_NONE
-        // gap, so no detection fires.
+        // skip+4: scanner gets stale register values from the skipped load.
+        // Do NOT mprotect R/W (scanner reads zeros → detects bypass).
         uintptr_t fault_page = fault_addr & ~(uintptr_t)0xFFF;
-        LI("[SIG%d] trap %p → skip+4 pc=%p lr=%p",
-           sig, (void*)fault_page, (void*)pc, (void*)lr);
+        LI("[SIG%d] trap %p → skip+4 pc=%p", sig, (void*)fault_page, (void*)pc);
 #ifdef __aarch64__
         ctx2->uc_mcontext.pc += 4;
 #elif defined(__arm__)
@@ -398,26 +391,16 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     }
 
     if (sig == SIGBUS) {
-        if (fault_addr == pc) {
-            // Instruction-fetch SIGBUS: scanner branched to a non-canonical/unaligned
-            // address (stale register from a previously skipped load).  Incrementing
-            // PC by 4 just walks through garbage 4 bytes at a time — 24 consecutive
-            // SIGBUS faults observed before kill.
-            // Instead: redirect PC → LR so the scanner "returns" from the bad call
-            // with x0=0 (null), letting it continue from the original call site.
-            LI("[SIGBUS] fetch fault=%p → redirect to lr=%p", (void*)fault_addr, (void*)lr);
-#ifdef __aarch64__
-            ctx2->uc_mcontext.pc       = lr;
-            ctx2->uc_mcontext.regs[0]  = 0;   // x0 = 0 (null return value)
-#elif defined(__arm__)
-            ctx2->uc_mcontext.arm_pc   = ctx2->uc_mcontext.arm_lr;
-            ctx2->uc_mcontext.arm_r0   = 0;
-#endif
-            return;
-        }
-        // SIGBUS from scanner dereffing a garbage/non-canonical data pointer —
-        // skip past the faulting load/store so the scanner can unwind cleanly.
-        LI("[SIGBUS] data fault=%p pc=%p — skip+4", (void*)fault_addr, (void*)pc);
+        // ALL SIGBUS cases (instruction-fetch fault_addr==pc AND data faults) → skip+4.
+        //
+        // The LR-redirect "fix" (commit 1cc397b) was empirically worse:
+        //   skip+4 walk → scanner stuck in SIGBUS loop → wp=6522 (all 61 layers install)
+        //   LR redirect  → scanner unblocks, processes x0=0, immediately SVC-kills → wp=3286
+        //
+        // skip+4 on instruction-fetch keeps the scanner spinning in an infinite SIGBUS
+        // loop through garbage address space, buying time for all layers to install
+        // before the scanner can reach a live kill path.
+        LI("[SIGBUS] fault=%p pc=%p — skip+4", (void*)fault_addr, (void*)pc);
 #ifdef __aarch64__
         ctx2->uc_mcontext.pc += 4;
 #elif defined(__arm__)
@@ -426,17 +409,15 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
         return;
     }
 
-    // SIGSEGV or other signal outside linanogs range.
-    // If fault_addr == pc the scanner branched to an unmapped but aligned address;
-    // redirect to LR the same way as the SIGBUS instruction-fetch case.
+    // SIGSEGV outside libanogs range.
+    // fault_addr == pc: scanner branched to an unmapped aligned address.
+    // skip+4 keeps the scanner from resolving back to a live kill path.
     if (fault_addr == pc) {
-        LI("[SIG%d] fetch fault=%p → redirect to lr=%p", sig, (void*)fault_addr, (void*)lr);
+        LI("[SIG%d] fetch fault=%p — skip+4", sig, (void*)fault_addr);
 #ifdef __aarch64__
-        ctx2->uc_mcontext.pc      = lr;
-        ctx2->uc_mcontext.regs[0] = 0;
+        ctx2->uc_mcontext.pc += 4;
 #elif defined(__arm__)
-        ctx2->uc_mcontext.arm_pc  = ctx2->uc_mcontext.arm_lr;
-        ctx2->uc_mcontext.arm_r0  = 0;
+        ctx2->uc_mcontext.arm_pc += 4;
 #endif
         return;
     }

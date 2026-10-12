@@ -401,25 +401,27 @@ static int hook_kill(pid_t pid, int sig) {
     pid_t my_pid = getpid();
     if (is_fatal_sig(sig) && (pid == my_pid || pid == 0 || pid == -1)) {
         uintptr_t ra = (uintptr_t)__builtin_return_address(0);
-        if (caller_is_ano7(ra)) {
-            LI("L57: blocked kill(%d,%d) from ano ra=%lx", pid, sig, (unsigned long)ra);
-            errno = EPERM;
-            return -1;
-        }
+        // Block ALL fatal kills to our PID regardless of caller origin.
+        // caller_is_ano7 was too restrictive: external scanner library kills
+        // from its own address range (not libanogs), bypassing the caller check
+        // and reaching us at wp=6522 after skip+4 walk escaped to valid code.
+        LI("L57: blocked kill(%d,%d) from_%s ra=%lx", pid, sig,
+           caller_is_ano7(ra) ? "ano" : "ext", (unsigned long)ra);
+        errno = EPERM;
+        return -1;
     }
     return g_orig_kill ? g_orig_kill(pid, sig)
-                       : (int)syscall(62 /*__NR_kill*/, pid, sig);
+                       : (int)syscall(129 /*__NR_kill*/, pid, sig);
 }
 
 static int hook_tgkill(pid_t tgid, pid_t tid, int sig) {
     pid_t my_pid = getpid();
     if (is_fatal_sig(sig) && (tgid == my_pid || tgid == 0)) {
         uintptr_t ra = (uintptr_t)__builtin_return_address(0);
-        if (caller_is_ano7(ra)) {
-            LI("L57: blocked tgkill(%d,%d,%d) from ano ra=%lx", tgid, tid, sig, (unsigned long)ra);
-            errno = EPERM;
-            return -1;
-        }
+        LI("L57: blocked tgkill(%d,%d,%d) from_%s ra=%lx", tgid, tid, sig,
+           caller_is_ano7(ra) ? "ano" : "ext", (unsigned long)ra);
+        errno = EPERM;
+        return -1;
     }
     return g_orig_tgkill ? g_orig_tgkill(tgid, tid, sig)
                          : (int)syscall(131 /*__NR_tgkill*/, tgid, tid, sig);
