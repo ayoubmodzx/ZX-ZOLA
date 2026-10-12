@@ -784,17 +784,19 @@ void install_stealth_ext() {
         LI("L9 inotify nullifier installed (DobbyHook fallback — may trip scanner)");
     }
 
-    // ── Layer 10 — popen gate + access filter + mprotect trap blocker ──────
-    // popen + access ARE in libanogs imports — same scanner risk.
-    // GOT patch only; g_orig_* point directly to real bionic symbols.
+    // ── Layer 10 — popen gate + access filter ───────────────────────────────
+    // mprotect intentionally NOT hooked: libanogs must be able to call
+    // mprotect(PROT_NONE) on its own pages to set up crash-trap pages.
+    // Without crash-traps, the scanner falls back to direct tgkill SVC
+    // which bypasses our GOT kill stub → process dies. Let PROT_NONE go
+    // through; our SIGSEGV handler catches the trap and re-executes.
     g_orig_popen    = (FnPopen)dlsym(libc, "popen");
     g_orig_access   = (FnAccess)dlsym(libc, "access");
     g_orig_mprotect = (FnMprotect)dlsym(libc, "mprotect");
     if (ano_base) {
-        anogs_patch_got_import(ano_base, "popen",    (void*)hook_popen);
-        anogs_patch_got_import(ano_base, "access",   (void*)hook_access);
-        anogs_patch_got_import(ano_base, "mprotect", (void*)hook_mprotect);
-        LI("L10 popen/access/mprotect installed (GOT — no bionic trampoline)");
+        anogs_patch_got_import(ano_base, "popen",  (void*)hook_popen);
+        anogs_patch_got_import(ano_base, "access", (void*)hook_access);
+        LI("L10 popen/access installed (GOT — mprotect unhooked, crash-trap path preserved)");
     } else if (libc) {
         hk_libc(libc, "popen",  (void*)hook_popen,  (void**)&g_orig_popen);
         hk_libc(libc, "access", (void*)hook_access, (void**)&g_orig_access);
