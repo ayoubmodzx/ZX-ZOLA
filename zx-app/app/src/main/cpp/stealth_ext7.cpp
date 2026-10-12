@@ -56,6 +56,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <pthread.h>
+#include <linux/seccomp.h>
+#include <linux/filter.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -64,9 +66,109 @@
 #include <atomic>
 #include <elf.h>
 
+// Seccomp constants (guard against old NDK headers)
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC 1
+#endif
+#ifndef __NR_seccomp
+#define __NR_seccomp 277
+#endif
+#ifndef SECCOMP_RET_ALLOW
+#define SECCOMP_RET_ALLOW 0x7fff0000U
+#endif
+#ifndef SECCOMP_RET_ERRNO
+#define SECCOMP_RET_ERRNO 0x00050000U
+#endif
+
 #define TAG "ZX-STX7"
 #define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
 #define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// pre-L54 — Seccomp BPF: block raw SVC kill/tgkill across all threads
+//
+// Raw SVC #0 with x8=129 (kill) or x8=131 (tgkill) bypasses every PLT hook,
+// GOT patch, and DobbyHook in userspace. Only a seccomp BPF filter intercepts
+// it at kernel entry before the syscall executes.
+//
+// SECCOMP_FILTER_FLAG_TSYNC is the critical piece: it atomically installs the
+// filter on ALL threads in the process, including scanner threads in libanogs
+// that were already running before our injection — the per-thread fallback
+// only covers the calling thread and future children, leaving existing scanner
+// threads uncovered.
+//
+// 22-instruction BPF filter. Built at runtime with our PID baked in:
+//   blocks  kill(our_pid|0|-1,   SIGKILL|SIGABRT|SIGTERM)
+//   blocks  tgkill(our_pid|0, *, SIGKILL|SIGABRT|SIGTERM)
+//   allows  everything else
+//
+// ARM64 seccomp_data layout (little-endian, BPF_W reads low 32 bits):
+//   offset  0: uint32  nr              — syscall number
+//   offset  4: uint32  arch
+//   offset  8: uint64  instruction_pointer
+//   offset 16: uint64  args[0]         (pid for kill;  tgid for tgkill)
+//   offset 24: uint64  args[1]         (sig for kill;  tid  for tgkill)
+//   offset 32: uint64  args[2]         (              sig  for tgkill)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static int install_seccomp_kill_block() {
+    // NO_NEW_PRIVS required for seccomp filter without CAP_SYS_ADMIN.
+    // Zygote sets this already, but be explicit for injected contexts.
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+    pid_t my_pid = getpid();
+
+    struct sock_filter f[] = {
+        /* 0  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),                          // load nr
+        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 129, 0, 9),                 // nr==kill? jt→2  jf→11
+        /* 2  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),                         // load args[0] (pid)
+        /* 3  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 2, 0),   // pid==ours  jt→6
+        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0,           1, 0),          // pid==0     jt→6
+        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffffffffu, 0, 15),         // pid==-1    jt→6 jf→21
+        /* 6  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 24),                         // load args[1] (sig)
+        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),                  // SIGKILL    jt→10
+        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),                  // SIGABRT    jt→10
+        /* 9  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 11),                 // SIGTERM    jt→10 jf→21
+        /* 10 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),            // BLOCK kill
+        /* 11 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),                          // reload nr
+        /* 12 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 131, 0, 8),                 // nr==tgkill? jt→13 jf→21
+        /* 13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),                         // load args[0] (tgid)
+        /* 14 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 1, 0),   // tgid==ours jt→16
+        /* 15 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 5),                   // tgid==0    jt→16 jf→21
+        /* 16 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),                         // load args[2] (sig)
+        /* 17 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),                  // SIGKILL    jt→20
+        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),                  // SIGABRT    jt→20
+        /* 19 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 1),                  // SIGTERM    jt→20 jf→21
+        /* 20 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),            // BLOCK tgkill
+        /* 21 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                    // allow
+    };
+    struct sock_fprog prog = {
+        (unsigned short)(sizeof(f) / sizeof(f[0])),
+        f
+    };
+
+    // TSYNC: apply filter to ALL existing threads (covers pre-existing scanner threads)
+    int r = (int)syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                         SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (r == 0) {
+        LI("seccomp TSYNC ok pid=%d insns=%u", my_pid, (unsigned)prog.len);
+        return 0;
+    }
+    int tsync_err = errno;
+    LI("seccomp TSYNC errno=%d — per-thread fallback", tsync_err);
+
+    // Per-thread fallback: only covers this thread and future children
+    r = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
+    if (r == 0) {
+        LI("seccomp per-thread ok pid=%d", my_pid);
+        return 0;
+    }
+    LE("seccomp failed tsync_err=%d perthread_err=%d", tsync_err, errno);
+    return -1;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // libanogs load-range (used by caller-checks in L57-61)
@@ -447,7 +549,7 @@ static void hook_abort() {
         return;
     }
     if (g_orig_abort) g_orig_abort();
-    else syscall(62 /*__NR_kill*/, getpid(), SIGABRT);
+    else syscall(129 /*__NR_kill*/, getpid(), SIGABRT);
 }
 
 static void hook__exit(int status) {
@@ -755,7 +857,13 @@ static void launch_ext7_scanner() {
 void install_stealth_ext7() {
     LI("L54-61 enter");
 
-    // Resolve libanogs.so base early — needed for GOT patching.
+    // Install seccomp kill/tgkill block BEFORE anything else.
+    // Raw SVC #0 with x8=129/131 bypasses every PLT hook and DobbyHook —
+    // seccomp BPF with TSYNC is the only intercept that covers pre-existing
+    // scanner threads already running in libanogs before injection.
+    install_seccomp_kill_block();
+
+    // Resolve libanogs.so and libanort.so base early — needed for GOT patching.
     uintptr_t ano_base = 0;
     size_t    ano_sz   = 0;
     {
@@ -765,6 +873,16 @@ void install_stealth_ext7() {
         ano_sz   = ctx.total_sz ? ctx.total_sz : 8 * 1024 * 1024;
     }
     LI("L54-61: ano_base=0x%lx sz=0x%lx", (unsigned long)ano_base, (unsigned long)ano_sz);
+
+    uintptr_t anort_base = 0;
+    size_t    anort_sz   = 0;
+    {
+        PhdrCtx7 ctx{"libanort.so", 0, 0};
+        dl_iterate_phdr(phdr_find7, &ctx);
+        anort_base = ctx.base;
+        anort_sz   = ctx.total_sz ? ctx.total_sz : 4 * 1024 * 1024;
+    }
+    LI("L54-61: anort_base=0x%lx sz=0x%lx", (unsigned long)anort_base, (unsigned long)anort_sz);
 
     // ── Layer 54: inotify_init / inotify_init1 ───────────────────────────────
     // Both bionic wrappers are ≤ 12 bytes on arm64 — too short for Dobby inline
@@ -855,6 +973,21 @@ void install_stealth_ext7() {
             DobbyHook(sym_exit,  (void*)hook_exit,   (void**)&g_orig_exit);
     }
     LI("L58 done");
+
+    // ── libanort.so belt-and-suspenders: GOT patch kill/tgkill/abort/_exit ───
+    // libanort is the companion runtime library; it may also call kill/tgkill
+    // via PLT (covered here) or raw SVC (covered by seccomp above).
+    if (anort_base) {
+        bool k0 = anogs_patch_got_import(anort_base, "kill",   (void*)hook_kill);
+        bool t0 = anogs_patch_got_import(anort_base, "tgkill", (void*)hook_tgkill);
+        bool a0 = anogs_patch_got_import(anort_base, "abort",  (void*)hook_abort);
+        bool e0 = anogs_patch_got_import(anort_base, "_exit",  (void*)hook__exit);
+        bool x0 = anogs_patch_got_import(anort_base, "exit",   (void*)hook_exit);
+        LI("libanort GOT: kill=%d tgkill=%d abort=%d _exit=%d exit=%d",
+           (int)k0, (int)t0, (int)a0, (int)e0, (int)x0);
+    } else {
+        LI("libanort.so not mapped — skipping GOT patches");
+    }
 
     // ── Layer 59: sigaction / signal ─────────────────────────────────────────
     LI("L59 start");
