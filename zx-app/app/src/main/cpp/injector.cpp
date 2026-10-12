@@ -198,6 +198,35 @@ static uintptr_t find_svc_gadget(pid_t pid) {
     return 0;
 }
 
+// PTRACE_SINGLESTEP wait helper: SIGCHLD from dying fork children can race with
+// the single-step stop.  Loop until we get a non-SIGCHLD ptrace-stop.
+// If SIGCHLD arrives after the SVC executed (PC advanced past svc_pc), we fake
+// a SIGTRAP status so the caller sees success and reads X0 normally.
+// If SIGCHLD arrives before the SVC executed (PC still == svc_pc), we suppress
+// the signal and re-issue PTRACE_SINGLESTEP.
+static int safe_singlestep_wait(pid_t pid, uintptr_t svc_pc) {
+    int wst = 0;
+    for (int _wi = 0; _wi < 64; ++_wi) {
+        waitpid(pid, &wst, 0);
+        if (!WIFSTOPPED(wst)) break;         // process died — propagate as-is
+        if (WSTOPSIG(wst) != SIGCHLD) break; // SIGTRAP or real fault — propagate
+        pt_regs chk; get_regs(pid, &chk);
+        if (chk.pc != svc_pc) {
+            // SVC completed; SIGCHLD arrived just after the syscall returned.
+            // Fake SIGTRAP stopped status so the check below sees success.
+            zerr("safe_singlestep_wait: SIGCHLD after SVC completed (PC=0x%lx), faking SIGTRAP",
+                 (unsigned long)chk.pc);
+            wst = (SIGTRAP << 8) | 0x7f;
+            break;
+        }
+        // SVC not yet executed — suppress SIGCHLD and re-issue the step
+        zerr("safe_singlestep_wait: SIGCHLD before SVC (PC=0x%lx==svc), restepping _wi=%d",
+             (unsigned long)chk.pc, _wi);
+        ptrace(PTRACE_SINGLESTEP, pid, nullptr, (void*)0L);
+    }
+    return wst;
+}
+
 // Allocate RWX memory in target via a raw SVC #0 gadget + PTRACE_SINGLESTEP.
 // Bypasses the mmap() C wrapper whose BTI guard (ARMv8.5+) causes SIGSEGV when
 // we teleport PC there via PTRACE_SETREGSET instead of a real BL/BLR instruction.
@@ -247,8 +276,7 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     // PTRACE_SINGLESTEP: executes exactly the SVC instruction, then stops with SIGTRAP.
     // The kernel handles the mmap syscall during the SVC, returns X0 = mapped address.
     ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int wst = 0;
-    waitpid(pid, &wst, 0);
+    int wst = safe_singlestep_wait(pid, svc_addr);
 
     if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
         pt_regs crash; get_regs(pid, &crash);
@@ -542,7 +570,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         rr.pc = find_svc_gadget(pid);
         if (rr.pc && set_regs(pid, &rr)) {
             ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-            int wst = 0; waitpid(pid, &wst, 0);
+            safe_singlestep_wait(pid, rr.pc);
             pt_regs rp; get_regs(pid, &rp);
             int64_t fd_ret = (int64_t)rp.regs[0];
             zerr("remote_dlopen: openat test fd=%lld (neg=errno, >=0=ok)", (long long)fd_ret);
@@ -577,7 +605,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                 rr.pc = svc;
                 if (!set_regs(pid, &rr)) { set_regs(pid, &ro); return -EINVAL; }
                 ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-                int wst=0; waitpid(pid, &wst, 0);
+                safe_singlestep_wait(pid, svc);
                 pt_regs rp; get_regs(pid, &rp);
                 set_regs(pid, &ro);
                 return (int64_t)rp.regs[0];
@@ -737,7 +765,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         rcl.pc = find_svc_gadget(pid);
         if (rcl.pc && set_regs(pid, &rcl)) {
             ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-            int cwst = 0; waitpid(pid, &cwst, 0);
+            safe_singlestep_wait(pid, rcl.pc);
             zerr("remote_dlopen: closed fd=%lld", (long long)saved_fd);
         }
     }
