@@ -480,7 +480,8 @@ static FnSigaction g_orig_sigaction = nullptr;
 static FnSignal    g_orig_signal    = nullptr;
 
 static inline bool sig_is_protected(int sig) {
-    return sig == SIGABRT || sig == SIGKILL || sig == SIGTRAP;
+    return sig == SIGABRT || sig == SIGKILL || sig == SIGTRAP
+        || sig == SIGSEGV || sig == SIGBUS;
 }
 
 static int hook_sigaction(int signum, const struct sigaction *act,
