@@ -952,13 +952,11 @@ int main(int argc, char *argv[]) {
                 zerr("main: libanogs read stub @ 0x%lx pre-patched r0=%d r1=%d",
                      (unsigned long)read_stub, (int)r0, (int)r1);
 
-                // Scanner entry points — NOP with RET so scan loop never executes
-                uintptr_t scn1 = anogs_base + 0x1b9ce4UL;
-                uintptr_t scn2 = anogs_base + 0x1ba72cUL;
-                bool s1 = remote_poke_insn(pid, scn1, 0xD65F03C0u); // RET
-                bool s2 = remote_poke_insn(pid, scn2, 0xD65F03C0u); // RET
-                zerr("main: libanogs scanners pre-patched scn1=%d@0x%lx scn2=%d@0x%lx",
-                     (int)s1, (unsigned long)scn1, (int)s2, (unsigned long)scn2);
+                // Scanner entry points — NOT pre-patched: silencing them prevents
+                // the crash-trap mechanism from firing, which is the only kill path
+                // our SIGSEGV handler can intercept. Let the scanners run; they will
+                // trigger crash-trap SIGSEGV which the payload handler absorbs.
+                zerr("main: libanogs scanners NOT pre-patched (crash-trap SIGSEGV path preserved)");
             } else {
                 zerr("main: WARNING libanogs.so not found — kill stub pre-patch skipped");
             }
