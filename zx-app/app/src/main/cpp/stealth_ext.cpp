@@ -364,24 +364,25 @@ sigsegv_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     uintptr_t fault_addr = (uintptr_t)info->si_addr;
     if (s_sigv_ano_base && fault_addr >= s_sigv_ano_base && fault_addr < s_sigv_ano_end) {
         // Fault is inside libanogs — intentional crash trap.
-        // Return via LR rather than stepping +4 so we exit the crash-trap
-        // function cleanly, regardless of how many bad loads follow.
-        ucontext_t *ctx = (ucontext_t*)raw_ctx;
+        // Strategy: make the faulted page R/W and return WITHOUT changing PC.
+        // The faulting instruction re-executes and succeeds (reads 0-bytes).
+        // Returning via LR causes the crash-trap's CALLER to deref x0 as a
+        // pointer (x0=0 after our fake return) → null-deref at 0x10 → die.
+        uintptr_t fault_page = fault_addr & ~(uintptr_t)0xFFF;
+        int r2 = (int)syscall(__NR_mprotect, (void*)fault_page, 0x1000,
+                              PROT_READ | PROT_WRITE);
 #ifdef __aarch64__
-        uintptr_t lr  = ctx->uc_mcontext.regs[30];
-        uintptr_t pc  = ctx->uc_mcontext.pc;
-        uintptr_t sp  = ctx->uc_mcontext.sp;
-        LI("[SIGSEGV] caught fault=%p pc=%p lr=%p sp=%p — ret via LR",
-           (void*)fault_addr, (void*)pc, (void*)lr, (void*)sp);
-        ctx->uc_mcontext.pc = lr; // jump to caller's return site
+        uintptr_t pc = ((ucontext_t*)raw_ctx)->uc_mcontext.pc;
+        uintptr_t lr = ((ucontext_t*)raw_ctx)->uc_mcontext.regs[30];
 #elif defined(__arm__)
-        uintptr_t lr = ctx->uc_mcontext.arm_lr;
-        uintptr_t pc = ctx->uc_mcontext.arm_pc;
-        LI("[SIGSEGV] caught fault=%p pc=%p lr=%p — ret via LR",
-           (void*)fault_addr, (void*)pc, (void*)lr);
-        ctx->uc_mcontext.arm_pc = lr;
+        uintptr_t pc = ((ucontext_t*)raw_ctx)->uc_mcontext.arm_pc;
+        uintptr_t lr = ((ucontext_t*)raw_ctx)->uc_mcontext.arm_lr;
+#else
+        uintptr_t pc = 0, lr = 0;
 #endif
-        return;
+        LI("[SIGSEGV] trap %p → unprotected (r=%d) pc=%p lr=%p — re-exec",
+           (void*)fault_page, r2, (void*)pc, (void*)lr);
+        return; // resume at same PC; instruction re-executes successfully
     }
     // Not from libanogs — re-deliver as default (die)
     LI("[SIGSEGV] non-ano fault=%p — reinstating default handler", (void*)fault_addr);
