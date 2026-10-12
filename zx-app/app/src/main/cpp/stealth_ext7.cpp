@@ -370,7 +370,7 @@ static int patch_scanner_by_marker(uintptr_t lib_base, size_t lib_sz,
         uintptr_t fn = lib_base + offsets[i];
         uint32_t existing;
         __builtin_memcpy(&existing, (void*)fn, 4);
-        if (existing == kMovW0Zero) { patched++; continue; }
+        if (existing == kMovW0Zero || existing == kRet) { patched++; continue; }
         if (patch_page_rwx(fn, kMovW0Zero, kRet)) {
             LI("L56: patched '%s' scanner @ base+0x%lx", marker, (unsigned long)offsets[i]);
             patched++;

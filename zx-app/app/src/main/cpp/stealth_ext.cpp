@@ -736,15 +736,6 @@ void install_stealth_ext() {
     LI("installing SIGSEGV suppressor...");
     if (ano_base) install_sigsegv_suppressor(ano_base, ano_end);
 
-    // Pre-open the observed crash-trap page so accessing it doesn't SIGSEGV
-    // even if libanogs already called mprotect(PROT_NONE) during JNI_OnLoad
-    if (ano_base) {
-        const uintptr_t ps = (uintptr_t)getpagesize();
-        uintptr_t trap_pg = (ano_base + 0x502000u) & ~(ps - 1u);
-        int mr = (int)syscall(__NR_mprotect, (void*)trap_pg, ps,
-                              PROT_READ | PROT_WRITE);
-        LI("libanogs trap-page mprotect R/W @ 0x%lx → %d", (unsigned long)trap_pg, mr);
-    }
 
     // ── Layer 7a — dl_iterate_phdr ──────────────────────────────────────────
     // dl_iterate_phdr is NOT in libanogs's import list; DobbyHook on bionic is safe
