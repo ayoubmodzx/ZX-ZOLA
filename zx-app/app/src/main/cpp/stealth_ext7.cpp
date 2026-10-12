@@ -201,7 +201,7 @@ static void *hook_AnoDelData4(int t, int *len, int f, int g)
 
 // Returns true if the function at `fn` has ≥ 4 non-trivial ARM64 instructions
 // before the first RET/SVC — Dobby needs at least 16 bytes for its trampoline.
-static bool is_hookable_arm64(const void *fn) {
+bool is_hookable_arm64(const void *fn) {
     if (!fn) return false;
     const uint32_t *w = (const uint32_t*)fn;
     if (w[0] == 0xD65F03C0u) return false;        // bare RET

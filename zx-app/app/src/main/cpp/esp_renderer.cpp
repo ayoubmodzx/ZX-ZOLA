@@ -17,6 +17,7 @@
 #include "zx_logbuf.hpp"
 
 #include <GLES3/gl3.h>
+#include <EGL/egl.h>
 #include <android/log.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -47,7 +48,7 @@ using FnW2S_v2    = void(*)(void* cam, Vec3* worldPos, int eye, Vec3* out);
 using FnGetMain   = void*(*)();
 using FnGetWidth  = int(*)();
 using FnGetHeight = int(*)();
-using FnCamRender = void(*)(void*, void*);  // Camera.OnPostRender: thisPtr + MethodInfo*
+using FnCamRender = void(*)(void*, void*);  // kept for compatibility; not used since eglSwap hook
 
 static FnW2S       g_w2s    = nullptr;
 static FnW2S_v2    g_w2s_v2 = nullptr;
@@ -327,60 +328,15 @@ static void gl_restore(const GlSave &s) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Camera.OnPostRender hook
+// Core ESP draw — called from eglSwapBuffers hook on every rendered frame
+// Uses GLES3 (EGL context guaranteed current when eglSwapBuffers fires).
 // ─────────────────────────────────────────────────────────────────────────────
-
-static FnCamRender g_origOnPostRender = nullptr;
-
-static void *s_eglGetCurrentCtxFn = nullptr;
-static bool  s_egl_init            = false;
-
-static bool has_egl_context() {
-    if (!s_egl_init) {
-        s_egl_init = true;
-        void *egl = dlopen("libEGL.so", RTLD_LAZY | RTLD_NOLOAD);
-        if (egl) s_eglGetCurrentCtxFn = dlsym(egl, "eglGetCurrentContext");
-        LI("EGL: lib=%p getCtx=%p", egl, s_eglGetCurrentCtxFn);
-    }
-    if (!s_eglGetCurrentCtxFn) return false;
-    typedef void* (*Fn)();
-    return ((Fn)s_eglGetCurrentCtxFn)() != nullptr;
-}
 
 static void update_hs_target(void *cam);
 
-static void hook_OnPostRender(void *cam, void *mi) {
-    static std::atomic<int> s_call_count{0};
-    int n = ++s_call_count;
-    if (n <= 3 || (n % 300) == 0) {
-        pthread_mutex_lock(&g_mu);
-        int cached = g_cache_n;
-        pthread_mutex_unlock(&g_mu);
-        LI("OnPostRender #%d cam=%p esp_on=%d cache_n=%d w2s_valid=%d",
-           n, cam,
-           (int)g_esp_on.load(std::memory_order_relaxed),
-           cached,
-           (int)g_w2s_valid.load(std::memory_order_relaxed));
-    }
-
-    if (g_origOnPostRender) g_origOnPostRender(cam, mi);
-    if (!g_esp_on.load(std::memory_order_relaxed)) return;
-
-    if (g_getW) { int w = g_getW(); if (w > 0) g_sw = w; }
-    if (g_getH) { int h = g_getH(); if (h > 0) g_sh = h; }
-
-    if (!has_egl_context()) {
-        if (n <= 3) LI("OnPostRender #%d: no EGL ctx — skipping draw", n);
-        update_hs_target(cam);
-        return;
-    }
-
-    // Compile shader once on first frame with a valid EGL context
+static void esp_do_gl_draw(void *cam) {
     gles_init();
-    if (!s_gles_ok) {
-        update_hs_target(cam);
-        return;
-    }
+    if (!s_gles_ok) return;
 
     GlSave saved;
     gl_save(saved);
@@ -406,7 +362,7 @@ static void hook_OnPostRender(void *cam, void *mi) {
             if (!has_head && !has_feet) continue;
 
             Color box_col;
-            if (e.dist < 30.f)      box_col = { 1.0f, 0.15f, 0.15f, 1.0f };
+            if      (e.dist < 30.f) box_col = { 1.0f, 0.15f, 0.15f, 1.0f };
             else if (e.dist < 80.f) box_col = { 1.0f, 0.55f, 0.0f,  1.0f };
             else                    box_col = { 0.0f, 0.95f, 1.0f,  1.0f };
 
@@ -424,8 +380,6 @@ static void hook_OnPostRender(void *cam, void *mi) {
                 draw_head_dot(head_s, 6.f, hs_col);
             }
         }
-
-        update_hs_target(cam);
     }
 
     gles_flush();
@@ -433,52 +387,213 @@ static void hook_OnPostRender(void *cam, void *mi) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// eglSwapBuffers hook — fires every frame on the render thread after the game
+// has fully drawn its frame. Works with Unity URP, HDRP, and built-in renderer.
+// Camera.OnPostRender is NOT used because URP does NOT call it on MonoBehaviours.
+// ─────────────────────────────────────────────────────────────────────────────
+
+typedef EGLBoolean (*FnEglSwap)(EGLDisplay, EGLSurface);
+static FnEglSwap g_origEglSwap = nullptr;
+
+static EGLBoolean hook_eglSwapBuffers(EGLDisplay dpy, EGLSurface surf) {
+    static std::atomic<int> s_frame{0};
+    int n = ++s_frame;
+
+    // Update screen size via Unity native icalls (safe from any thread)
+    if (g_getW) { int w = g_getW(); if (w > 0) g_sw = w; }
+    if (g_getH) { int h = g_getH(); if (h > 0) g_sh = h; }
+
+    // Get main camera via Unity native icall (safe from render thread)
+    void *cam = g_getMain ? g_getMain() : nullptr;
+
+    if (n <= 5 || (n % 600) == 0)
+        LI("eglSwap #%d cam=%p sw=%d sh=%d esp=%d cache=%d w2s=%d",
+           n, cam, g_sw, g_sh,
+           (int)g_esp_on.load(), g_cache_n,
+           (int)g_w2s_valid.load());
+
+    update_hs_target(cam);
+
+    if (g_esp_on.load(std::memory_order_relaxed) && cam)
+        esp_do_gl_draw(cam);
+
+    return g_origEglSwap ? g_origEglSwap(dpy, surf) : EGL_TRUE;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Background position update thread (50ms refresh)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static const char *k_head_names[]  = { "Head","head","Bip001 Head","mixamo:Head","head_jnt","Spine3",nullptr };
-static const char *k_chest_names[] = { "Chest","chest","Bip001 Spine2","mixamo:Spine1","spine_03",nullptr };
-static const char *k_lsh_names[]   = { "LeftArm","l_arm","Bip001 L Clavicle","mixamo:LeftArm","shoulder_l",nullptr };
-static const char *k_rsh_names[]   = { "RightArm","r_arm","Bip001 R Clavicle","mixamo:RightArm","shoulder_r",nullptr };
-static const char *k_lft_names[]   = { "LeftFoot","l_foot","Bip001 L Foot","mixamo:LeftFoot","foot_l",nullptr };
-static const char *k_rft_names[]   = { "RightFoot","r_foot","Bip001 R Foot","mixamo:RightFoot","foot_r",nullptr };
+// Free Fire uses Spine-style Biped names (3ds Max Biped).  "Bip01" (one zero) is the
+// standard Garena rig — NOT "Bip001" (two zeros).  Also cover Unity generic + mixamo rigs.
+static const char *k_head_names[]  = {
+    "Head","head","head_01",
+    "Bip01 Head","Bip001 Head",
+    "mixamorig:Head","mixamo:Head",
+    "head_jnt","Neck1","neck_01","Neck",
+    nullptr };
+static const char *k_chest_names[] = {
+    "Chest","chest","chest_01",
+    "Bip01 Spine2","Bip001 Spine2","Bip01 Spine1","Spine2","Spine1","Spine3",
+    "mixamorig:Spine1","mixamo:Spine1",
+    "spine_03","spine_02",
+    nullptr };
+static const char *k_lsh_names[]   = {
+    "LeftArm","l_arm","upperarm_l","UpperArm_L","arm_l",
+    "Bip01 L UpperArm","Bip001 L Clavicle","Bip01 L Clavicle","L_UpperArm",
+    "mixamorig:LeftArm","mixamo:LeftArm",
+    "shoulder_l","clavicle_l",
+    nullptr };
+static const char *k_rsh_names[]   = {
+    "RightArm","r_arm","upperarm_r","UpperArm_R","arm_r",
+    "Bip01 R UpperArm","Bip001 R Clavicle","Bip01 R Clavicle","R_UpperArm",
+    "mixamorig:RightArm","mixamo:RightArm",
+    "shoulder_r","clavicle_r",
+    nullptr };
+static const char *k_lft_names[]   = {
+    "LeftFoot","l_foot","foot_l","lfoot",
+    "Bip01 L Foot","Bip001 L Foot","L_Foot",
+    "mixamorig:LeftFoot","mixamo:LeftFoot",
+    "calf_l","thigh_l",
+    nullptr };
+static const char *k_rft_names[]   = {
+    "RightFoot","r_foot","foot_r","rfoot",
+    "Bip01 R Foot","Bip001 R Foot","R_Foot",
+    "mixamorig:RightFoot","mixamo:RightFoot",
+    "calf_r","thigh_r",
+    nullptr };
 
-static MethodInfo *s_mTransformFind = nullptr;
-static MethodInfo *s_mGetPosition   = nullptr;
-static MethodInfo *s_mGetTransform  = nullptr;
+static MethodInfo *s_mTransformFind  = nullptr;
+static MethodInfo *s_mGetPosition    = nullptr;
+static MethodInfo *s_mGetTransform   = nullptr;
+static MethodInfo *s_mGetChild       = nullptr;
+static MethodInfo *s_mGetChildCount  = nullptr;
+static MethodInfo *s_mGetObjName     = nullptr;
+
+// Direct icall pointer for Transform.get_position (avoids il2cpp boxing overhead)
+using FnGetPosIcall = void(*)(void* self, Vec3* out);
+static FnGetPosIcall g_fnGetPosIcall = nullptr;
 
 static void resolve_unity_methods() {
-    Il2CppClass *trCls  = Il2Cpp::cls("Transform", "UnityEngine");
-    Il2CppClass *cmpCls = Il2Cpp::cls("Component", "UnityEngine");
+    Il2CppClass *trCls  = Il2Cpp::cls("Transform",  "UnityEngine");
+    Il2CppClass *cmpCls = Il2Cpp::cls("Component",  "UnityEngine");
+    Il2CppClass *objCls = Il2Cpp::cls("Object",     "UnityEngine");
+
     if (trCls) {
-        s_mTransformFind = Il2Cpp::getMethod(trCls, "Find",         1);
-        s_mGetPosition   = Il2Cpp::getMethod(trCls, "get_position", 0);
+        s_mTransformFind = Il2Cpp::getMethod(trCls, "Find",          1);
+        s_mGetPosition   = Il2Cpp::getMethod(trCls, "get_position",  0);
+        s_mGetChild      = Il2Cpp::getMethod(trCls, "GetChild",      1);
+        s_mGetChildCount = Il2Cpp::getMethod(trCls, "get_childCount",0);
     }
     if (cmpCls) {
         s_mGetTransform = Il2Cpp::getMethod(cmpCls, "get_transform", 0);
     }
-    LI("unity methods: Find=%p get_position=%p get_transform=%p",
+    if (objCls) {
+        s_mGetObjName = Il2Cpp::getMethod(objCls, "get_name", 0);
+    }
+
+    // Resolve the injected icall for get_position — faster and avoids boxing
+    void *il2lib = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (il2lib) {
+        using FnResolve = void*(*)(const char*);
+        auto resolve = (FnResolve)dlsym(il2lib, "il2cpp_resolve_icall");
+        if (resolve) {
+            g_fnGetPosIcall = (FnGetPosIcall)resolve(
+                "UnityEngine.Transform::get_position_Injected(UnityEngine.Vector3&)");
+            if (!g_fnGetPosIcall)
+                g_fnGetPosIcall = (FnGetPosIcall)resolve(
+                    "UnityEngine.Transform::get_position(UnityEngine.Vector3&)");
+        }
+    }
+
+    LI("unity methods: Find=%p get_pos=%p get_transform=%p GetChild=%p childCnt=%p getName=%p posIcall=%p",
        s_mTransformFind ? s_mTransformFind->methodPointer : nullptr,
        s_mGetPosition   ? s_mGetPosition->methodPointer   : nullptr,
-       s_mGetTransform  ? s_mGetTransform->methodPointer  : nullptr);
+       s_mGetTransform  ? s_mGetTransform->methodPointer  : nullptr,
+       s_mGetChild      ? s_mGetChild->methodPointer      : nullptr,
+       s_mGetChildCount ? s_mGetChildCount->methodPointer : nullptr,
+       s_mGetObjName    ? s_mGetObjName->methodPointer    : nullptr,
+       (void*)g_fnGetPosIcall);
 }
 
-static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
-    if (!transform || !s_mTransformFind || !s_mTransformFind->methodPointer) return nullptr;
-    for (int i = 0; names[i]; i++) {
-        Il2CppObject *nameStr = Il2Cpp::newString(names[i]);
-        if (!nameStr) continue;
-        Il2CppObject *bone = Il2Cpp::invoke1(s_mTransformFind, transform, nameStr);
-        if (bone) return bone;
+// Compare a Unity Il2CppString (UTF-16, little-endian) against a C ASCII string.
+// Il2CppString layout: { Il2CppObject(16B) | int32 length(4B) | uint16 chars[length] }
+static bool il2_str_eq_ascii(Il2CppObject *strObj, const char *cstr) {
+    if (!strObj || !cstr) return false;
+    int32_t  wlen  = *(int32_t*) ((char*)strObj + 16);
+    uint16_t *wch  = (uint16_t*)((char*)strObj + 20);
+    int       clen = 0;
+    while (cstr[clen]) clen++;
+    if (wlen != clen) return false;
+    for (int i = 0; i < clen; i++) {
+        if (wch[i] != (uint16_t)(unsigned char)cstr[i]) return false;
+    }
+    return true;
+}
+
+// Depth-first recursive bone search — Transform.Find only checks DIRECT children,
+// so we must walk the hierarchy manually. maxdepth=12 covers all realistic rigs.
+static Il2CppObject *find_bone_recursive(Il2CppObject *tr, const char **names, int depth) {
+    if (!tr || depth > 12) return nullptr;
+
+    // Check this node's name (skip root, it's the player GameObject itself)
+    if (depth > 0 && s_mGetObjName && s_mGetObjName->methodPointer) {
+        Il2CppObject *nameObj = Il2Cpp::invoke0(s_mGetObjName, tr);
+        if (nameObj) {
+            for (int ni = 0; names[ni]; ni++) {
+                if (il2_str_eq_ascii(nameObj, names[ni])) return tr;
+            }
+        }
+    }
+
+    // Walk children
+    if (!s_mGetChildCount || !s_mGetChild ||
+        !s_mGetChildCount->methodPointer || !s_mGetChild->methodPointer)
+        return nullptr;
+
+    // get_childCount returns boxed System.Int32: { Il2CppObject(16B) | int32(4B) }
+    Il2CppObject *cntBox = Il2Cpp::invoke0(s_mGetChildCount, tr);
+    if (!cntBox) return nullptr;
+    int32_t cnt = *(int32_t*)((char*)cntBox + 16);
+
+    for (int32_t i = 0; i < cnt; i++) {
+        // GetChild(int index) — pass pointer to the index (value-type param)
+        Il2CppObject *child = Il2Cpp::invoke1(s_mGetChild, tr, (void*)&i);
+        if (!child) continue;
+        Il2CppObject *result = find_bone_recursive(child, names, depth + 1);
+        if (result) return result;
     }
     return nullptr;
 }
 
+// Public wrapper used by position_updater
+static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
+    // First try Transform.Find for speed (works if bone is direct child)
+    if (s_mTransformFind && s_mTransformFind->methodPointer) {
+        for (int i = 0; names[i]; i++) {
+            Il2CppObject *ns = Il2Cpp::newString(names[i]);
+            if (!ns) continue;
+            Il2CppObject *b = Il2Cpp::invoke1(s_mTransformFind, transform, ns);
+            if (b) return b;
+        }
+    }
+    // Fall back to full recursive DFS (handles nested rigs like FF Armature/Hips/Spine/.../Head)
+    return find_bone_recursive(transform, names, 0);
+}
+
 static Vec3 get_position(Il2CppObject *transform) {
     Vec3 pos{};
+    if (!transform) return pos;
+    // Prefer direct icall — no boxing overhead, avoids il2cpp_runtime_invoke exception path
+    if (g_fnGetPosIcall) {
+        g_fnGetPosIcall(transform, &pos);
+        return pos;
+    }
+    // Fallback: il2cpp_runtime_invoke — returns boxed Vector3
+    // Box layout: { Il2CppObject(16B) | float x(4B) | float y(4B) | float z(4B) }
     if (!s_mGetPosition || !s_mGetPosition->methodPointer) return pos;
     Il2CppObject *boxed = Il2Cpp::invoke0(s_mGetPosition, transform);
-    if (boxed) __builtin_memcpy(&pos, (char*)boxed + sizeof(Il2CppObject), sizeof(Vec3));
+    if (boxed) __builtin_memcpy(&pos, (char*)boxed + 16, sizeof(Vec3));
     return pos;
 }
 
@@ -712,22 +827,26 @@ void ESP::init() {
 
     resolve_unity_methods();
 
-    Il2CppClass *camCls = Il2Cpp::cls("Camera", "UnityEngine");
-    LI("ESP::init camCls=%p", camCls);
-    if (camCls) {
-        MethodInfo *opr = Il2Cpp::getMethod(camCls, "OnPostRender", 0);
-        LI("ESP::init OnPostRender method=%p ptr=%p",
-           opr, opr ? opr->methodPointer : nullptr);
-        if (opr && opr->methodPointer) {
-            DobbyHook(opr->methodPointer,
-                      (void*)(FnCamRender)hook_OnPostRender,
-                      (void**)&g_origOnPostRender);
-            LI("Camera.OnPostRender hooked @ %p", opr->methodPointer);
+    // Hook eglSwapBuffers — fires every frame regardless of render pipeline (URP/HDRP/builtin).
+    // This replaces the old Camera.OnPostRender hook which URP never calls.
+    {
+        void *eglLib = dlopen("libEGL.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (!eglLib) eglLib = dlopen("libEGL.so", RTLD_LAZY);
+        LI("ESP::init eglLib=%p", eglLib);
+        if (eglLib) {
+            void *eglSwapFn = dlsym(eglLib, "eglSwapBuffers");
+            LI("ESP::init eglSwapBuffers=%p", eglSwapFn);
+            if (eglSwapFn) {
+                DobbyHook(eglSwapFn,
+                          (void*)(FnEglSwap)hook_eglSwapBuffers,
+                          (void**)&g_origEglSwap);
+                LI("eglSwapBuffers hooked @ %p", eglSwapFn);
+            } else {
+                LE("eglSwapBuffers symbol missing in libEGL.so — ESP render hook inactive");
+            }
         } else {
-            LE("Camera.OnPostRender method not found — rendering hook inactive");
+            LE("libEGL.so not found — ESP render hook inactive");
         }
-    } else {
-        LE("UnityEngine.Camera class not found — rendering hook inactive");
     }
 
     pthread_t t;

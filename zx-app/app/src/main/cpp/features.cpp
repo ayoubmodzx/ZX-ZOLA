@@ -7,6 +7,7 @@
 #include "esp_renderer.hpp"
 #include "il2cpp_scanner.hpp"
 #include "dobby_stub.hpp"
+#include "stealth_ext7.hpp"
 #include <android/log.h>
 #include "zx_logbuf.hpp"
 #include <dlfcn.h>
@@ -111,7 +112,13 @@ static FnSetFOV g_origSetFOV = nullptr;
 static void hookSetFOV(void *self, float fov) {
     if (!g_origSetFOV) return;
     float ov = g_fovOverride.load(std::memory_order_relaxed);
-    g_origSetFOV(self, ov > 0.f ? ov : fov);
+    if (ov > 0.f) {
+        // Clamp — Unity crashes with FOV <= 0 or >= 180 (degenerate projection matrix)
+        ov = ov < 1.f ? 1.f : (ov > 150.f ? 150.f : ov);
+        g_origSetFOV(self, ov);
+    } else {
+        g_origSetFOV(self, fov);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -220,8 +227,14 @@ static void hookUnityIcalls() {
     void *setFOV = resolve("UnityEngine.Camera::set_fieldOfView(System.Single)");
     if (!setFOV) setFOV = resolve("UnityEngine.Camera::set_fieldOfView(float)");
     if (setFOV) {
-        DobbyHook(setFOV, (void*)hookSetFOV, (void**)&g_origSetFOV);
-        LOG("Hooked Camera::set_fieldOfView");
+        if (is_hookable_arm64(setFOV)) {
+            DobbyHook(setFOV, (void*)hookSetFOV, (void**)&g_origSetFOV);
+            LOG("Hooked Camera::set_fieldOfView @ %p", setFOV);
+        } else {
+            ERR("set_fieldOfView @ %p too short for DobbyHook — FOV override disabled", setFOV);
+        }
+    } else {
+        ERR("set_fieldOfView icall not found — FOV override disabled");
     }
 }
 
