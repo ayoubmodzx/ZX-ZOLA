@@ -330,9 +330,16 @@ using FnMprotect = int(*)(void*, size_t, int);
 static FnMprotect g_orig_mprotect = nullptr;
 
 static int hook_mprotect(void *addr, size_t len, int prot) {
-    if (prot == PROT_NONE) {
-        LI("[mprotect] blocked PROT_NONE @ %p sz=%zu — crash trap neutralised", addr, (size_t)len);
-        return 0;
+    // Only block PROT_NONE calls that target libanogs's own mapped region.
+    // Blocking all PROT_NONE breaks libanogs's internal memory protection,
+    // triggering detection via a path OTHER than the crash trap.
+    if (prot == PROT_NONE && s_stx_ano_base) {
+        uintptr_t a = (uintptr_t)addr;
+        uintptr_t e = a + len;
+        if (a >= s_stx_ano_base && e <= s_stx_ano_end) {
+            LI("[mprotect] blocked PROT_NONE inside libanogs @ %p sz=%zu", addr, (size_t)len);
+            return 0;
+        }
     }
     return g_orig_mprotect ? g_orig_mprotect(addr, len, prot)
                            : (int)syscall(__NR_mprotect, addr, len, prot);
@@ -370,7 +377,7 @@ sigsegv_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     struct sigaction dfl = {};
     dfl.sa_handler = SIG_DFL;
     sigemptyset(&dfl.sa_mask);
-    syscall(186 /*rt_sigaction*/, SIGSEGV, &dfl, nullptr, sizeof(sigset_t));
+    sigaction(SIGSEGV, &dfl, nullptr);
     raise(SIGSEGV);
 }
 
@@ -381,10 +388,10 @@ static void install_sigsegv_suppressor(uintptr_t ano_base, uintptr_t ano_end) {
     sa.sa_sigaction = sigsegv_suppressor;
     sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
-    // Use raw syscall to bypass any STH4 sigaction hook that might swallow this
-    syscall(186 /*rt_sigaction*/, SIGSEGV, &sa, nullptr, sizeof(sigset_t));
-    LI("SIGSEGV suppressor installed for libanogs [%lx-%lx]",
-       (unsigned long)ano_base, (unsigned long)ano_end);
+    // Use sigaction() — syscall 186 is mq_notify on ARM64, NOT rt_sigaction (134)
+    int r = sigaction(SIGSEGV, &sa, nullptr);
+    LI("SIGSEGV suppressor installed for libanogs [%lx-%lx] r=%d",
+       (unsigned long)ano_base, (unsigned long)ano_end, r);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -699,6 +706,7 @@ void install_stealth_ext() {
 
     // Install SIGSEGV suppressor BEFORE libanogs's background threads start scanning
     // (libanogs's crash trap fires a SIGSEGV at its own base+0x502000)
+    LI("installing SIGSEGV suppressor...");
     if (ano_base) install_sigsegv_suppressor(ano_base, ano_end);
 
     // Pre-open the observed crash-trap page so accessing it doesn't SIGSEGV
