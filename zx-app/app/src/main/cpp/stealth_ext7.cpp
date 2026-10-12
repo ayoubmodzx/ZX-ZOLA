@@ -150,15 +150,21 @@ static int install_seccomp_kill_block() {
         f
     };
 
-    // TSYNC: apply filter to ALL existing threads (covers pre-existing scanner threads)
-    int r = (int)syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+    // TSYNC: apply filter to ALL existing threads (covers pre-existing scanner threads).
+    // Pre-4.17 kernels return the TID of the first un-syncable thread (positive value)
+    // on partial failure rather than -1+errno. Bionic's syscall() sets errno=0 in that
+    // case because the raw return was not in [-4096,-1]. Handle both.
+    long raw_r = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
                          SECCOMP_FILTER_FLAG_TSYNC, &prog);
-    if (r == 0) {
+    if (raw_r == 0) {
         LI("seccomp TSYNC ok pid=%d insns=%u", my_pid, (unsigned)prog.len);
         return 0;
     }
-    int tsync_err = errno;
-    LI("seccomp TSYNC errno=%d — per-thread fallback", tsync_err);
+    if (raw_r > 0) {
+        LI("seccomp TSYNC: TID=%ld refused (pre-4.17 kernel, NO_NEW_PRIVS missing on scanner threads) — per-thread fallback", raw_r);
+    } else {
+        LI("seccomp TSYNC errno=%d — per-thread fallback", errno);
+    }
 
     // Per-thread fallback: only covers this thread and future children
     r = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
@@ -795,6 +801,78 @@ static int phdr_find7(struct dl_phdr_info *info, size_t, void *data) {
     return 1;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// patch_raw_svc_kill — NOP out raw SVC kill/tgkill calls in a library.
+//
+// Seccomp TSYNC fails on pre-4.17 kernels (and on Android when scanner threads
+// don't have NO_NEW_PRIVS=1) so we can't block raw SVC via seccomp on those
+// threads. Instead we scan the r-x segment for the literal opcode sequence:
+//   MOV X8, #129  (D2801028)  — __NR_kill
+//   MOV X8, #131  (D2801068)  — __NR_tgkill
+// within 4 instructions before any SVC #0 (D4000001) and replace the SVC
+// with MOV X0, #0 (D2800000) — a fake "success" return.  The caller sees 0
+// and assumes the kill succeeded, so it doesn't retry.
+//
+// Only the r-x segment is walked — PROT_NONE gap pages between LOAD segments
+// are never touched (rx_cap is capped at the first executable LOAD segment's
+// end, which is always below the first gap).
+// ─────────────────────────────────────────────────────────────────────────────
+
+static int patch_raw_svc_kill(uintptr_t lib_base, size_t lib_sz,
+                               const char *lib_name) {
+    if (!lib_base || !lib_sz) return 0;
+
+    static constexpr uint32_t kSVC0          = 0xD4000001u;
+    static constexpr uint32_t kMovX8Kill     = 0xD2801028u;  // MOV X8, #129
+    static constexpr uint32_t kMovX8Tgkill   = 0xD2801068u;  // MOV X8, #131
+    static constexpr uint32_t kMovX0Zero     = 0xD2800000u;  // MOV X0, #0
+
+    // Restrict scan to first r-x LOAD segment to avoid PROT_NONE gaps
+    size_t rx_cap = 0;
+    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr*)lib_base;
+    if (ehdr->e_ident[EI_MAG0] == ELFMAG0 && ehdr->e_ident[EI_CLASS] == ELFCLASS64) {
+        const Elf64_Phdr *phdr = (const Elf64_Phdr*)(lib_base + ehdr->e_phoff);
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X)) {
+                size_t e = (size_t)(phdr[i].p_vaddr + phdr[i].p_filesz);
+                if (e > rx_cap) rx_cap = e;
+            }
+        }
+    }
+    if (!rx_cap)
+        rx_cap = lib_sz < 8 * 1024 * 1024 ? lib_sz : 8 * 1024 * 1024;
+
+    int patched = 0;
+    for (size_t off = 16; off + 4 <= rx_cap; off += 4) {
+        uint32_t insn;
+        __builtin_memcpy(&insn, (void*)(lib_base + off), 4);
+        if (insn != kSVC0) continue;
+
+        // Walk back up to 4 instructions looking for MOV X8, #kill/#tgkill
+        for (int back = 1; back <= 4; back++) {
+            uint32_t prev;
+            __builtin_memcpy(&prev, (void*)(lib_base + off - (size_t)(back * 4)), 4);
+            if (prev != kMovX8Kill && prev != kMovX8Tgkill) continue;
+
+            // Found matching MOV X8 — replace SVC #0 with MOV X0, #0
+            uintptr_t svc_addr = lib_base + off;
+            uintptr_t pg       = svc_addr & ~(uintptr_t)0xFFF;
+            if (mprotect((void*)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                uint32_t *p = (uint32_t*)svc_addr;
+                *p = kMovX0Zero;
+                __builtin___clear_cache((char*)p, (char*)(p + 1));
+                mprotect((void*)pg, 0x1000, PROT_READ | PROT_EXEC);
+                LI("L56+: SVC→MOV_X0_0 [%s] %s+0x%zx (back=%d)",
+                   prev == kMovX8Kill ? "kill" : "tgkill", lib_name, off, back);
+                patched++;
+            }
+            break;  // stop backtracking for this SVC site
+        }
+    }
+    LI("L56+: raw SVC kill-block: %d sites patched in %s", patched, lib_name);
+    return patched;
+}
+
 static void *ext7_scanner_thread(void*) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
 
@@ -833,6 +911,20 @@ static void *ext7_scanner_thread(void*) {
         total += n;
     }
     LI("L56: extended scanner patch done — %d functions patched across 3 markers", total);
+
+    // Scan and NOP raw SVC kill/tgkill call sites in libanogs and libanort.
+    // TSYNC seccomp fails on this kernel (pre-4.17 TID return — existing scanner
+    // threads don't have NO_NEW_PRIVS) so we eliminate the kill sites directly.
+    patch_raw_svc_kill(ano_base, lib_sz, "libanogs");
+    {
+        PhdrCtx7 ctx{"libanort.so", 0, 0};
+        dl_iterate_phdr(phdr_find7, &ctx);
+        if (ctx.base) {
+            size_t sz = ctx.total_sz ? ctx.total_sz : 4 * 1024 * 1024;
+            if (sz > 32 * 1024 * 1024) sz = 4 * 1024 * 1024;
+            patch_raw_svc_kill(ctx.base, sz, "libanort");
+        }
+    }
 
     // Update ranges for caller-check hooks now that lib is confirmed
     g_range7_ready.store(false, std::memory_order_release);
