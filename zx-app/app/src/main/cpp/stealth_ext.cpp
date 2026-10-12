@@ -363,17 +363,28 @@ sigsegv_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     (void)sig;
     uintptr_t fault_addr = (uintptr_t)info->si_addr;
     if (s_sigv_ano_base && fault_addr >= s_sigv_ano_base && fault_addr < s_sigv_ano_end) {
-        // Fault is inside libanogs — intentional crash trap
+        // Fault is inside libanogs — intentional crash trap.
+        // Return via LR rather than stepping +4 so we exit the crash-trap
+        // function cleanly, regardless of how many bad loads follow.
         ucontext_t *ctx = (ucontext_t*)raw_ctx;
-        // ARM64: all instructions are 4 bytes; advance past the faulting insn
 #ifdef __aarch64__
-        ctx->uc_mcontext.pc += 4;
+        uintptr_t lr  = ctx->uc_mcontext.regs[30];
+        uintptr_t pc  = ctx->uc_mcontext.pc;
+        uintptr_t sp  = ctx->uc_mcontext.sp;
+        LI("[SIGSEGV] caught fault=%p pc=%p lr=%p sp=%p — ret via LR",
+           (void*)fault_addr, (void*)pc, (void*)lr, (void*)sp);
+        ctx->uc_mcontext.pc = lr; // jump to caller's return site
 #elif defined(__arm__)
-        ctx->uc_mcontext.arm_pc += 4;
+        uintptr_t lr = ctx->uc_mcontext.arm_lr;
+        uintptr_t pc = ctx->uc_mcontext.arm_pc;
+        LI("[SIGSEGV] caught fault=%p pc=%p lr=%p — ret via LR",
+           (void*)fault_addr, (void*)pc, (void*)lr);
+        ctx->uc_mcontext.arm_pc = lr;
 #endif
-        return; // resume execution after the faulting instruction
+        return;
     }
     // Not from libanogs — re-deliver as default (die)
+    LI("[SIGSEGV] non-ano fault=%p — reinstating default handler", (void*)fault_addr);
     struct sigaction dfl = {};
     dfl.sa_handler = SIG_DFL;
     sigemptyset(&dfl.sa_mask);
