@@ -167,12 +167,12 @@ static int install_seccomp_kill_block() {
     }
 
     // Per-thread fallback: only covers this thread and future children
-    r = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
-    if (r == 0) {
+    int pt_r = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
+    if (pt_r == 0) {
         LI("seccomp per-thread ok pid=%d", my_pid);
         return 0;
     }
-    LE("seccomp failed tsync_err=%d perthread_err=%d", tsync_err, errno);
+    LE("seccomp failed raw_r=%ld perthread_err=%d", raw_r, errno);
     return -1;
 }
 
