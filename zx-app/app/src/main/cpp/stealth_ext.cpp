@@ -497,24 +497,52 @@ static int hook_access(const char *path, int mode) {
 // ═════════════════════════════════════════════════════════════════════════════
 // Layer 10d — fork() neutraliser
 //
-// libanogs forks a child at vaddr 0x258668; child path (CBZ W0 → 0x2586e8):
-//   1. Resets SIGSEGV to SIG_DFL (0x2588a8) — kills our crash-trap handler
-//   2. Runs ptrace-based detection (0x25895c)
-//   3. tgkill(getppid(), SIGKILL) via direct SVC — kills the parent
-//   4. _exit(127)
+// libanogs detection dispatch at 0x258668:
+//   CBZ W8 (byte[obj+0x876]==0) → 0x2586e8: SKIP fork, run detection in-process
+//   fork@plt → CBZ W0 (child)  → 0x2586e8: same kill path from child
 //
-// Hook fork() in libanogs GOT → return fake child PID (always parent path).
-// No real child is spawned; child detection never executes.
+// Kill path 0x2586e8:
+//   1. 0x2588a8: signal_reset — resets SIGSEGV to SIG_DFL
+//   2. 0x25895c: detection loop → tail-calls 0x258d14 (ptrace/kill ops)
+//   3. 0x258700: _exit(127) — FINAL FAILSAFE even if kill ops are hooked
+//
+// Fork hook blocks the fork-child path. _exit hook (Layer 10f) is the
+// critical blocker for the in-process path (byte==0 bypasses fork entirely).
 // ═════════════════════════════════════════════════════════════════════════════
 
 using FnFork = pid_t(*)();
 static FnFork g_orig_fork = nullptr;
 
 static pid_t hook_fork() {
-    // Non-zero return = parent path; CBZ W0 at 0x2586d0 NOT taken.
-    // No real child → no signal reset, no detection, no tgkill parent.
-    LI("[fork] neutralised — fake child PID, no real fork");
+    // Non-zero return → parent path; CBZ W0 at 0x2586d0 NOT taken.
+    LI("[fork] neutralised — no real fork");
     return (pid_t)2;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 10f — _exit() / abort() blocker
+//
+// _exit(127) at 0x258700 is libanogs's FINAL failsafe after all kill ops.
+// Runs in the main process when byte[obj+0x876]==0 (no-fork path).
+// Hook both _exit and abort to return without terminating the process.
+// Also re-install the SIGSEGV suppressor since 0x2588a8 resets it first.
+// ═════════════════════════════════════════════════════════════════════════════
+
+using FnExit  = void(*)(int);
+using FnAbort = void(*)();
+static FnExit  g_orig__exit = nullptr;
+static FnAbort g_orig_abort = nullptr;
+
+static void hook__exit(int code) {
+    LI("[_exit] blocked code=%d — re-installing SIGSEGV suppressor", code);
+    // Re-arm the SIGSEGV suppressor: 0x2588a8 reset it to SIG_DFL before calling us
+    if (s_sigv_ano_base) install_sigsegv_suppressor(s_sigv_ano_base, s_sigv_ano_end);
+    // Return without exiting — execution falls to the next instruction (new function)
+}
+
+static void hook_abort() {
+    LI("[abort] blocked — re-installing SIGSEGV suppressor");
+    if (s_sigv_ano_base) install_sigsegv_suppressor(s_sigv_ano_base, s_sigv_ano_end);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -780,9 +808,14 @@ void install_stealth_ext() {
 
 
     // ── Layer 7a — dl_iterate_phdr ──────────────────────────────────────────
-    // dl_iterate_phdr is NOT in libanogs's import list; DobbyHook on bionic is safe
-    if (libc) hk_libc(libc, "dl_iterate_phdr",
-        (void*)hook_dl_iterate_phdr, (void**)&g_orig_iter_phdr);
+    // dl_iterate_phdr IS in libanogs's import (RELA[208], GOT 0x50fc28).
+    // DobbyHook on bionic silently fails (non-hookable region); patch GOT instead.
+    // Bionic hook attempted as fallback to cover other callers (e.g. libil2cpp).
+    g_orig_iter_phdr = (FnIterPhdr)dlsym(libc, "dl_iterate_phdr");
+    if (!g_orig_iter_phdr) g_orig_iter_phdr = (FnIterPhdr)dlsym(RTLD_DEFAULT, "dl_iterate_phdr");
+    if (libc && !s_stx_ano_base) // only attempt bionic hook if GOT patch unavailable
+        hk_libc(libc, "dl_iterate_phdr", (void*)hook_dl_iterate_phdr, (void**)&g_orig_iter_phdr);
+    // GOT patch is done in L10 block below alongside other GOT patches
 
     // ── Layer 7b — dlopen ──────────────────────────────────────────────────
     // dlopen IS in libanogs imports — use GOT patch to avoid bionic body trampoline
@@ -837,14 +870,22 @@ void install_stealth_ext() {
     g_orig_mprotect = (FnMprotect)dlsym(libc, "mprotect");
     g_orig_fork     = (FnFork)dlsym(libc, "fork");
     g_orig_ptrace   = (FnPtrace)dlsym(libc, "ptrace");
+    g_orig__exit    = (FnExit)dlsym(libc, "_exit");
+    g_orig_abort    = (FnAbort)dlsym(libc, "abort");
     if (ano_base) {
-        anogs_patch_got_import(ano_base, "popen",  (void*)hook_popen);
-        anogs_patch_got_import(ano_base, "access", (void*)hook_access);
-        // fork: prevents child-based detection path (0x2586e8) — no real child = no tgkill
-        anogs_patch_got_import(ano_base, "fork",   (void*)hook_fork);
-        // ptrace: PTRACE_TRACEME loop (0x258b10, 17 callers) always reports success
-        anogs_patch_got_import(ano_base, "ptrace", (void*)hook_ptrace);
-        LI("L10 popen/access/fork/ptrace installed (GOT — mprotect unhooked, crash-trap preserved)");
+        anogs_patch_got_import(ano_base, "popen",           (void*)hook_popen);
+        anogs_patch_got_import(ano_base, "access",          (void*)hook_access);
+        // fork: blocks fork-child path (CBZ W0 → 0x2586e8); byte==0 path still runs
+        anogs_patch_got_import(ano_base, "fork",            (void*)hook_fork);
+        // ptrace: PTRACE_TRACEME loop (0x258b10, 17 callers) always returns 0
+        anogs_patch_got_import(ano_base, "ptrace",          (void*)hook_ptrace);
+        // _exit/abort: final failsafe at 0x258700 — blocks process termination
+        anogs_patch_got_import(ano_base, "_exit",           (void*)hook__exit);
+        anogs_patch_got_import(ano_base, "abort",           (void*)hook_abort);
+        // dl_iterate_phdr: bionic DobbyHook fails; must go through libanogs GOT
+        // caller at 0x4fdaf4 scans all loaded ELFs for injected libs
+        anogs_patch_got_import(ano_base, "dl_iterate_phdr", (void*)hook_dl_iterate_phdr);
+        LI("L10 popen/access/fork/ptrace/_exit/abort/dl_iterate_phdr installed (GOT)");
     } else if (libc) {
         hk_libc(libc, "popen",  (void*)hook_popen,  (void**)&g_orig_popen);
         hk_libc(libc, "access", (void*)hook_access, (void**)&g_orig_access);
