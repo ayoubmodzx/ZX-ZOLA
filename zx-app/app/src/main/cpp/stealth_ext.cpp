@@ -359,66 +359,74 @@ static uintptr_t s_sigv_ano_base = 0;
 static uintptr_t s_sigv_ano_end  = 0;
 
 static void __attribute__((noinline))
-sigsegv_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
-    (void)sig;
+fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     uintptr_t fault_addr = (uintptr_t)info->si_addr;
+    ucontext_t *ctx2 = (ucontext_t*)raw_ctx;
+#ifdef __aarch64__
+    uintptr_t pc = ctx2->uc_mcontext.pc;
+    uintptr_t lr = ctx2->uc_mcontext.regs[30];
+#elif defined(__arm__)
+    uintptr_t pc = ctx2->uc_mcontext.arm_pc;
+    uintptr_t lr = ctx2->uc_mcontext.arm_lr;
+#else
+    uintptr_t pc = 0, lr = 0;
+#endif
+
     if (s_sigv_ano_base && fault_addr >= s_sigv_ano_base && fault_addr < s_sigv_ano_end) {
-        // Fault is inside libanogs — intentional crash trap.
-        // Strategy: make the faulted page R/W and return WITHOUT changing PC.
-        // The faulting instruction re-executes and succeeds (reads 0-bytes).
-        // Returning via LR causes the crash-trap's CALLER to deref x0 as a
-        // pointer (x0=0 after our fake return) → null-deref at 0x10 → die.
+        // Fault inside libanogs crash-trap pages — mprotect R/W and re-exec.
         uintptr_t fault_page = fault_addr & ~(uintptr_t)0xFFF;
         int r2 = (int)syscall(__NR_mprotect, (void*)fault_page, 0x1000,
                               PROT_READ | PROT_WRITE);
-        ucontext_t *ctx2 = (ucontext_t*)raw_ctx;
-#ifdef __aarch64__
-        uintptr_t pc = ctx2->uc_mcontext.pc;
-        uintptr_t lr = ctx2->uc_mcontext.regs[30];
-#elif defined(__arm__)
-        uintptr_t pc = ctx2->uc_mcontext.arm_pc;
-        uintptr_t lr = ctx2->uc_mcontext.arm_lr;
-#else
-        uintptr_t pc = 0, lr = 0;
-#endif
         if (r2 == 0) {
-            // PROT_NONE page → now accessible; re-execute the faulting load.
-            LI("[SIGSEGV] trap %p → unprotected pc=%p lr=%p — re-exec",
-               (void*)fault_page, (void*)pc, (void*)lr);
-            return; // resume at same PC; instruction re-executes successfully
+            LI("[SIG%d] trap %p → unprotected pc=%p lr=%p — re-exec",
+               sig, (void*)fault_page, (void*)pc, (void*)lr);
+            return;
         }
-        // mprotect failed → page is genuinely unmapped (e.g. gap between ELF
-        // LOAD segments hit by our full-library scanner).  Advance PC past the
-        // faulting instruction so the scanner loop continues instead of spinning.
-        LI("[SIGSEGV] trap %p → unmapped (r=%d) pc=%p — skip+4",
-           (void*)fault_page, r2, (void*)pc);
+        LI("[SIG%d] trap %p → unmapped (r=%d) pc=%p — skip+4",
+           sig, (void*)fault_page, r2, (void*)pc);
 #ifdef __aarch64__
         ctx2->uc_mcontext.pc += 4;
 #elif defined(__arm__)
         ctx2->uc_mcontext.arm_pc += 4;
 #endif
-        return; // advance past unmapped access; loop continues
+        return;
     }
-    // Not from libanogs — re-deliver as default (die)
+
+    if (sig == SIGBUS) {
+        // SIGBUS from scanner dereffing a garbage/non-canonical pointer it computed
+        // from zero-filled crash-trap pages — skip past the faulting instruction
+        // so the scanner function can continue or unwind cleanly.
+        LI("[SIGBUS] non-ano fault=%p pc=%p — skip+4", (void*)fault_addr, (void*)pc);
+        (void)lr;
+#ifdef __aarch64__
+        ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+        ctx2->uc_mcontext.arm_pc += 4;
+#endif
+        return;
+    }
+
+    // SIGSEGV outside libanogs range — re-deliver as default (genuine crash)
     LI("[SIGSEGV] non-ano fault=%p — reinstating default handler", (void*)fault_addr);
+    (void)lr;
     struct sigaction dfl = {};
     dfl.sa_handler = SIG_DFL;
     sigemptyset(&dfl.sa_mask);
-    sigaction(SIGSEGV, &dfl, nullptr);
-    raise(SIGSEGV);
+    sigaction(sig, &dfl, nullptr);
+    raise(sig);
 }
 
 static void install_sigsegv_suppressor(uintptr_t ano_base, uintptr_t ano_end) {
     s_sigv_ano_base = ano_base;
     s_sigv_ano_end  = ano_end;
     struct sigaction sa = {};
-    sa.sa_sigaction = sigsegv_suppressor;
+    sa.sa_sigaction = fault_suppressor;
     sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
-    // Use sigaction() — syscall 186 is mq_notify on ARM64, NOT rt_sigaction (134)
-    int r = sigaction(SIGSEGV, &sa, nullptr);
-    LI("SIGSEGV suppressor installed for libanogs [%lx-%lx] r=%d",
-       (unsigned long)ano_base, (unsigned long)ano_end, r);
+    int r  = sigaction(SIGSEGV, &sa, nullptr);
+    int r2 = sigaction(SIGBUS,  &sa, nullptr);
+    LI("fault suppressor installed for libanogs [%lx-%lx] SIGSEGV r=%d SIGBUS r=%d",
+       (unsigned long)ano_base, (unsigned long)ano_end, r, r2);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
