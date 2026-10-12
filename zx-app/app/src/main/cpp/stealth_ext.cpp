@@ -371,18 +371,33 @@ sigsegv_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
         uintptr_t fault_page = fault_addr & ~(uintptr_t)0xFFF;
         int r2 = (int)syscall(__NR_mprotect, (void*)fault_page, 0x1000,
                               PROT_READ | PROT_WRITE);
+        ucontext_t *ctx2 = (ucontext_t*)raw_ctx;
 #ifdef __aarch64__
-        uintptr_t pc = ((ucontext_t*)raw_ctx)->uc_mcontext.pc;
-        uintptr_t lr = ((ucontext_t*)raw_ctx)->uc_mcontext.regs[30];
+        uintptr_t pc = ctx2->uc_mcontext.pc;
+        uintptr_t lr = ctx2->uc_mcontext.regs[30];
 #elif defined(__arm__)
-        uintptr_t pc = ((ucontext_t*)raw_ctx)->uc_mcontext.arm_pc;
-        uintptr_t lr = ((ucontext_t*)raw_ctx)->uc_mcontext.arm_lr;
+        uintptr_t pc = ctx2->uc_mcontext.arm_pc;
+        uintptr_t lr = ctx2->uc_mcontext.arm_lr;
 #else
         uintptr_t pc = 0, lr = 0;
 #endif
-        LI("[SIGSEGV] trap %p → unprotected (r=%d) pc=%p lr=%p — re-exec",
-           (void*)fault_page, r2, (void*)pc, (void*)lr);
-        return; // resume at same PC; instruction re-executes successfully
+        if (r2 == 0) {
+            // PROT_NONE page → now accessible; re-execute the faulting load.
+            LI("[SIGSEGV] trap %p → unprotected pc=%p lr=%p — re-exec",
+               (void*)fault_page, (void*)pc, (void*)lr);
+            return; // resume at same PC; instruction re-executes successfully
+        }
+        // mprotect failed → page is genuinely unmapped (e.g. gap between ELF
+        // LOAD segments hit by our full-library scanner).  Advance PC past the
+        // faulting instruction so the scanner loop continues instead of spinning.
+        LI("[SIGSEGV] trap %p → unmapped (r=%d) pc=%p — skip+4",
+           (void*)fault_page, r2, (void*)pc);
+#ifdef __aarch64__
+        ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+        ctx2->uc_mcontext.arm_pc += 4;
+#endif
+        return; // advance past unmapped access; loop continues
     }
     // Not from libanogs — re-deliver as default (die)
     LI("[SIGSEGV] non-ano fault=%p — reinstating default handler", (void*)fault_addr);
