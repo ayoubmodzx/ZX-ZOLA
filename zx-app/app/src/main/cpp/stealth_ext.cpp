@@ -409,6 +409,18 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
         return;
     }
 
+    if (sig == SIGTRAP) {
+        // BRK #1 integrity traps in libanogs .text fire SIGTRAP when scanner
+        // detects patched instructions. skip+4 skips past the BRK instruction.
+        LI("[SIGTRAP] pc=%p — skip+4", (void*)pc);
+#ifdef __aarch64__
+        ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+        ctx2->uc_mcontext.arm_pc += 4;
+#endif
+        return;
+    }
+
     // SIGSEGV outside libanogs range.
     // fault_addr == pc: scanner branched to an unmapped aligned address.
     // skip+4 keeps the scanner from resolving back to a live kill path.
@@ -440,8 +452,9 @@ static void install_sigsegv_suppressor(uintptr_t ano_base, uintptr_t ano_end) {
     sigemptyset(&sa.sa_mask);
     int r  = sigaction(SIGSEGV, &sa, nullptr);
     int r2 = sigaction(SIGBUS,  &sa, nullptr);
-    LI("fault suppressor installed for libanogs [%lx-%lx] SIGSEGV r=%d SIGBUS r=%d",
-       (unsigned long)ano_base, (unsigned long)ano_end, r, r2);
+    int r3 = sigaction(SIGTRAP, &sa, nullptr);
+    LI("fault suppressor installed for libanogs [%lx-%lx] SIGSEGV r=%d SIGBUS r=%d SIGTRAP r=%d",
+       (unsigned long)ano_base, (unsigned long)ano_end, r, r2, r3);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

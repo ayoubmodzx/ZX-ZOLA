@@ -88,92 +88,125 @@
 #define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────────────────────
-// pre-L54 — Seccomp BPF: block raw SVC kill/tgkill across all threads
+// pre-L54 — Seccomp BPF: block raw SVC kill/tgkill on ALL existing threads
 //
-// Raw SVC #0 with x8=129 (kill) or x8=131 (tgkill) bypasses every PLT hook,
-// GOT patch, and DobbyHook in userspace. Only a seccomp BPF filter intercepts
-// it at kernel entry before the syscall executes.
+// Raw SVC #0 with x8=129 (kill) or x8=131 (tgkill) — and libanort.so's
+// tp_syscall_imp generic trampoline — all bypass PLT hooks and GOT patches.
+// Seccomp at kernel entry is the only reliable intercept.
 //
-// SECCOMP_FILTER_FLAG_TSYNC is the critical piece: it atomically installs the
-// filter on ALL threads in the process, including scanner threads in libanogs
-// that were already running before our injection — the per-thread fallback
-// only covers the calling thread and future children, leaving existing scanner
-// threads uncovered.
+// TSYNC fails on this device (scanner threads lack NO_NEW_PRIVS before our
+// injection).  Signal-based delivery installs the filter IN each scanner
+// thread's own context via SIGUSR1:
+//   1. Build BPF prog in static globals (pointer must stay valid for all threads)
+//   2. Install on the calling thread via prctl
+//   3. Install SIGUSR1 handler → prctl(NO_NEW_PRIVS) + prctl(SECCOMP) on handler
+//   4. Enumerate /proc/self/task, tgkill SIGUSR1 to every thread except self
+//   5. Wait 10 ms for delivery, restore original SIGUSR1 handler
 //
-// 22-instruction BPF filter. Built at runtime with our PID baked in:
-//   blocks  kill(our_pid|0|-1,   SIGKILL|SIGABRT|SIGTERM)
-//   blocks  tgkill(our_pid|0, *, SIGKILL|SIGABRT|SIGTERM)
-//   allows  everything else
-//
-// ARM64 seccomp_data layout (little-endian, BPF_W reads low 32 bits):
-//   offset  0: uint32  nr              — syscall number
-//   offset  4: uint32  arch
-//   offset  8: uint64  instruction_pointer
-//   offset 16: uint64  args[0]         (pid for kill;  tgid for tgkill)
-//   offset 24: uint64  args[1]         (sig for kill;  tid  for tgkill)
-//   offset 32: uint64  args[2]         (              sig  for tgkill)
+// 22-instruction BPF filter (same as before), built with our PID baked in.
 // ─────────────────────────────────────────────────────────────────────────────
 
-static int install_seccomp_kill_block() {
-    // NO_NEW_PRIVS required for seccomp filter without CAP_SYS_ADMIN.
-    // Zygote sets this already, but be explicit for injected contexts.
-    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+// Static globals — filter pointer must outlive all signal deliveries
+static struct sock_filter g_sc_filter[22];
+static struct sock_fprog  g_sc_prog   = { 22, g_sc_filter };
 
+// Runs in each scanner thread's context when it receives SIGUSR1
+static void seccomp_sigusr1_installer(int, siginfo_t*, void*) {
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &g_sc_prog, 0, 0);
+}
+
+static int install_seccomp_kill_block() {
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     pid_t my_pid = getpid();
 
+    // Build the 22-instruction BPF filter into the global array.
     struct sock_filter f[] = {
-        /* 0  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),                          // load nr
-        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 129, 0, 9),                 // nr==kill? jt→2  jf→11
-        /* 2  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),                         // load args[0] (pid)
-        /* 3  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 2, 0),   // pid==ours  jt→6
-        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0,           1, 0),          // pid==0     jt→6
-        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffffffffu, 0, 15),         // pid==-1    jt→6 jf→21
-        /* 6  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 24),                         // load args[1] (sig)
-        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),                  // SIGKILL    jt→10
-        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),                  // SIGABRT    jt→10
-        /* 9  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 11),                 // SIGTERM    jt→10 jf→21
-        /* 10 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),            // BLOCK kill
-        /* 11 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),                          // reload nr
-        /* 12 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 131, 0, 8),                 // nr==tgkill? jt→13 jf→21
-        /* 13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),                         // load args[0] (tgid)
-        /* 14 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 1, 0),   // tgid==ours jt→16
-        /* 15 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 5),                   // tgid==0    jt→16 jf→21
-        /* 16 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),                         // load args[2] (sig)
-        /* 17 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),                  // SIGKILL    jt→20
-        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),                  // SIGABRT    jt→20
-        /* 19 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 1),                  // SIGTERM    jt→20 jf→21
-        /* 20 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),            // BLOCK tgkill
-        /* 21 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),                    // allow
+        /* 0  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 129, 0, 9),
+        /* 2  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),
+        /* 3  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 2, 0),
+        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0,           1, 0),
+        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffffffffu, 0, 15),
+        /* 6  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 24),
+        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),
+        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),
+        /* 9  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 11),
+        /* 10 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        /* 11 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        /* 12 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 131, 0, 8),
+        /* 13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),
+        /* 14 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 1, 0),
+        /* 15 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 5),
+        /* 16 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),
+        /* 17 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),
+        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),
+        /* 19 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 1),
+        /* 20 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        /* 21 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
-    struct sock_fprog prog = {
-        (unsigned short)(sizeof(f) / sizeof(f[0])),
-        f
+    static_assert(sizeof(f)/sizeof(f[0]) == 22, "filter count mismatch");
+    memcpy(g_sc_filter, f, sizeof(f));
+
+    // Install on the calling thread first
+    int self_r = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &g_sc_prog, 0, 0);
+    if (self_r != 0) {
+        LE("seccomp self-install failed errno=%d", errno);
+        return -1;
+    }
+    LI("seccomp installed on calling thread pid=%d", my_pid);
+
+    // Install SIGUSR1 handler; save and restore the old one afterwards
+    struct sigaction sa = {}, old_sa = {};
+    sa.sa_sigaction = seccomp_sigusr1_installer;
+    sa.sa_flags     = SA_SIGINFO | SA_RESTART | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, &old_sa);
+
+    // Enumerate /proc/self/task and signal each scanner thread
+    struct LinuxDirent64_sc7 {
+        uint64_t d_ino; int64_t d_off; uint16_t d_reclen; uint8_t d_type;
+        char d_name[1];
     };
 
-    // TSYNC: apply filter to ALL existing threads (covers pre-existing scanner threads).
-    // Pre-4.17 kernels return the TID of the first un-syncable thread (positive value)
-    // on partial failure rather than -1+errno. Bionic's syscall() sets errno=0 in that
-    // case because the raw return was not in [-4096,-1]. Handle both.
-    long raw_r = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
-                         SECCOMP_FILTER_FLAG_TSYNC, &prog);
-    if (raw_r == 0) {
-        LI("seccomp TSYNC ok pid=%d insns=%u", my_pid, (unsigned)prog.len);
-        return 0;
-    }
-    if (raw_r > 0) {
-        LI("seccomp TSYNC: TID=%ld refused (pre-4.17 kernel, NO_NEW_PRIVS missing on scanner threads) — per-thread fallback", raw_r);
+    pid_t my_tid = (pid_t)syscall(178 /*__NR_gettid*/);
+    int dfd = (int)syscall(56 /*openat*/, AT_FDCWD, "/proc/self/task",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    int n_sent = 0;
+    if (dfd >= 0) {
+        alignas(8) char buf[2048];
+        long nr;
+        while ((nr = syscall(61 /*getdents64*/, dfd, buf, (long)sizeof(buf))) > 0) {
+            for (long pos = 0; pos < nr; ) {
+                const auto *de = (const LinuxDirent64_sc7*)(buf + pos);
+                if (de->d_name[0] != '.') {
+                    pid_t tid = 0;
+                    for (const char *p = de->d_name; *p >= '0' && *p <= '9'; p++)
+                        tid = tid * 10 + (*p - '0');
+                    if (tid > 0 && tid != my_tid) {
+                        // tgkill: SIGUSR1=10, not a fatal signal → passes our filter
+                        syscall(131 /*tgkill*/, (long)my_pid, (long)tid, SIGUSR1);
+                        n_sent++;
+                    }
+                }
+                pos += de->d_reclen;
+            }
+        }
+        syscall(57 /*close*/, (long)dfd);
     } else {
-        LI("seccomp TSYNC errno=%d — per-thread fallback", errno);
+        LI("seccomp: /proc/self/task open failed errno=%d", errno);
     }
 
-    // Per-thread fallback: only covers this thread and future children
-    int pt_r = prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog, 0, 0);
-    if (pt_r == 0) {
-        LI("seccomp per-thread ok pid=%d", my_pid);
-        return 0;
+    if (n_sent > 0) {
+        // Give each scanner thread time to handle SIGUSR1 and install seccomp
+        struct timespec ts{0, 10000000}; // 10 ms
+        nanosleep(&ts, nullptr);
+        LI("seccomp: signaled %d threads via SIGUSR1", n_sent);
     }
-    LE("seccomp failed raw_r=%ld perthread_err=%d", raw_r, errno);
-    return -1;
+
+    // Restore original SIGUSR1 handler
+    sigaction(SIGUSR1, &old_sa, nullptr);
+    return 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -801,78 +834,6 @@ static int phdr_find7(struct dl_phdr_info *info, size_t, void *data) {
     return 1;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// patch_raw_svc_kill — NOP out raw SVC kill/tgkill calls in a library.
-//
-// Seccomp TSYNC fails on pre-4.17 kernels (and on Android when scanner threads
-// don't have NO_NEW_PRIVS=1) so we can't block raw SVC via seccomp on those
-// threads. Instead we scan the r-x segment for the literal opcode sequence:
-//   MOV X8, #129  (D2801028)  — __NR_kill
-//   MOV X8, #131  (D2801068)  — __NR_tgkill
-// within 4 instructions before any SVC #0 (D4000001) and replace the SVC
-// with MOV X0, #0 (D2800000) — a fake "success" return.  The caller sees 0
-// and assumes the kill succeeded, so it doesn't retry.
-//
-// Only the r-x segment is walked — PROT_NONE gap pages between LOAD segments
-// are never touched (rx_cap is capped at the first executable LOAD segment's
-// end, which is always below the first gap).
-// ─────────────────────────────────────────────────────────────────────────────
-
-static int patch_raw_svc_kill(uintptr_t lib_base, size_t lib_sz,
-                               const char *lib_name) {
-    if (!lib_base || !lib_sz) return 0;
-
-    static constexpr uint32_t kSVC0          = 0xD4000001u;
-    static constexpr uint32_t kMovX8Kill     = 0xD2801028u;  // MOV X8, #129
-    static constexpr uint32_t kMovX8Tgkill   = 0xD2801068u;  // MOV X8, #131
-    static constexpr uint32_t kMovX0Zero     = 0xD2800000u;  // MOV X0, #0
-
-    // Restrict scan to first r-x LOAD segment to avoid PROT_NONE gaps
-    size_t rx_cap = 0;
-    const Elf64_Ehdr *ehdr = (const Elf64_Ehdr*)lib_base;
-    if (ehdr->e_ident[EI_MAG0] == ELFMAG0 && ehdr->e_ident[EI_CLASS] == ELFCLASS64) {
-        const Elf64_Phdr *phdr = (const Elf64_Phdr*)(lib_base + ehdr->e_phoff);
-        for (int i = 0; i < ehdr->e_phnum; i++) {
-            if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X)) {
-                size_t e = (size_t)(phdr[i].p_vaddr + phdr[i].p_filesz);
-                if (e > rx_cap) rx_cap = e;
-            }
-        }
-    }
-    if (!rx_cap)
-        rx_cap = lib_sz < 8 * 1024 * 1024 ? lib_sz : 8 * 1024 * 1024;
-
-    int patched = 0;
-    for (size_t off = 16; off + 4 <= rx_cap; off += 4) {
-        uint32_t insn;
-        __builtin_memcpy(&insn, (void*)(lib_base + off), 4);
-        if (insn != kSVC0) continue;
-
-        // Walk back up to 4 instructions looking for MOV X8, #kill/#tgkill
-        for (int back = 1; back <= 4; back++) {
-            uint32_t prev;
-            __builtin_memcpy(&prev, (void*)(lib_base + off - (size_t)(back * 4)), 4);
-            if (prev != kMovX8Kill && prev != kMovX8Tgkill) continue;
-
-            // Found matching MOV X8 — replace SVC #0 with MOV X0, #0
-            uintptr_t svc_addr = lib_base + off;
-            uintptr_t pg       = svc_addr & ~(uintptr_t)0xFFF;
-            if (mprotect((void*)pg, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-                uint32_t *p = (uint32_t*)svc_addr;
-                *p = kMovX0Zero;
-                __builtin___clear_cache((char*)p, (char*)(p + 1));
-                mprotect((void*)pg, 0x1000, PROT_READ | PROT_EXEC);
-                LI("L56+: SVC→MOV_X0_0 [%s] %s+0x%zx (back=%d)",
-                   prev == kMovX8Kill ? "kill" : "tgkill", lib_name, off, back);
-                patched++;
-            }
-            break;  // stop backtracking for this SVC site
-        }
-    }
-    LI("L56+: raw SVC kill-block: %d sites patched in %s", patched, lib_name);
-    return patched;
-}
-
 static void *ext7_scanner_thread(void*) {
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
 
@@ -911,20 +872,6 @@ static void *ext7_scanner_thread(void*) {
         total += n;
     }
     LI("L56: extended scanner patch done — %d functions patched across 3 markers", total);
-
-    // Scan and NOP raw SVC kill/tgkill call sites in libanogs and libanort.
-    // TSYNC seccomp fails on this kernel (pre-4.17 TID return — existing scanner
-    // threads don't have NO_NEW_PRIVS) so we eliminate the kill sites directly.
-    patch_raw_svc_kill(ano_base, lib_sz, "libanogs");
-    {
-        PhdrCtx7 ctx{"libanort.so", 0, 0};
-        dl_iterate_phdr(phdr_find7, &ctx);
-        if (ctx.base) {
-            size_t sz = ctx.total_sz ? ctx.total_sz : 4 * 1024 * 1024;
-            if (sz > 32 * 1024 * 1024) sz = 4 * 1024 * 1024;
-            patch_raw_svc_kill(ctx.base, sz, "libanort");
-        }
-    }
 
     // Update ranges for caller-check hooks now that lib is confirmed
     g_range7_ready.store(false, std::memory_order_release);
