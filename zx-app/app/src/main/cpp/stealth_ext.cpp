@@ -359,7 +359,11 @@ sigsegv_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
         // Fault is inside libanogs — intentional crash trap
         ucontext_t *ctx = (ucontext_t*)raw_ctx;
         // ARM64: all instructions are 4 bytes; advance past the faulting insn
+#ifdef __aarch64__
         ctx->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+        ctx->uc_mcontext.arm_pc += 4;
+#endif
         return; // resume execution after the faulting instruction
     }
     // Not from libanogs — re-deliver as default (die)
