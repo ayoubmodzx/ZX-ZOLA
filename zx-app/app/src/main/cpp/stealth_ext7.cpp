@@ -308,10 +308,11 @@ static int patch_scanner_by_marker(uintptr_t lib_base, size_t lib_sz,
     if (!str_va) return 0;
     uintptr_t str_page = str_va & ~(uintptr_t)0xFFF;
 
-    // Scan text range for ADRP Xn, <str_page>
-    uintptr_t code_hi = str_va;
-    uintptr_t code_lo = (code_hi > lib_base + 0x100000)
-                         ? code_hi - 0x100000 : lib_base;
+    // Scan FULL library for ADRP Xn, <str_page>.
+    // Scanner functions that reference these strings live at HIGHER addresses
+    // than the strings themselves — scanning only below str_va misses them all.
+    uintptr_t code_lo = lib_base;
+    uintptr_t code_hi = lib_base + scan_cap;
 
     uintptr_t offsets[4] = {};
     int found = 0;
