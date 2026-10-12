@@ -495,6 +495,48 @@ static int hook_access(const char *path, int mode) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Layer 10d — fork() neutraliser
+//
+// libanogs forks a child at vaddr 0x258668; child path (CBZ W0 → 0x2586e8):
+//   1. Resets SIGSEGV to SIG_DFL (0x2588a8) — kills our crash-trap handler
+//   2. Runs ptrace-based detection (0x25895c)
+//   3. tgkill(getppid(), SIGKILL) via direct SVC — kills the parent
+//   4. _exit(127)
+//
+// Hook fork() in libanogs GOT → return fake child PID (always parent path).
+// No real child is spawned; child detection never executes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+using FnFork = pid_t(*)();
+static FnFork g_orig_fork = nullptr;
+
+static pid_t hook_fork() {
+    // Non-zero return = parent path; CBZ W0 at 0x2586d0 NOT taken.
+    // No real child → no signal reset, no detection, no tgkill parent.
+    LI("[fork] neutralised — fake child PID, no real fork");
+    return (pid_t)2;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 10e — ptrace() neutraliser
+//
+// libanogs calls ptrace(PTRACE_TRACEME) in a loop (17 call sites, 0x258b10).
+// If PTRACE_TRACEME returns -EPERM (already traced), detection fires.
+// Hook in GOT always reports success (0) so the anti-debug check passes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+using FnPtrace = long(*)(int, pid_t, void*, void*);
+static FnPtrace g_orig_ptrace = nullptr;
+
+static long hook_ptrace(int req, pid_t pid, void *addr, void *data) {
+    if (req == 0 /* PTRACE_TRACEME */) {
+        LI("[ptrace] TRACEME spoofed → 0");
+        return 0;
+    }
+    return g_orig_ptrace ? g_orig_ptrace(req, pid, addr, data) : -1;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Layer 11 — MADV_DONTDUMP + prctl anti-dump
 //
 // prctl(PR_SET_DUMPABLE, 0): prevents /proc/self/mem writes and core dumps
@@ -793,14 +835,22 @@ void install_stealth_ext() {
     g_orig_popen    = (FnPopen)dlsym(libc, "popen");
     g_orig_access   = (FnAccess)dlsym(libc, "access");
     g_orig_mprotect = (FnMprotect)dlsym(libc, "mprotect");
+    g_orig_fork     = (FnFork)dlsym(libc, "fork");
+    g_orig_ptrace   = (FnPtrace)dlsym(libc, "ptrace");
     if (ano_base) {
         anogs_patch_got_import(ano_base, "popen",  (void*)hook_popen);
         anogs_patch_got_import(ano_base, "access", (void*)hook_access);
-        LI("L10 popen/access installed (GOT — mprotect unhooked, crash-trap path preserved)");
+        // fork: prevents child-based detection path (0x2586e8) — no real child = no tgkill
+        anogs_patch_got_import(ano_base, "fork",   (void*)hook_fork);
+        // ptrace: PTRACE_TRACEME loop (0x258b10, 17 callers) always reports success
+        anogs_patch_got_import(ano_base, "ptrace", (void*)hook_ptrace);
+        LI("L10 popen/access/fork/ptrace installed (GOT — mprotect unhooked, crash-trap preserved)");
     } else if (libc) {
         hk_libc(libc, "popen",  (void*)hook_popen,  (void**)&g_orig_popen);
         hk_libc(libc, "access", (void*)hook_access, (void**)&g_orig_access);
-        LI("L10 popen gate + access filter installed (DobbyHook fallback — may trip scanner)");
+        hk_libc(libc, "fork",   (void*)hook_fork,   (void**)&g_orig_fork);
+        hk_libc(libc, "ptrace", (void*)hook_ptrace, (void**)&g_orig_ptrace);
+        LI("L10 popen/access/fork/ptrace installed (DobbyHook fallback — may trip scanner)");
     }
 
     // ── Layer 11 — MADV_DONTDUMP + prctl ────────────────────────────────────
