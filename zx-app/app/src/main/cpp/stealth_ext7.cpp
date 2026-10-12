@@ -296,8 +296,29 @@ static constexpr uint32_t kRet       = 0xD65F03C0u;
 static int patch_scanner_by_marker(uintptr_t lib_base, size_t lib_sz,
                                     const char *marker) {
     size_t mlen = strlen(marker);
-    // Find marker string in the mapped library image
-    size_t scan_cap = (lib_sz < 20 * 1024 * 1024) ? lib_sz : 20 * 1024 * 1024;
+
+    // Limit scan to the r-x LOAD segment only.
+    // The rw- segments and PROT_NONE guard pages between segments must NOT be
+    // accessed — libanogs verifies that its guard pages remain PROT_NONE and
+    // kills the process (SIGKILL) if they've been made accessible.
+    // All code and rodata strings reside in the r-x segment, so this is safe.
+    size_t rx_cap = 0;
+    {
+        const Elf64_Ehdr *ehdr = (const Elf64_Ehdr*)lib_base;
+        if (ehdr->e_ident[EI_MAG0] == ELFMAG0 && ehdr->e_ident[EI_CLASS] == ELFCLASS64) {
+            const Elf64_Phdr *phdr = (const Elf64_Phdr*)(lib_base + ehdr->e_phoff);
+            for (int i = 0; i < ehdr->e_phnum; i++) {
+                if (phdr[i].p_type == PT_LOAD && (phdr[i].p_flags & PF_X)) {
+                    size_t e = (size_t)(phdr[i].p_vaddr + phdr[i].p_filesz);
+                    if (e > rx_cap) rx_cap = e;
+                }
+            }
+        }
+    }
+    size_t scan_cap = rx_cap ? rx_cap
+                             : (lib_sz < 8 * 1024 * 1024 ? lib_sz : 8 * 1024 * 1024);
+
+    // Find marker string in the mapped library image (r-x range only)
     uintptr_t str_va = 0;
     for (size_t i = 0; i + mlen <= scan_cap; i++) {
         if (__builtin_memcmp((void*)(lib_base + i), marker, mlen) == 0) {
@@ -308,7 +329,7 @@ static int patch_scanner_by_marker(uintptr_t lib_base, size_t lib_sz,
     if (!str_va) return 0;
     uintptr_t str_page = str_va & ~(uintptr_t)0xFFF;
 
-    // Scan FULL library for ADRP Xn, <str_page>.
+    // Scan full r-x segment for ADRP Xn, <str_page>.
     // Scanner functions that reference these strings live at HIGHER addresses
     // than the strings themselves — scanning only below str_va misses them all.
     uintptr_t code_lo = lib_base;
