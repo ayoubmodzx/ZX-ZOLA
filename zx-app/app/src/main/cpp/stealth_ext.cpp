@@ -373,17 +373,16 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
 #endif
 
     if (s_sigv_ano_base && fault_addr >= s_sigv_ano_base && fault_addr < s_sigv_ano_end) {
-        // Fault inside libanogs crash-trap pages — mprotect R/W and re-exec.
+        // Fault inside libanogs crash-trap pages.
+        // Strategy: skip the faulting instruction entirely (PC+4).
+        // Do NOT mprotect R/W — that lets the scanner read zero-bytes from the
+        // now-accessible page, which it detects as "crash-trap bypassed" and
+        // triggers a kill.  By skipping, the scanner gets stale register values
+        // instead of zeros: it can't distinguish this from a normal PROT_NONE
+        // gap, so no detection fires.
         uintptr_t fault_page = fault_addr & ~(uintptr_t)0xFFF;
-        int r2 = (int)syscall(__NR_mprotect, (void*)fault_page, 0x1000,
-                              PROT_READ | PROT_WRITE);
-        if (r2 == 0) {
-            LI("[SIG%d] trap %p → unprotected pc=%p lr=%p — re-exec",
-               sig, (void*)fault_page, (void*)pc, (void*)lr);
-            return;
-        }
-        LI("[SIG%d] trap %p → unmapped (r=%d) pc=%p — skip+4",
-           sig, (void*)fault_page, r2, (void*)pc);
+        LI("[SIG%d] trap %p → skip+4 pc=%p lr=%p",
+           sig, (void*)fault_page, (void*)pc, (void*)lr);
 #ifdef __aarch64__
         ctx2->uc_mcontext.pc += 4;
 #elif defined(__arm__)
