@@ -624,18 +624,22 @@ void AntiDetect::install() {
     OBF_DECODE(anolib, "libanogs.so");
     void *ano = dlopen(anolib, RTLD_LAZY | RTLD_NOLOAD);
 
+    // Layers 54-61 FIRST: kill/tgkill/sigaction hooks must be active before any
+    // GOT patches (L10) that trigger libanogs's background detection timer.
+    // Firing order is: L57 blocks kill(), L59 blocks SIGSEGV handler reset —
+    // both need to be live before L10 patches libanogs's fork/ptrace/dl_iterate GOT.
+    install_stealth_ext7();     // Layers 54-61 (kill/tgkill/sigaction/abort/_exit)
     install_ffutil_bypass();    // Layer 1
     install_proc_hider();       // Layer 2
     install_anosdk_extended(ano); // Layer 3
     // Layer 5 (RWX tracker) is passive — populated by dobby_impl.cpp
     // Layer 6 (string obfuscation) is passive — compile-time only
-    install_stealth_ext();      // Layers 7-12
+    install_stealth_ext();      // Layers 7-12 (L10 GOT patches; kill/tgkill now also in GOT)
     install_stealth_ext2();     // Layers 13-17
     install_stealth_ext3();     // Layers 18-26
     install_stealth_ext4();     // Layers 27-43
     install_stealth_ext5();     // Layers 44-48
     install_stealth_ext6();     // Layers 49-53
-    install_stealth_ext7();     // Layers 54-61
     zx_scrub_trampolines();     // Layer 4 — scrub ALL 61 layers' trampolines at once
 
     LI("AntiDetect: all 61 layers active");

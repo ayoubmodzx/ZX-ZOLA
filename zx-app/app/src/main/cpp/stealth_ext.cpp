@@ -50,6 +50,12 @@
 #ifndef __NR_mprotect
 #define __NR_mprotect 226
 #endif
+#ifndef __NR_kill
+#define __NR_kill 129
+#endif
+#ifndef __NR_tgkill
+#define __NR_tgkill 131
+#endif
 #include <pthread.h>
 #include <cstring>
 #include <cstdio>
@@ -502,6 +508,39 @@ static int hook_access(const char *path, int mode) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Layer 10k — kill() / tgkill() neutraliser (libanogs GOT)
+//
+// libanogs calls kill(getpid(), SIGKILL) or tgkill(tgid, tid, SIGKILL) from
+// 0x258d14 (detection loop) after all other kill paths fail.  Block these in
+// the GOT so the call returns -EPERM without delivering any signal.
+// These are GOT-only hooks; bionic bodies stay pristine (no scanner trampoline).
+// ═════════════════════════════════════════════════════════════════════════════
+
+static inline bool is_fatal_sig_stx(int sig) {
+    return sig == SIGKILL || sig == SIGABRT || sig == SIGTERM;
+}
+
+static int hook_kill_ano(pid_t pid, int sig) {
+    pid_t my_pid = getpid();
+    if (is_fatal_sig_stx(sig) && (pid == my_pid || pid == 0 || pid == -1)) {
+        LI("[kill] blocked kill(%d,%d) via ano GOT", pid, sig);
+        errno = EPERM;
+        return -1;
+    }
+    return (int)syscall(__NR_kill, pid, sig);
+}
+
+static int hook_tgkill_ano(pid_t tgid, pid_t tid, int sig) {
+    pid_t my_pid = getpid();
+    if (is_fatal_sig_stx(sig) && (tgid == my_pid || tgid == 0)) {
+        LI("[tgkill] blocked tgkill(%d,%d,%d) via ano GOT", tgid, tid, sig);
+        errno = EPERM;
+        return -1;
+    }
+    return (int)syscall(__NR_tgkill, tgid, tid, sig);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Layer 10d — fork() neutraliser
 //
 // libanogs detection dispatch at 0x258668:
@@ -892,7 +931,11 @@ void install_stealth_ext() {
         // dl_iterate_phdr: bionic DobbyHook fails; must go through libanogs GOT
         // caller at 0x4fdaf4 scans all loaded ELFs for injected libs
         anogs_patch_got_import(ano_base, "dl_iterate_phdr", (void*)hook_dl_iterate_phdr);
-        LI("L10 popen/access/fork/ptrace/_exit/abort/dl_iterate_phdr installed (GOT)");
+        // kill/tgkill: blocks final detection loop at 0x258d14 via GOT
+        // (L57 DobbyHooks bionic as backup; GOT patch catches direct-import path)
+        anogs_patch_got_import(ano_base, "kill",            (void*)hook_kill_ano);
+        anogs_patch_got_import(ano_base, "tgkill",          (void*)hook_tgkill_ano);
+        LI("L10 popen/access/fork/ptrace/_exit/abort/dl_iterate_phdr/kill/tgkill installed (GOT)");
     } else if (libc) {
         hk_libc(libc, "popen",  (void*)hook_popen,  (void**)&g_orig_popen);
         hk_libc(libc, "access", (void*)hook_access, (void**)&g_orig_access);
