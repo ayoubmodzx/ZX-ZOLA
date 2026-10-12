@@ -398,11 +398,26 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     }
 
     if (sig == SIGBUS) {
-        // SIGBUS from scanner dereffing a garbage/non-canonical pointer it computed
-        // from zero-filled crash-trap pages — skip past the faulting instruction
-        // so the scanner function can continue or unwind cleanly.
-        LI("[SIGBUS] non-ano fault=%p pc=%p — skip+4", (void*)fault_addr, (void*)pc);
-        (void)lr;
+        if (fault_addr == pc) {
+            // Instruction-fetch SIGBUS: scanner branched to a non-canonical/unaligned
+            // address (stale register from a previously skipped load).  Incrementing
+            // PC by 4 just walks through garbage 4 bytes at a time — 24 consecutive
+            // SIGBUS faults observed before kill.
+            // Instead: redirect PC → LR so the scanner "returns" from the bad call
+            // with x0=0 (null), letting it continue from the original call site.
+            LI("[SIGBUS] fetch fault=%p → redirect to lr=%p", (void*)fault_addr, (void*)lr);
+#ifdef __aarch64__
+            ctx2->uc_mcontext.pc       = lr;
+            ctx2->uc_mcontext.regs[0]  = 0;   // x0 = 0 (null return value)
+#elif defined(__arm__)
+            ctx2->uc_mcontext.arm_pc   = ctx2->uc_mcontext.arm_lr;
+            ctx2->uc_mcontext.arm_r0   = 0;
+#endif
+            return;
+        }
+        // SIGBUS from scanner dereffing a garbage/non-canonical data pointer —
+        // skip past the faulting load/store so the scanner can unwind cleanly.
+        LI("[SIGBUS] data fault=%p pc=%p — skip+4", (void*)fault_addr, (void*)pc);
 #ifdef __aarch64__
         ctx2->uc_mcontext.pc += 4;
 #elif defined(__arm__)
@@ -411,9 +426,23 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
         return;
     }
 
-    // SIGSEGV outside libanogs range — re-deliver as default (genuine crash)
+    // SIGSEGV or other signal outside linanogs range.
+    // If fault_addr == pc the scanner branched to an unmapped but aligned address;
+    // redirect to LR the same way as the SIGBUS instruction-fetch case.
+    if (fault_addr == pc) {
+        LI("[SIG%d] fetch fault=%p → redirect to lr=%p", sig, (void*)fault_addr, (void*)lr);
+#ifdef __aarch64__
+        ctx2->uc_mcontext.pc      = lr;
+        ctx2->uc_mcontext.regs[0] = 0;
+#elif defined(__arm__)
+        ctx2->uc_mcontext.arm_pc  = ctx2->uc_mcontext.arm_lr;
+        ctx2->uc_mcontext.arm_r0  = 0;
+#endif
+        return;
+    }
+
+    // Genuine SIGSEGV data fault outside our range — re-deliver as default crash
     LI("[SIGSEGV] non-ano fault=%p — reinstating default handler", (void*)fault_addr);
-    (void)lr;
     struct sigaction dfl = {};
     dfl.sa_handler = SIG_DFL;
     sigemptyset(&dfl.sa_mask);
