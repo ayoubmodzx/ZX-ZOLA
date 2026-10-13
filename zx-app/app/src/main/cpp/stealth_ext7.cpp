@@ -106,6 +106,85 @@
 // 22-instruction BPF filter (same as before), built with our PID baked in.
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// kill_watchdog_children — enumerate /proc and SIGKILL any child of our PID.
+//
+// libanort.so calls fork()+execv() during JNI_OnLoad (~200ms before injection)
+// to create an external watchdog process.  That process runs outside our seccomp
+// filter and can send SIGKILL(our_pid) at any time.  We kill it first.
+//
+// Uses only raw syscalls + minimal libc (snprintf, read, memcmp) so it is safe
+// to call before any hooks are installed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct LinuxDirent64_wdg {
+    uint64_t d_ino; int64_t d_off; uint16_t d_reclen; uint8_t d_type;
+    char d_name[1];
+};
+
+static void kill_watchdog_children() {
+    pid_t my_pid = getpid();
+
+    int pfd = (int)syscall(56 /*openat*/, AT_FDCWD, "/proc",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    if (pfd < 0) {
+        LI("watchdog_kill: /proc open failed errno=%d", errno);
+        return;
+    }
+
+    int killed = 0;
+    alignas(8) char dirbuf[4096];
+    long nr;
+    while ((nr = syscall(61 /*getdents64*/, pfd, dirbuf, (long)sizeof(dirbuf))) > 0) {
+        for (long pos = 0; pos < nr; ) {
+            const auto *de = (const LinuxDirent64_wdg*)(dirbuf + pos);
+            pos += de->d_reclen;
+
+            if (de->d_name[0] < '1' || de->d_name[0] > '9') continue;
+            pid_t cpid = 0;
+            for (const char *p = de->d_name; *p >= '0' && *p <= '9'; p++)
+                cpid = cpid * 10 + (*p - '0');
+            if (cpid <= 0 || cpid == my_pid) continue;
+
+            // Read /proc/cpid/status to find PPid field
+            char spath[48];
+            snprintf(spath, sizeof(spath), "/proc/%d/status", (int)cpid);
+            int sfd = (int)syscall(56 /*openat*/, AT_FDCWD, spath, O_RDONLY | O_CLOEXEC, 0);
+            if (sfd < 0) continue;
+
+            char sbuf[1024];
+            long sn = read(sfd, sbuf, (long)(sizeof(sbuf) - 1));
+            syscall(57 /*close*/, (long)sfd);
+            if (sn <= 0) continue;
+            sbuf[sn] = '\0';
+
+            // Scan for "PPid:\t" or "PPid: " line
+            pid_t ppid = -1;
+            for (char *p = sbuf, *end = sbuf + sn; p < end; ) {
+                if (p + 5 <= end &&
+                    p[0]=='P' && p[1]=='P' && p[2]=='i' && p[3]=='d' && p[4]==':') {
+                    p += 5;
+                    while (p < end && (*p == ' ' || *p == '\t')) p++;
+                    ppid = 0;
+                    while (p < end && *p >= '0' && *p <= '9')
+                        ppid = ppid * 10 + (*p++ - '0');
+                    break;
+                }
+                while (p < end && *p != '\n') p++;
+                if (p < end) p++;
+            }
+
+            if (ppid == my_pid) {
+                LI("watchdog_kill: child pid=%d ppid=%d → SIGKILL", (int)cpid, (int)ppid);
+                syscall(129 /*kill*/, (long)cpid, 9L /*SIGKILL*/);
+                killed++;
+            }
+        }
+    }
+    syscall(57 /*close*/, (long)pfd);
+    LI("watchdog_kill: killed=%d children of pid=%d", killed, (int)my_pid);
+}
+
 // Static globals — filter pointer must outlive all signal deliveries
 static struct sock_filter g_sc_filter[22];
 static struct sock_fprog  g_sc_prog   = { 22, g_sc_filter };
@@ -958,6 +1037,11 @@ static void launch_ext7_scanner() {
 
 void install_stealth_ext7() {
     LI("L54-61 enter");
+
+    // Kill watchdog child process FIRST — libanort.so fork()+execv()'d it
+    // during JNI_OnLoad before injection.  It runs outside our seccomp and
+    // can send SIGKILL(my_pid) unconditionally.  Must die before scanner starts.
+    kill_watchdog_children();
 
     // Install seccomp kill/tgkill block BEFORE anything else.
     // Raw SVC #0 with x8=129/131 bypasses every PLT hook and DobbyHook —
