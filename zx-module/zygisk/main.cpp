@@ -27,19 +27,19 @@ public:
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         if (!args->nice_name) {
-            m_api->setOption(1); // DLCLOSE
+            m_api->setOption(0); // DLCLOSE_MODULE_JNI
             return;
         }
 
         const char *pkg = m_env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!pkg) { m_api->setOption(1); return; }
+        if (!pkg) { m_api->setOption(0); return; }
 
         bool is_ff = (strcmp(pkg, FF_PKG) == 0 || strcmp(pkg, FF_PKG_MAX) == 0);
         m_env->ReleaseStringUTFChars(args->nice_name, pkg);
 
         if (!is_ff) {
             // Unload from every non-FF process — zero overhead everywhere else
-            m_api->setOption(1);
+            m_api->setOption(0);
             return;
         }
 

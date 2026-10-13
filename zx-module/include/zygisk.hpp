@@ -1,9 +1,9 @@
 #pragma once
-// Zygisk API v4 - minimal header
+// Zygisk API v1 - minimal header (v1 = compatible with all Magisk Zygisk)
 #include <cstdint>
 #include <jni.h>
 
-#define ZYGISK_API_VERSION 4
+#define ZYGISK_API_VERSION 1
 
 namespace zygisk {
 
