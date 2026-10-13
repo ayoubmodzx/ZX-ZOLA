@@ -20,25 +20,29 @@ static AsyncWorker g_worker;
 class ZxZolaModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
+        // api is only valid for the duration of onLoad; preAppSpecialize
+        // receives its own per-call api implicitly via Magisk callbacks.
+        // We store it here only because preAppSpecialize calls setOption
+        // on the same object — Magisk keeps it alive for the module lifetime.
         m_api = api;
         m_env = env;
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         if (!args->nice_name) {
-            m_api->setOption(1); // DLCLOSE
+            m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
         const char *pkg = m_env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!pkg) { m_api->setOption(1); return; }
+        if (!pkg) { m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
 
         bool is_ff = (strcmp(pkg, FF_PKG) == 0 || strcmp(pkg, FF_PKG_MAX) == 0);
         m_env->ReleaseStringUTFChars(args->nice_name, pkg);
 
         if (!is_ff) {
             // Unload from every non-FF process — zero overhead everywhere else
-            m_api->setOption(1);
+            m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
