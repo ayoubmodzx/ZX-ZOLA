@@ -109,6 +109,10 @@
 // Static globals — filter pointer must outlive all signal deliveries
 static struct sock_filter g_sc_filter[22];
 static struct sock_fprog  g_sc_prog   = { 22, g_sc_filter };
+// Saved original SIGUSR1 handler — restored by background thread AFTER thaw
+static struct sigaction   g_sigusr1_old_sa = {};
+// PID baked at filter-build time, used by deferred thread
+static pid_t              g_sc_pid = 0;
 
 // Runs in each scanner thread's context when it receives SIGUSR1
 static void seccomp_sigusr1_installer(int, siginfo_t*, void*) {
@@ -116,9 +120,64 @@ static void seccomp_sigusr1_installer(int, siginfo_t*, void*) {
     prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &g_sc_prog, 0, 0);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Background thread: waits 300 ms (past injector's thaw_threads), then
+// re-enumerates /proc/self/task and re-signals all threads that are NOW running.
+// After delivery window (200 ms), restores the original SIGUSR1 handler.
+//
+// Why deferred: our constructor runs while injector has all scanner threads
+// FROZEN via PTRACE_ATTACH.  SIGUSR1 sent to frozen threads queues correctly,
+// but we were restoring old_sa BEFORE the injector called thaw_threads(), so
+// queued signals fired with old_sa instead of seccomp_sigusr1_installer.
+// ─────────────────────────────────────────────────────────────────────────────
+static void *seccomp_deferred_thread(void *) {
+    // 300 ms: conservative margin past injector's thaw_threads (~50-100 ms)
+    struct timespec ts300{0, 300000000L};
+    nanosleep(&ts300, nullptr);
+
+    struct LinuxDirent64_def {
+        uint64_t d_ino; int64_t d_off; uint16_t d_reclen; uint8_t d_type;
+        char d_name[1];
+    };
+
+    pid_t my_pid = g_sc_pid;
+    pid_t my_tid = (pid_t)syscall(178 /*__NR_gettid*/);
+    int dfd = (int)syscall(56 /*openat*/, AT_FDCWD, "/proc/self/task",
+                           O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+    int n_sent = 0;
+    if (dfd >= 0) {
+        alignas(8) char buf[2048];
+        long nr;
+        while ((nr = syscall(61 /*getdents64*/, dfd, buf, (long)sizeof(buf))) > 0) {
+            for (long pos = 0; pos < nr; ) {
+                const auto *de = (const LinuxDirent64_def*)(buf + pos);
+                if (de->d_name[0] != '.') {
+                    pid_t tid = 0;
+                    for (const char *p = de->d_name; *p >= '0' && *p <= '9'; p++)
+                        tid = tid * 10 + (*p - '0');
+                    if (tid > 0 && tid != my_tid)
+                        if (syscall(131 /*tgkill*/, (long)my_pid, (long)tid, SIGUSR1) == 0)
+                            n_sent++;
+                }
+                pos += de->d_reclen;
+            }
+        }
+        syscall(57 /*close*/, (long)dfd);
+    }
+    LI("seccomp deferred: dfd=%d n_sent=%d (post-thaw)", dfd, n_sent);
+
+    // 200 ms delivery window, then restore original handler
+    struct timespec ts200{0, 200000000L};
+    nanosleep(&ts200, nullptr);
+    sigaction(SIGUSR1, &g_sigusr1_old_sa, nullptr);
+    LI("seccomp deferred: SIGUSR1 handler restored");
+    return nullptr;
+}
+
 static int install_seccomp_kill_block() {
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
     pid_t my_pid = getpid();
+    g_sc_pid = my_pid;
 
     // Build the 22-instruction BPF filter into the global array.
     struct sock_filter f[] = {
@@ -156,14 +215,18 @@ static int install_seccomp_kill_block() {
     }
     LI("seccomp installed on calling thread pid=%d", my_pid);
 
-    // Install SIGUSR1 handler; save and restore the old one afterwards
-    struct sigaction sa = {}, old_sa = {};
+    // Install SIGUSR1 handler; save old_sa into global for deferred restoration
+    struct sigaction sa = {};
     sa.sa_sigaction = seccomp_sigusr1_installer;
     sa.sa_flags     = SA_SIGINFO | SA_RESTART | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGUSR1, &sa, &old_sa);
+    sigaction(SIGUSR1, &sa, &g_sigusr1_old_sa);
 
-    // Enumerate /proc/self/task and signal each scanner thread
+    // Enumerate /proc/self/task and signal each scanner thread.
+    // NOTE: scanner threads may still be FROZEN (PTRACE_ATTACH) at this point.
+    // Signals queue on frozen threads and will fire with seccomp_sigusr1_installer
+    // when injector calls thaw_threads() — BUT only if we haven't restored
+    // old_sa yet.  The deferred thread below handles restoration AFTER thaw.
     struct LinuxDirent64_sc7 {
         uint64_t d_ino; int64_t d_off; uint16_t d_reclen; uint8_t d_type;
         char d_name[1];
@@ -193,19 +256,19 @@ static int install_seccomp_kill_block() {
             }
         }
         syscall(57 /*close*/, (long)dfd);
-    } else {
-        LI("seccomp: /proc/self/task open failed errno=%d", errno);
     }
+    LI("seccomp: initial_enum dfd=%d n_sent=%d my_tid=%d (threads may be frozen)", dfd, n_sent, (int)my_tid);
 
-    if (n_sent > 0) {
-        // Give each scanner thread time to handle SIGUSR1 and install seccomp
-        struct timespec ts{0, 10000000}; // 10 ms
-        nanosleep(&ts, nullptr);
-        LI("seccomp: signaled %d threads via SIGUSR1", n_sent);
-    }
-
-    // Restore original SIGUSR1 handler
-    sigaction(SIGUSR1, &old_sa, nullptr);
+    // Launch background thread to re-signal post-thaw and then restore old_sa.
+    // Do NOT restore old_sa here — frozen threads haven't processed SIGUSR1 yet.
+    pthread_t t;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_attr_setstacksize(&attr, 32768);
+    pthread_create(&t, &attr, seccomp_deferred_thread, nullptr);
+    pthread_attr_destroy(&attr);
+    LI("seccomp: deferred thread launched (300ms delay before re-signal+restore)");
     return 0;
 }
 
