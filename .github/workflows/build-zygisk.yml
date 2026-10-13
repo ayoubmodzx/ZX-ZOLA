@@ -26,6 +26,18 @@ jobs:
       - name: Set NDK path
         run: echo "NDK=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
 
+      # ── Pull official zygisk.hpp from Magisk source ──────────────────────
+      # Our hand-crafted header risks api_table layout drift vs the running
+      # Magisk version. Always build against the real official header.
+      - name: Fetch official zygisk.hpp
+        run: |
+          curl -fsSL \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3.raw" \
+            "https://api.github.com/repos/topjohnwu/Magisk/contents/native/src/include/zygisk.hpp" \
+            -o zx-module/include/zygisk.hpp
+          head -5 zx-module/include/zygisk.hpp
+
       # ── Build arm64-v8a ──────────────────────────────────────────────────
       - name: Build arm64-v8a
         run: |
