@@ -52,19 +52,21 @@ jobs:
           cp build-arm64/libzx_zola.so              module_staging/zygisk/arm64-v8a.so
           cp build-arm32/libzx_zola.so              module_staging/zygisk/armeabi-v7a.so
           chmod +x module_staging/customize.sh module_staging/service.sh module_staging/META-INF/com/google/android/update-binary
-          cd module_staging
-          zip -r ../ZX-ZOLA-module.zip module.prop customize.sh service.sh zygisk META-INF
-          cd ..
-          echo "Module size: $(du -sh ZX-ZOLA-module.zip)"
-
       - name: Upload module artifact
         uses: actions/upload-artifact@v4
         with:
           name: ZX-ZOLA-module
-          path: ZX-ZOLA-module.zip
+          path: module_staging/
           retention-days: 30
 
       - name: Create Release (main branch)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          cd module_staging
+          zip -r ../ZX-ZOLA-module.zip module.prop customize.sh service.sh zygisk META-INF
+          cd ..
+
+      - name: Upload release zip
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
