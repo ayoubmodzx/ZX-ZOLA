@@ -5,6 +5,7 @@
 #include "feature_engine.hpp"
 #include "anosdk_bypass.hpp"
 #include "memory_guard.hpp"
+#include "kill_shield.hpp"
 #include <android/log.h>
 #include <cstring>
 
@@ -52,12 +53,16 @@ public:
         g_worker.start();
 
         g_worker.post([] {
-            // 1. Hide ourselves from AnoSDK memory scan first
+            // 1. Kill-path neutraliser — FIRST: patches kill stubs + MVM
+            //    dispatcher on load, delivers seccomp to every new thread
+            KillShield::install();
+
+            // 2. Hide ourselves from AnoSDK memory scan
             if (MemoryGuard::init()) {
                 MemoryGuard::hideSelf();
             }
 
-            // 2. Intercept AnoSDK reporting — BEFORE it initializes
+            // 3. Intercept AnoSDK reporting — BEFORE it initializes
             AnoBypass::install();
 
             // 3. Init il2cpp API
