@@ -32,6 +32,9 @@
 #include <linux/filter.h>
 #include <fcntl.h>
 #include <dlfcn.h>
+#ifndef RTLD_DI_LINKMAP
+#  define RTLD_DI_LINKMAP 2
+#endif
 #include <link.h>
 #include <pthread.h>
 #include <unistd.h>

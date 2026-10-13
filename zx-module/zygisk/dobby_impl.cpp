@@ -2,6 +2,7 @@
 // No external Dobby dependency needed — implements the subset used by ZX-ZOLA.
 
 #include "dobby_stub.hpp"
+#include <cstddef>
 // Zygisk module stubs — MemoryGuard handles hiding, no full anti_detect needed
 static void zx_track_rwx_page(void*, size_t) {}
 static void zx_register_scrub_target(void*) {}
