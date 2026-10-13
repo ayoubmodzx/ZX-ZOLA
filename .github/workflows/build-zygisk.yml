@@ -88,23 +88,21 @@ jobs:
           mkdir -p "$STAGE/META-INF/com/google/android"
           mkdir -p "$STAGE/zygisk"
 
-          # Standard Magisk update-binary stub — sources customize.sh
-          cat > "$STAGE/META-INF/com/google/android/update-binary" << 'UBEOF'
-          #!/system/bin/sh
-          SKIPUNZIP=1
-          . /data/adb/magisk/util_functions.sh
-          . "$TMPDIR/customize.sh"
-          UBEOF
+          # Download the real Magisk update-binary from the official module template.
+          # This is what Magisk checks — a heredoc stub causes "not a Magisk module".
+          curl -fsSL \
+            "https://raw.githubusercontent.com/topjohnwu/magisk-module-template/main/META-INF/com/google/android/update-binary" \
+            -o "$STAGE/META-INF/com/google/android/update-binary"
 
-          # updater-script must contain exactly #MAGISK for Magisk to process it
-          echo '#MAGISK' > "$STAGE/META-INF/com/google/android/updater-script"
+          # updater-script first line must be exactly #MAGISK (no leading spaces)
+          printf '#MAGISK\n' > "$STAGE/META-INF/com/google/android/updater-script"
 
           # Module files
           cp zx-module/module.prop           "$STAGE/module.prop"
           cp zx-module/scripts/customize.sh  "$STAGE/customize.sh"
           cp zx-module/scripts/service.sh    "$STAGE/service.sh"
 
-          # Native libraries
+          # Native libraries (Zygisk expects <abi>.so names)
           cp build/arm64/libzx_zola.so       "$STAGE/zygisk/arm64-v8a.so"
           cp build/arm32/libzx_zola.so       "$STAGE/zygisk/armeabi-v7a.so"
 
