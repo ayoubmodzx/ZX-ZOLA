@@ -53,7 +53,7 @@ jobs:
           cp build-arm32/libzx_zola.so              module_staging/zygisk/armeabi-v7a.so
           chmod +x module_staging/customize.sh module_staging/service.sh module_staging/META-INF/com/google/android/update-binary
           cd module_staging
-          zip -r ../ZX-ZOLA-module.zip .
+          zip -r ../ZX-ZOLA-module.zip module.prop customize.sh service.sh zygisk META-INF
           cd ..
           echo "Module size: $(du -sh ZX-ZOLA-module.zip)"
 
