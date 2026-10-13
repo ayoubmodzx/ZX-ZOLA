@@ -4,8 +4,10 @@ project(zx_zola)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Aggressive optimization, strip symbols
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -flto -fvisibility=hidden -ffunction-sections -fdata-sections")
+# Aggressive optimization — do NOT pass -fvisibility=hidden globally; it would
+# hide zygisk_module_entry even with the per-symbol default attribute when LTO
+# merges translation units. Each internal symbol is hidden via per-TU attributes.
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -flto -ffunction-sections -fdata-sections")
 set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--strip-all -Wl,-z,relro,-z,now")
 
 add_library(zx_zola SHARED
@@ -19,6 +21,10 @@ add_library(zx_zola SHARED
 )
 
 target_include_directories(zx_zola PRIVATE include)
+
+# Hide all symbols by default at the target level; zygisk_module_entry is
+# explicitly marked visibility("default") in the REGISTER_ZYGISK_MODULE macro.
+target_compile_options(zx_zola PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
 
 target_link_libraries(zx_zola
     android
