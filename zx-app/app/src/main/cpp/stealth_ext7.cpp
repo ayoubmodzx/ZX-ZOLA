@@ -1070,6 +1070,17 @@ void install_stealth_ext7() {
     }
     LI("L54-61: anort_base=0x%lx sz=0x%lx", (unsigned long)anort_base, (unsigned long)anort_sz);
 
+    // ── MVM generic syscall dispatcher neutralization ────────────────────────
+    // libanogs.so offset 0x4e0140: MOV X8,X0; MOV X0,X1; ...; SVC #0
+    // This dispatcher handles kill(129), tgkill(131), exit_group(94), and
+    // others.  Our seccomp filter blocks kill/tgkill, but NOT exit_group.
+    // Patching the entry point to MOV W0,#0; RET makes all dispatched calls
+    // silently return 0 (success) without executing the SVC.
+    if (ano_base) {
+        bool ok = patch_page_rwx(ano_base + 0x4e0140, kMovW0Zero, kRet);
+        LI("MVM dispatcher neutralized @ base+0x4e0140: %s", ok ? "OK" : "FAILED");
+    }
+
     // ── Layer 54: inotify_init / inotify_init1 ───────────────────────────────
     // Both bionic wrappers are ≤ 12 bytes on arm64 — too short for Dobby inline
     // trampolines. Use GOT patching inside libanogs instead.
