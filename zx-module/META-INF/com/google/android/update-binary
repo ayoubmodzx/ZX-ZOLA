@@ -1,7 +1,24 @@
 #!/sbin/sh
 
-SKIPUNZIP=1
+umask 022
 
-# Extract and run customize.sh
-unzip -o "$ZIPFILE" 'customize.sh' -d "$TMPDIR" >&2
-[ -f "$TMPDIR/customize.sh" ] && . "$TMPDIR/customize.sh"
+ui_print() { echo "$1"; }
+
+require_new_magisk() {
+  ui_print "*******************************"
+  ui_print " Please install Magisk v20.4+! "
+  ui_print "*******************************"
+  exit 1
+}
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+[ -f /data/adb/magisk/util_functions.sh ] || require_new_magisk
+. /data/adb/magisk/util_functions.sh
+[ $MAGISK_VER_CODE -lt 20400 ] && require_new_magisk
+
+install_module
+exit 0
