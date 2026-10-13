@@ -4,10 +4,23 @@ project(zx_zola)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Aggressive optimization — do NOT pass -fvisibility=hidden globally; it would
-# hide zygisk_module_entry even with the per-symbol default attribute when LTO
-# merges translation units. Each internal symbol is hidden via per-TU attributes.
-set(CMAKE_CXX_FLAGS_RELEASE "-O3 -flto -ffunction-sections -fdata-sections")
+# ── Dobby inline hook engine ──────────────────────────────────────────────────
+include(FetchContent)
+FetchContent_Declare(
+    Dobby
+    GIT_REPOSITORY https://github.com/jmpews/Dobby.git
+    GIT_TAG        main
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   FALSE
+)
+set(DOBBY_DEBUG                          OFF CACHE BOOL "" FORCE)
+set(Plugin.SymbolResolver                ON  CACHE BOOL "" FORCE)
+set(Plugin.Darwin.HideLibrary            OFF CACHE BOOL "" FORCE)
+set(Plugin.Android.BionicLinkerRestriction OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(Dobby)
+
+# ── Global flags — no LTO or visibility here; set per-target below ────────────
+set(CMAKE_CXX_FLAGS_RELEASE   "-O2 -ffunction-sections -fdata-sections")
 set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--strip-all -Wl,-z,relro,-z,now")
 
 add_library(zx_zola SHARED
@@ -22,12 +35,15 @@ add_library(zx_zola SHARED
 
 target_include_directories(zx_zola PRIVATE include)
 
-# Hide all symbols by default at the target level; zygisk_module_entry is
-# explicitly marked visibility("default") in the REGISTER_ZYGISK_MODULE macro.
-target_compile_options(zx_zola PRIVATE -fvisibility=hidden -fvisibility-inlines-hidden)
+# Per-target: hide everything by default; zygisk_module_entry has explicit default attr
+target_compile_options(zx_zola PRIVATE
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+)
 
 target_link_libraries(zx_zola
     android
     log
     dl
+    dobby
 )
