@@ -1,0 +1,156 @@
+name: Build Zygisk Module ZIP
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── NDK setup ────────────────────────────────────────────────────────
+      - name: Install NDK r27c + CMake
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "y" | "$SDKMANAGER" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1" \
+            "platforms;android-35" \
+            --sdk_root="$ANDROID_SDK_ROOT" > /dev/null
+
+      - name: Set NDK path
+        run: echo "NDK=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      # ── Build arm64-v8a ──────────────────────────────────────────────────
+      - name: Build arm64-v8a
+        run: |
+          cmake -S zx-module -B build/arm64 \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_STL=c++_static \
+            -GNinja
+          cmake --build build/arm64 --config Release
+
+      # ── Build armeabi-v7a ────────────────────────────────────────────────
+      - name: Build armeabi-v7a
+        run: |
+          cmake -S zx-module -B build/arm32 \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_STL=c++_static \
+            -GNinja
+          cmake --build build/arm32 --config Release
+
+      # ── Verify zygisk_module_entry is exported ───────────────────────────
+      - name: Verify symbol export
+        run: |
+          ARM64_SO="build/arm64/libzx_zola.so"
+          ARM32_SO="build/arm32/libzx_zola.so"
+
+          check_sym() {
+            local so="$1"
+            if ! "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+                  -D "$so" 2>/dev/null | grep -q "zygisk_module_entry"; then
+              echo "ERROR: zygisk_module_entry not exported in $so"
+              "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D "$so" || true
+              exit 1
+            fi
+            echo "OK: zygisk_module_entry found in $so"
+          }
+
+          check_sym "$ARM64_SO"
+          check_sym "$ARM32_SO"
+
+      # ── Compute SHA256 for runtime verification ──────────────────────────
+      - name: Compute library hashes
+        id: hashes
+        run: |
+          ARM64_HASH=$(sha256sum build/arm64/libzx_zola.so | awk '{print $1}')
+          ARM32_HASH=$(sha256sum build/arm32/libzx_zola.so | awk '{print $1}')
+          echo "arm64=$ARM64_HASH" >> "$GITHUB_OUTPUT"
+          echo "arm32=$ARM32_HASH" >> "$GITHUB_OUTPUT"
+          echo "arm64 SHA256: $ARM64_HASH"
+          echo "arm32 SHA256: $ARM32_HASH"
+
+      # ── Stage module ZIP contents ────────────────────────────────────────
+      - name: Stage module structure
+        run: |
+          STAGE="staging/zx_zola_zygisk"
+          mkdir -p "$STAGE/META-INF/com/google/android"
+          mkdir -p "$STAGE/zygisk"
+
+          # Standard Magisk update-binary stub — sources customize.sh
+          cat > "$STAGE/META-INF/com/google/android/update-binary" << 'UBEOF'
+          #!/system/bin/sh
+          SKIPUNZIP=1
+          . /data/adb/magisk/util_functions.sh
+          . "$TMPDIR/customize.sh"
+          UBEOF
+
+          # updater-script must contain exactly #MAGISK for Magisk to process it
+          echo '#MAGISK' > "$STAGE/META-INF/com/google/android/updater-script"
+
+          # Module files
+          cp zx-module/module.prop           "$STAGE/module.prop"
+          cp zx-module/scripts/customize.sh  "$STAGE/customize.sh"
+          cp zx-module/scripts/service.sh    "$STAGE/service.sh"
+
+          # Native libraries
+          cp build/arm64/libzx_zola.so       "$STAGE/zygisk/arm64-v8a.so"
+          cp build/arm32/libzx_zola.so       "$STAGE/zygisk/armeabi-v7a.so"
+
+          chmod 755 "$STAGE/META-INF/com/google/android/update-binary"
+          chmod 755 "$STAGE/customize.sh"
+          chmod 755 "$STAGE/service.sh"
+
+      # ── Pack ZIP ─────────────────────────────────────────────────────────
+      - name: Create module ZIP
+        run: |
+          VERSION=$(grep '^version=' zx-module/module.prop | cut -d= -f2 | tr -d ' ')
+          BUILD="${{ github.run_number }}"
+          ZIPNAME="ZX-ZOLA-${VERSION}-build${BUILD}.zip"
+          echo "ZIPNAME=$ZIPNAME" >> "$GITHUB_ENV"
+
+          cd staging/zx_zola_zygisk
+          zip -r9 "../../$ZIPNAME" . -x "*.DS_Store"
+          cd ../..
+
+          echo "ZIP size: $(du -sh "$ZIPNAME" | cut -f1)"
+          echo "ZIP SHA256: $(sha256sum "$ZIPNAME" | awk '{print $1}')"
+
+      # ── Upload artifact ──────────────────────────────────────────────────
+      - name: Upload module ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIPNAME }}
+          path: ${{ env.ZIPNAME }}
+          retention-days: 30
+
+      # ── Release on main branch push ──────────────────────────────────────
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "zygisk-build-${{ github.run_number }}"
+          name: "ZX-ZOLA Zygisk Build ${{ github.run_number }}"
+          body: |
+            ## ZX-ZOLA Zygisk Module
+
+            **arm64-v8a SHA256:** `${{ steps.hashes.outputs.arm64 }}`
+            **armeabi-v7a SHA256:** `${{ steps.hashes.outputs.arm32 }}`
+
+            ### Install
+            Flash in Magisk or KernelSU → reboot → hide root + Zygisk.
+          files: ${{ env.ZIPNAME }}
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
