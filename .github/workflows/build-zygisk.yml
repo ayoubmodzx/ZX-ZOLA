@@ -88,14 +88,9 @@ jobs:
           mkdir -p "$STAGE/META-INF/com/google/android"
           mkdir -p "$STAGE/zygisk"
 
-          # Download the real Magisk update-binary from the official module template.
-          # This is what Magisk checks — a heredoc stub causes "not a Magisk module".
-          curl -fsSL \
-            "https://raw.githubusercontent.com/topjohnwu/magisk-module-template/main/META-INF/com/google/android/update-binary" \
-            -o "$STAGE/META-INF/com/google/android/update-binary"
-
-          # updater-script first line must be exactly #MAGISK (no leading spaces)
-          printf '#MAGISK\n' > "$STAGE/META-INF/com/google/android/updater-script"
+          # Copy pre-committed META-INF files — avoids external URL fragility
+          cp zx-module/META-INF/com/google/android/update-binary  "$STAGE/META-INF/com/google/android/update-binary"
+          cp zx-module/META-INF/com/google/android/updater-script "$STAGE/META-INF/com/google/android/updater-script"
 
           # Module files
           cp zx-module/module.prop           "$STAGE/module.prop"

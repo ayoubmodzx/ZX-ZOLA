@@ -1,0 +1,7 @@
+#!/sbin/sh
+
+SKIPUNZIP=1
+
+# Extract and run customize.sh
+unzip -o "$ZIPFILE" 'customize.sh' -d "$TMPDIR" >&2
+[ -f "$TMPDIR/customize.sh" ] && . "$TMPDIR/customize.sh"
