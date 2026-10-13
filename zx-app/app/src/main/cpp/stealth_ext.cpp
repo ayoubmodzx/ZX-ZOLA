@@ -364,16 +364,25 @@ static int hook_mprotect(void *addr, size_t len, int prot) {
 static uintptr_t s_sigv_ano_base = 0;
 static uintptr_t s_sigv_ano_end  = 0;
 
-// Park function: scanner threads redirected here when they hit an
-// instruction-fetch SIGBUS at an invalid address (garbage PC from MVM returning 0).
-// skip+4 through garbage escapes at ~39 iterations (wp=7849 die-point).
-// Parking permanently prevents that escape — thread sleeps forever.
+// Park function: scanner threads redirected here after the skip+4 timing window expires.
+// skip+4 × N buys time (each signal delivery starves the kill thread of CPU).
+// After N iterations the thread escapes garbage space and reaches live kill code.
+// Parking after N skips preserves the timing benefit AND prevents the escape.
 static void __attribute__((noreturn, noinline)) thread_park_fn() {
     for (;;) {
         struct timespec ts = {30, 0};
         nanosleep(&ts, nullptr);
     }
 }
+
+// Per-thread instruction-fetch SIGBUS counter.
+// Each scanner thread independently spins kIfetchParkThreshold times (≥ the 39
+// iterations observed at wp=7849) before being parked.
+// Immediate park (count=0) was wp=3465 — it removed the timing window entirely.
+// skip+4 forever was wp=7849 — thread eventually escapes at iteration 39.
+// skip+4 × 80 then park: preserves the timing window, eliminates the escape.
+static __thread int tl_ifetch_sigbus_count = 0;
+static constexpr int kIfetchParkThreshold  = 80;
 
 static void __attribute__((noinline))
 fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
@@ -403,14 +412,24 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
 
     if (sig == SIGBUS) {
         if (fault_addr == pc) {
-            // Instruction-fetch fault: scanner thread branched to an invalid address
-            // (garbage PC from MVM dispatcher returning 0).
-            // Old behaviour: skip+4 → ~39 iterations through garbage → escape to live kill code → wp=7849 death.
-            // New behaviour: redirect PC to thread_park_fn → thread parks forever, never escapes.
-            LI("[SIGBUS] ifetch=%p — park thread", (void*)pc);
+            // Instruction-fetch fault: scanner thread at an invalid address.
+            // Strategy: skip+4 for the first kIfetchParkThreshold iterations to
+            // preserve the CPU-starvation timing window (each signal delivery
+            // delays the kill thread), then park permanently to prevent escape.
+            tl_ifetch_sigbus_count++;
+            if (tl_ifetch_sigbus_count > kIfetchParkThreshold) {
+                LI("[SIGBUS] ifetch=%p cnt=%d — park", (void*)pc, tl_ifetch_sigbus_count);
 #ifdef __aarch64__
-            ctx2->uc_mcontext.pc = (uint64_t)(uintptr_t)thread_park_fn;
+                ctx2->uc_mcontext.pc = (uint64_t)(uintptr_t)thread_park_fn;
 #endif
+            } else {
+                LI("[SIGBUS] ifetch=%p cnt=%d — skip+4", (void*)pc, tl_ifetch_sigbus_count);
+#ifdef __aarch64__
+                ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+                ctx2->uc_mcontext.arm_pc += 4;
+#endif
+            }
             return;
         }
         // Data-access SIGBUS (fault_addr != pc) → skip+4 as before
