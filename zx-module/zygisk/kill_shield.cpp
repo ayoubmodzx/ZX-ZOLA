@@ -32,9 +32,6 @@
 #include <linux/filter.h>
 #include <fcntl.h>
 #include <dlfcn.h>
-#ifndef RTLD_DI_LINKMAP
-#  define RTLD_DI_LINKMAP 2
-#endif
 #include <link.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -153,16 +150,32 @@ static bool patch2(uintptr_t addr, uint32_t i0, uint32_t i1) {
     return true;
 }
 
+// ── Base-address helper (dl_iterate_phdr — available API 21+) ─────────────────
+struct FindBase { const char* needle; uintptr_t base; };
+
+static int find_base_cb(struct dl_phdr_info* info, size_t, void* data) {
+    auto* fb = static_cast<FindBase*>(data);
+    if (info->dlpi_name && strstr(info->dlpi_name, fb->needle)) {
+        fb->base = (uintptr_t)info->dlpi_addr;
+        return 1;
+    }
+    return 0;
+}
+
+static uintptr_t lib_base(const char* needle) {
+    FindBase fb{needle, 0};
+    dl_iterate_phdr(find_base_cb, &fb);
+    return fb.base;
+}
+
 // ── Patch entry points ────────────────────────────────────────────────────────
 static std::atomic<bool> g_anogs_done{false};
 static std::atomic<bool> g_anort_done{false};
 
-static void apply_anogs(void* handle) {
+static void apply_anogs(void* /*handle*/) {
     if (g_anogs_done.exchange(true)) return;
-    struct link_map* lm = nullptr;
-    dlinfo(handle, RTLD_DI_LINKMAP, &lm);
-    if (!lm) { LE("anogs: no linkmap"); return; }
-    uintptr_t b = (uintptr_t)lm->l_addr;
+    uintptr_t b = lib_base("libanogs");
+    if (!b) { LE("anogs: base not found"); return; }
     LI("anogs base=0x%lx", (unsigned long)b);
     int r1 = patch2(b + kKillStub,   kMovW0Zero, kRet);
     int r2 = patch2(b + kOpenatStub, kMovW0Zero, kRet);
@@ -171,12 +184,10 @@ static void apply_anogs(void* handle) {
     LI("kill=%d openat=%d read=%d MVM=%d", r1, r2, r3, r4);
 }
 
-static void apply_anort(void* handle) {
+static void apply_anort(void* /*handle*/) {
     if (g_anort_done.exchange(true)) return;
-    struct link_map* lm = nullptr;
-    dlinfo(handle, RTLD_DI_LINKMAP, &lm);
-    if (!lm) { LE("anort: no linkmap"); return; }
-    uintptr_t b = (uintptr_t)lm->l_addr;
+    uintptr_t b = lib_base("libanort");
+    if (!b) { LE("anort: base not found"); return; }
     LI("anort base=0x%lx", (unsigned long)b);
     LI("tp_syscall=%d", patch2(b + kTpSyscall, kMovX0XZR, kRet));
 }
