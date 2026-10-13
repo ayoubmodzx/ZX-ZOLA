@@ -186,8 +186,8 @@ static void kill_watchdog_children() {
 }
 
 // Static globals — filter pointer must outlive all signal deliveries
-static struct sock_filter g_sc_filter[22];
-static struct sock_fprog  g_sc_prog   = { 22, g_sc_filter };
+static struct sock_filter g_sc_filter[25];
+static struct sock_fprog  g_sc_prog   = { 25, g_sc_filter };
 // Saved original SIGUSR1 handler — restored by background thread AFTER thaw
 static struct sigaction   g_sigusr1_old_sa = {};
 // PID baked at filter-build time, used by deferred thread
@@ -258,32 +258,39 @@ static int install_seccomp_kill_block() {
     pid_t my_pid = getpid();
     g_sc_pid = my_pid;
 
-    // Build the 22-instruction BPF filter into the global array.
+    // Build the 25-instruction BPF filter into the global array.
+    // Instructions 0-2: block exit_group(94) unconditionally — scanner fallback
+    // kill path when kill/tgkill are already blocked by EPERM.
+    // Instructions 3-24: original kill(129)/tgkill(131) fatal-signal filter.
+    // All jf offsets targeting ALLOW land on inst 24. Verified per instruction.
     struct sock_filter f[] = {
         /* 0  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
-        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 129, 0, 9),
-        /* 2  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),
-        /* 3  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 2, 0),
-        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0,           1, 0),
-        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffffffffu, 0, 15),
-        /* 6  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 24),
-        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),
-        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),
-        /* 9  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 11),
-        /* 10 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
-        /* 11 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
-        /* 12 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 131, 0, 8),
-        /* 13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),
-        /* 14 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 1, 0),
-        /* 15 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 5),
-        /* 16 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),
-        /* 17 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),
-        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),
-        /* 19 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 1),
-        /* 20 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
-        /* 21 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 94, 0, 1),
+        /* 2  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        /* 3  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 129, 0, 9),
+        /* 5  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),
+        /* 6  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 2, 0),
+        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0,           1, 0),
+        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0xffffffffu, 0, 15),
+        /* 9  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 24),
+        /* 10 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),
+        /* 11 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),
+        /* 12 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 11),
+        /* 13 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        /* 14 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        /* 15 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 131, 0, 8),
+        /* 16 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 16),
+        /* 17 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, (uint32_t)my_pid, 1, 0),
+        /* 18 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 0, 0, 5),
+        /* 19 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 32),
+        /* 20 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 9,  2, 0),
+        /* 21 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 6,  1, 0),
+        /* 22 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 15, 0, 1),
+        /* 23 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | EPERM),
+        /* 24 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
-    static_assert(sizeof(f)/sizeof(f[0]) == 22, "filter count mismatch");
+    static_assert(sizeof(f)/sizeof(f[0]) == 25, "filter count mismatch");
     memcpy(g_sc_filter, f, sizeof(f));
 
     // Install on the calling thread first
