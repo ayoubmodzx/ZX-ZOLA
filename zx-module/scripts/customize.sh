@@ -41,12 +41,12 @@ esac
 
 [ -n "$ABI64" ] && {
     ui_print "- Extracting $ABI64 library"
-    extract "$ZIPFILE" "zygisk/$ABI64.so" "$MODPATH/zygisk"
+    extract "$ZIPFILE" "zygisk/$ABI64.so" "$MODPATH"
 }
 
 [ -n "$ABI32" ] && {
     ui_print "- Extracting $ABI32 library"
-    extract "$ZIPFILE" "zygisk/$ABI32.so" "$MODPATH/zygisk"
+    extract "$ZIPFILE" "zygisk/$ABI32.so" "$MODPATH"
 }
 
 chmod 755 "$MODPATH/service.sh"
