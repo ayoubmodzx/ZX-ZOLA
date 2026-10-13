@@ -364,6 +364,17 @@ static int hook_mprotect(void *addr, size_t len, int prot) {
 static uintptr_t s_sigv_ano_base = 0;
 static uintptr_t s_sigv_ano_end  = 0;
 
+// Park function: scanner threads redirected here when they hit an
+// instruction-fetch SIGBUS at an invalid address (garbage PC from MVM returning 0).
+// skip+4 through garbage escapes at ~39 iterations (wp=7849 die-point).
+// Parking permanently prevents that escape — thread sleeps forever.
+static void __attribute__((noreturn, noinline)) thread_park_fn() {
+    for (;;) {
+        struct timespec ts = {30, 0};
+        nanosleep(&ts, nullptr);
+    }
+}
+
 static void __attribute__((noinline))
 fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     uintptr_t fault_addr = (uintptr_t)info->si_addr;
@@ -391,16 +402,19 @@ fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
     }
 
     if (sig == SIGBUS) {
-        // ALL SIGBUS cases (instruction-fetch fault_addr==pc AND data faults) → skip+4.
-        //
-        // The LR-redirect "fix" (commit 1cc397b) was empirically worse:
-        //   skip+4 walk → scanner stuck in SIGBUS loop → wp=6522 (all 61 layers install)
-        //   LR redirect  → scanner unblocks, processes x0=0, immediately SVC-kills → wp=3286
-        //
-        // skip+4 on instruction-fetch keeps the scanner spinning in an infinite SIGBUS
-        // loop through garbage address space, buying time for all layers to install
-        // before the scanner can reach a live kill path.
-        LI("[SIGBUS] fault=%p pc=%p — skip+4", (void*)fault_addr, (void*)pc);
+        if (fault_addr == pc) {
+            // Instruction-fetch fault: scanner thread branched to an invalid address
+            // (garbage PC from MVM dispatcher returning 0).
+            // Old behaviour: skip+4 → ~39 iterations through garbage → escape to live kill code → wp=7849 death.
+            // New behaviour: redirect PC to thread_park_fn → thread parks forever, never escapes.
+            LI("[SIGBUS] ifetch=%p — park thread", (void*)pc);
+#ifdef __aarch64__
+            ctx2->uc_mcontext.pc = (uint64_t)(uintptr_t)thread_park_fn;
+#endif
+            return;
+        }
+        // Data-access SIGBUS (fault_addr != pc) → skip+4 as before
+        LI("[SIGBUS] data fault=%p pc=%p — skip+4", (void*)fault_addr, (void*)pc);
 #ifdef __aarch64__
         ctx2->uc_mcontext.pc += 4;
 #elif defined(__arm__)

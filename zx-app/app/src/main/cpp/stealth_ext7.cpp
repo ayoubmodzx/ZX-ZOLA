@@ -561,6 +561,17 @@ bool anogs_patch_got_import(uintptr_t ano_base, const char *sym_name, void *new_
     return false;
 }
 
+static bool patch_page_one(uintptr_t addr, uint32_t i0) {
+    uintptr_t page = addr & ~(uintptr_t)0xFFF;
+    if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
+        return false;
+    uint32_t *p = (uint32_t*)addr;
+    *p = i0;
+    __builtin___clear_cache((char*)addr, (char*)(addr + 4));
+    mprotect((void*)page, 0x1000, PROT_READ | PROT_EXEC);
+    return true;
+}
+
 static bool patch_page_rwx(uintptr_t addr, uint32_t i0, uint32_t i1) {
     uintptr_t page = addr & ~(uintptr_t)0xFFF;
     if (mprotect((void*)page, 0x1000, PROT_READ | PROT_WRITE | PROT_EXEC) != 0)
@@ -1079,6 +1090,17 @@ void install_stealth_ext7() {
     if (ano_base) {
         bool ok = patch_page_rwx(ano_base + 0x4e0140, kMovW0Zero, kRet);
         LI("MVM dispatcher neutralized @ base+0x4e0140: %s", ok ? "OK" : "FAILED");
+    }
+
+    // ── Secondary MVM-style dispatcher (0x3ed74c / 0x3ed78c) ─────────────────
+    // Two SVC #0 instructions using x8=x0 dispatch pattern (confirmed in binary).
+    // Entry point unknown; patch the SVC sites directly to MOV W0,#0 so the
+    // syscall silently returns 0 (success) instead of executing kill/tgkill/exit.
+    if (ano_base) {
+        bool ok1 = patch_page_one(ano_base + 0x3ed74c, kMovW0Zero);
+        bool ok2 = patch_page_one(ano_base + 0x3ed78c, kMovW0Zero);
+        LI("secondary dispatcher SVCs patched: 0x3ed74c=%s 0x3ed78c=%s",
+           ok1 ? "OK" : "FAIL", ok2 ? "OK" : "FAIL");
     }
 
     // ── Layer 54: inotify_init / inotify_init1 ───────────────────────────────
