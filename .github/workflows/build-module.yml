@@ -44,26 +44,14 @@ jobs:
         run: |
           mkdir -p module_staging/zygisk
           mkdir -p module_staging/META-INF/com/google/android
-
-          # Required by Magisk to recognize the zip as a valid module
-          cat > module_staging/META-INF/com/google/android/update-binary << 'UPDATEBINARY'
-#!/sbin/sh
-SKIPUNZIP=1
-mount /data 2>/dev/null
-[ -f /data/adb/magisk/util_functions.sh ] || { echo "! Magisk not found"; exit 1; }
-. /data/adb/magisk/util_functions.sh
-install_module
-exit 0
-UPDATEBINARY
-
-          echo "#MAGISK" > module_staging/META-INF/com/google/android/updater-script
-
-          cp zx-module/module.prop          module_staging/module.prop
-          cp zx-module/scripts/customize.sh module_staging/customize.sh
-          cp zx-module/scripts/service.sh   module_staging/service.sh
-          cp build-arm64/libzx_zola.so      module_staging/zygisk/arm64-v8a.so
-          cp build-arm32/libzx_zola.so      module_staging/zygisk/armeabi-v7a.so
-          chmod +x module_staging/customize.sh module_staging/service.sh
+          cp zx-module/module.prop                  module_staging/module.prop
+          cp zx-module/scripts/customize.sh         module_staging/customize.sh
+          cp zx-module/scripts/service.sh           module_staging/service.sh
+          cp zx-module/scripts/update-binary        module_staging/META-INF/com/google/android/update-binary
+          cp zx-module/scripts/updater-script       module_staging/META-INF/com/google/android/updater-script
+          cp build-arm64/libzx_zola.so              module_staging/zygisk/arm64-v8a.so
+          cp build-arm32/libzx_zola.so              module_staging/zygisk/armeabi-v7a.so
+          chmod +x module_staging/customize.sh module_staging/service.sh module_staging/META-INF/com/google/android/update-binary
           cd module_staging
           zip -r ../ZX-ZOLA-module.zip .
           cd ..
