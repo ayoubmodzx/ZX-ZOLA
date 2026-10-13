@@ -30,6 +30,7 @@
 #include <sys/syscall.h>
 #include <linux/seccomp.h>
 #include <linux/filter.h>
+#include <fcntl.h>
 #include <dlfcn.h>
 #include <link.h>
 #include <pthread.h>
@@ -243,5 +244,13 @@ bool KillShield::install() {
     pthread_create(&wt, nullptr, watcher_thread, nullptr);
     pthread_detach(wt);
 
-    return dlo && ptc;
+    bool ok = dlo && ptc;
+
+    // Write marker so the ZX-ZOLA app can detect whether the module is active
+    if (ok) {
+        int fd = open("/data/local/tmp/.zx_ks_ok", O_WRONLY|O_CREAT|O_TRUNC, 0644);
+        if (fd >= 0) close(fd);
+    }
+
+    return ok;
 }
