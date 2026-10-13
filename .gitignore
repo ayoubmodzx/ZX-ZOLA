@@ -19,3 +19,6 @@ zx-app/app/src/main/assets/arm64-v8a/zx_injector
 # NDK / CMake
 .externalNativeBuild/
 cmake-build-*/
+
+# Game library — too large for GitHub (176MB), kept locally for analysis only
+مكاتب لعبة/arm64/libil2cpp.so

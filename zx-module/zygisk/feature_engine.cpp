@@ -8,6 +8,21 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+// ─── All names confirmed from global-metadata.dat (IL2CPP v31) ───────────────
+//
+// GameVarDef: RunSpeed, DashSpeedScale, CrouchSpeed, CreepSpeed,
+//             StropFOV, ActiveSkillCameraFOV
+//
+// UGCAttachmentRepItem (networked weapon stat component) — hooked setters:
+//   set_ScatterMax, set_ScatterSpeed, set_ScatterSpeedCrouchCreep,
+//   set_SightAimAssist, set_SightAimAssistSnapRange, set_FireInterval,
+//   set_AmmoClipSize, set_FullDamageDistance
+//
+// EWeaponScoreID (enum, NOT float fields): RateOfFire, ClipSize, Recoil, ...
+//
+// OperationSettingInfo: AimAssist
+// ─────────────────────────────────────────────────────────────────────────────
+
 FeatureEngine &FeatureEngine::get() {
     static FeatureEngine instance;
     return instance;
@@ -15,13 +30,9 @@ FeatureEngine &FeatureEngine::get() {
 
 void FeatureEngine::init(AsyncWorker *worker) {
     m_worker = worker;
-
-    // Async — fires on background SCHED_IDLE thread after il2cpp stabilizes
     m_worker->postDelayed([this] {
         resolveClasses();
-
         if (m_ready) {
-            // Apply defaults
             applyNoGrass(true);
             applyWidePOV(85.0f);
             LOGI("Features ready");
@@ -33,167 +44,220 @@ void FeatureEngine::init(AsyncWorker *worker) {
 
 void FeatureEngine::resolveClasses() {
     Il2CppImage *img = Il2CppApi::getImage("Assembly-CSharp");
-    if (!img) {
-        LOGE("Assembly-CSharp not found");
-        return;
+    if (!img) { LOGE("Assembly-CSharp not found"); return; }
+
+    // ── GameVarDef — game-wide movement/camera config singleton
+    m_cls.GameVarDef = Il2CppApi::getClass(img, "", "GameVarDef");
+    if (m_cls.GameVarDef) {
+        m_fld.runSpeed       = Il2CppApi::getField(m_cls.GameVarDef, "RunSpeed");
+        m_fld.dashSpeedScale = Il2CppApi::getField(m_cls.GameVarDef, "DashSpeedScale");
+        m_fld.crouchSpeed    = Il2CppApi::getField(m_cls.GameVarDef, "CrouchSpeed");
+        m_fld.creepSpeed     = Il2CppApi::getField(m_cls.GameVarDef, "CreepSpeed");
+        m_fld.stropFov       = Il2CppApi::getField(m_cls.GameVarDef, "StropFOV");
+        m_fld.activeSkillFov = Il2CppApi::getField(m_cls.GameVarDef, "ActiveSkillCameraFOV");
     }
 
-    // ── Player ────────────────────────────────────────────────────────────────
-    m_cls.Player    = Il2CppApi::getClass(img, "", "PlayerMovement");
-    m_cls.Character = Il2CppApi::getClass(img, "", "CharacterController");
-    m_cls.Health    = Il2CppApi::getClass(img, "", "HealthComponent");
-
-    // ── Weapon ────────────────────────────────────────────────────────────────
-    m_cls.Weapon    = Il2CppApi::getClass(img, "", "WeaponController");
-    m_cls.Bullet    = Il2CppApi::getClass(img, "", "BulletManager");
-    m_cls.Recoil    = Il2CppApi::getClass(img, "", "RecoilController");
-
-    // ── Camera / Aim ─────────────────────────────────────────────────────────
-    m_cls.Camera    = Il2CppApi::getClass(img, "", "CameraController");
-    m_cls.Aim       = Il2CppApi::getClass(img, "", "AimController");
-
-    // ── Environment ──────────────────────────────────────────────────────────
-    m_cls.Grass     = Il2CppApi::getClass(img, "", "GrassManager");
-    m_cls.Vehicle   = Il2CppApi::getClass(img, "", "VehicleController");
-    m_cls.Loot      = Il2CppApi::getClass(img, "", "LootManager");
-
-    // ── Fields ───────────────────────────────────────────────────────────────
-    if (m_cls.Player)    m_fld.moveSpeed    = Il2CppApi::getField(m_cls.Player,    "moveSpeed");
-    if (m_cls.Character) m_fld.jumpForce    = Il2CppApi::getField(m_cls.Character, "jumpForce");
-    if (m_cls.Recoil)    m_fld.recoilForce  = Il2CppApi::getField(m_cls.Recoil,   "recoilForce");
-    if (m_cls.Weapon)    m_fld.bulletSpread = Il2CppApi::getField(m_cls.Weapon,    "bulletSpread");
-    if (m_cls.Weapon)    m_fld.fireRate     = Il2CppApi::getField(m_cls.Weapon,    "fireRate");
-    if (m_cls.Camera)    m_fld.fov          = Il2CppApi::getField(m_cls.Camera,    "fieldOfView");
-    if (m_cls.Grass)     m_fld.grassEnable  = Il2CppApi::getField(m_cls.Grass,    "enableGrass");
-    if (m_cls.Health)    m_fld.maxHealth    = Il2CppApi::getField(m_cls.Health,    "maxHealth");
-    if (m_cls.Vehicle)   m_fld.vehicleSpeed = Il2CppApi::getField(m_cls.Vehicle,  "maxSpeed");
-
-    // Methods for hooks
-    if (m_cls.Aim)    m_mth.calcAimTarget   = Il2CppApi::getMethod(m_cls.Aim,    "CalculateAimTarget", 0);
-    if (m_cls.Weapon) m_mth.onFireWeapon    = Il2CppApi::getMethod(m_cls.Weapon, "OnFireWeapon",       1);
-    if (m_cls.Health) m_mth.takeDamage      = Il2CppApi::getMethod(m_cls.Health, "TakeDamage",         2);
-
-    m_ready = (m_cls.Player || m_cls.Weapon || m_cls.Camera);
-    LOGI("Classes resolved — Player:%p Weapon:%p Camera:%p Grass:%p",
-         m_cls.Player, m_cls.Weapon, m_cls.Camera, m_cls.Grass);
-}
-
-// ── COMBAT ────────────────────────────────────────────────────────────────────
-
-void FeatureEngine::applyAntiRecoil(bool enable) {
-    if (!m_fld.recoilForce) return;
-    float val = enable ? 0.0f : 1.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.recoilForce, &val);
-    LOGI("AntiRecoil: %s", enable ? "ON" : "OFF");
-}
-
-void FeatureEngine::applyNoSpread(bool enable) {
-    if (!m_fld.bulletSpread) return;
-    float val = enable ? 0.0f : 1.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.bulletSpread, &val);
-    LOGI("NoSpread: %s", enable ? "ON" : "OFF");
-}
-
-void FeatureEngine::applyRapidFire(bool enable) {
-    if (!m_fld.fireRate) return;
-    float val = enable ? 0.05f : 0.3f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.fireRate, &val);
-    LOGI("RapidFire: %s", enable ? "ON" : "OFF");
-}
-
-void FeatureEngine::applyAimAssist(bool enable) {
-    // Only hooks ONE specific method — not all GL calls
-    if (!m_mth.calcAimTarget || !m_mth.calcAimTarget->methodPointer) return;
-
-    static void *orig_calc = nullptr;
-
-    if (enable && !orig_calc) {
-        // The actual aimbot correction hook
-        static auto hook_fn = [](void *instance) -> void * {
-            using Fn = void *(*)(void *);
-            void *result = reinterpret_cast<Fn>(orig_calc)(instance);
-            // Apply aim smoothing here — no GL touch
-            return result;
-        };
-
-        HookEngine::get().hookAddr(
-            m_mth.calcAimTarget->methodPointer,
-            (void *)static_cast<void *(*)(void *)>(hook_fn),
-            &orig_calc, "AimAssist");
-
-    } else if (!enable && orig_calc) {
-        HookEngine::get().unhook(m_mth.calcAimTarget->methodPointer);
-        orig_calc = nullptr;
+    // ── UGCAttachmentRepItem — all setters confirmed from global-metadata.dat
+    m_cls.WeaponAttachment = Il2CppApi::getClass(img, "", "UGCAttachmentRepItem");
+    if (m_cls.WeaponAttachment) {
+        m_mth.setScatterMax     = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_ScatterMax",              1);
+        m_mth.setScatterSpeed   = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_ScatterSpeed",            1);
+        m_mth.setScatterSpeedCC = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_ScatterSpeedCrouchCreep", 1);
+        m_mth.setSightAimAssist = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_SightAimAssist",          1);
+        m_mth.setAimAssistSnap  = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_SightAimAssistSnapRange", 1);
+        m_mth.setFireInterval   = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_FireInterval",            1);
+        m_mth.setAmmoClipSize   = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_AmmoClipSize",            1);
+        m_mth.setFullDamageDist = Il2CppApi::getMethod(m_cls.WeaponAttachment, "set_FullDamageDistance",      1);
+        hookWeaponSetters();
     }
-    LOGI("AimAssist: %s", enable ? "ON" : "OFF");
+
+    // ── OperationSettingInfo — AimAssist user setting field
+    m_cls.OpSetting = Il2CppApi::getClass(img, "", "OperationSettingInfo");
+    if (m_cls.OpSetting)
+        m_fld.aimAssistSetting = Il2CppApi::getField(m_cls.OpSetting, "AimAssist");
+
+    m_ready = (m_cls.GameVarDef || m_cls.WeaponAttachment);
+    LOGI("Classes — GameVarDef:%p WeaponAttach:%p OpSetting:%p",
+         m_cls.GameVarDef, m_cls.WeaponAttachment, m_cls.OpSetting);
+    LOGI("Fields  — RunSpeed:%p ScatterSetter:%p AimAssistSetter:%p",
+         m_fld.runSpeed, m_mth.setScatterMax, m_mth.setSightAimAssist);
 }
 
-// ── MOVEMENT ─────────────────────────────────────────────────────────────────
+
+// ── Hook weapon property setters to intercept stat writes ─────────────────────
+static void *s_origSetScatterMax     = nullptr;
+static void *s_origSetScatterSpeed   = nullptr;
+static void *s_origSetScatterSpeedCC = nullptr;
+static void *s_origSetSightAimAssist = nullptr;
+static void *s_origSetAimAssistSnap  = nullptr;
+static void *s_origSetFireInterval   = nullptr;
+static void *s_origSetAmmoClipSize   = nullptr;
+static void *s_origSetFullDamageDist = nullptr;
+static FeatureEngine *s_engine       = nullptr;
+
+// ScatterMax=0 kills bullet spread; ScatterSpeed=0 stops spread accumulating during fire
+static void hook_setScatterMax(void *self, float val) {
+    if (s_engine && s_engine->m_noSpread) val = 0.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetScatterMax)(self, val);
+}
+static void hook_setScatterSpeed(void *self, float val) {
+    if (s_engine && s_engine->m_noSpread) val = 0.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetScatterSpeed)(self, val);
+}
+static void hook_setScatterSpeedCC(void *self, float val) {
+    if (s_engine && s_engine->m_noSpread) val = 0.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetScatterSpeedCC)(self, val);
+}
+static void hook_setSightAimAssist(void *self, float val) {
+    if (s_engine && s_engine->m_aimAssist) val = 1.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetSightAimAssist)(self, val);
+}
+static void hook_setAimAssistSnap(void *self, float val) {
+    if (s_engine && s_engine->m_aimAssist) val = 999.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetAimAssistSnap)(self, val);
+}
+static void hook_setFireInterval(void *self, float val) {
+    if (s_engine && s_engine->m_rapidFire) val = 0.01f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetFireInterval)(self, val);
+}
+static void hook_setAmmoClipSize(void *self, int val) {
+    if (s_engine && s_engine->m_rapidFire) val = 999;
+    reinterpret_cast<void(*)(void*, int)>(s_origSetAmmoClipSize)(self, val);
+}
+static void hook_setFullDamageDist(void *self, float val) {
+    if (s_engine && s_engine->m_extendRange) val = 200.0f;
+    reinterpret_cast<void(*)(void*, float)>(s_origSetFullDamageDist)(self, val);
+}
+
+#define HOOK(mth, fn, orig, tag) \
+    if (m_mth.mth && m_mth.mth->methodPointer) \
+        eng.hookAddr(m_mth.mth->methodPointer, (void *)(fn), &(orig), (tag))
+
+void FeatureEngine::hookWeaponSetters() {
+    s_engine = this;
+    auto &eng = HookEngine::get();
+    HOOK(setScatterMax,     hook_setScatterMax,     s_origSetScatterMax,     "ScatterMax");
+    HOOK(setScatterSpeed,   hook_setScatterSpeed,   s_origSetScatterSpeed,   "ScatterSpd");
+    HOOK(setScatterSpeedCC, hook_setScatterSpeedCC, s_origSetScatterSpeedCC, "ScatterCC");
+    HOOK(setSightAimAssist, hook_setSightAimAssist, s_origSetSightAimAssist, "SightAA");
+    HOOK(setAimAssistSnap,  hook_setAimAssistSnap,  s_origSetAimAssistSnap,  "AASnap");
+    HOOK(setFireInterval,   hook_setFireInterval,   s_origSetFireInterval,   "FireIntvl");
+    HOOK(setAmmoClipSize,   hook_setAmmoClipSize,   s_origSetAmmoClipSize,   "ClipSize");
+    HOOK(setFullDamageDist, hook_setFullDamageDist, s_origSetFullDamageDist, "FullDmgDst");
+    LOGI("Weapon setter hooks installed (%zu methods)", sizeof(m_mth)/sizeof(void*));
+}
+#undef HOOK
+
+// ── MOVEMENT ──────────────────────────────────────────────────────────────────
 
 void FeatureEngine::applySpeedHack(bool enable, float multiplier) {
-    if (!m_fld.moveSpeed) return;
-    float base = 6.0f;
-    float val  = enable ? base * multiplier : base;
-    Il2CppApi::setStaticValue(nullptr, m_fld.moveSpeed, &val);
+    // GameVarDef.RunSpeed / DashSpeedScale / CrouchSpeed / CreepSpeed
+    // All confirmed field names from global-metadata.dat string pool
+    if (m_fld.runSpeed) {
+        float base = 6.0f, val = enable ? base * multiplier : base;
+        Il2CppApi::setStaticValue(nullptr, m_fld.runSpeed, &val);
+    }
+    if (m_fld.dashSpeedScale) {
+        float val = enable ? multiplier : 1.0f;
+        Il2CppApi::setStaticValue(nullptr, m_fld.dashSpeedScale, &val);
+    }
+    if (m_fld.crouchSpeed) {
+        float base = 4.0f, val = enable ? base * multiplier : base;
+        Il2CppApi::setStaticValue(nullptr, m_fld.crouchSpeed, &val);
+    }
+    if (m_fld.creepSpeed) {
+        float base = 2.5f, val = enable ? base * multiplier : base;
+        Il2CppApi::setStaticValue(nullptr, m_fld.creepSpeed, &val);
+    }
     LOGI("SpeedHack: %s (x%.2f)", enable ? "ON" : "OFF", multiplier);
 }
 
 void FeatureEngine::applyHighJump(bool enable) {
-    if (!m_fld.jumpForce) return;
-    float val = enable ? 18.0f : 8.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.jumpForce, &val);
+    // CharacterController.stepOffset — confirmed field from metadata
+    Il2CppImage *unityImg = Il2CppApi::getImage("UnityEngine.PhysicsModule");
+    if (!unityImg) unityImg = Il2CppApi::getImage("UnityEngine");
+    if (!unityImg) return;
+    Il2CppClass *cc = Il2CppApi::getClass(unityImg, "UnityEngine", "CharacterController");
+    if (!cc) return;
+    FieldInfo *stepOff = Il2CppApi::getField(cc, "stepOffset");
+    if (stepOff) {
+        float val = enable ? 4.0f : 0.35f;
+        Il2CppApi::setStaticValue(nullptr, stepOff, &val);
+    }
     LOGI("HighJump: %s", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyVehicleSpeed(bool enable, float multiplier) {
-    if (!m_fld.vehicleSpeed) return;
-    float base = 100.0f;
-    float val  = enable ? base * multiplier : base;
-    Il2CppApi::setStaticValue(nullptr, m_fld.vehicleSpeed, &val);
-    LOGI("VehicleSpeed: %s", enable ? "ON" : "OFF");
+    (void)enable; (void)multiplier;
+    LOGI("VehicleSpeed: stub — vehicle class not yet confirmed in metadata");
 }
 
 // ── VISUAL ────────────────────────────────────────────────────────────────────
 
 void FeatureEngine::applyWidePOV(float fov) {
-    if (!m_fld.fov) return;
-    Il2CppApi::setStaticValue(nullptr, m_fld.fov, &fov);
+    // GameVarDef.StropFOV + ActiveSkillCameraFOV — both confirmed from metadata
+    if (m_fld.stropFov)       Il2CppApi::setStaticValue(nullptr, m_fld.stropFov,       &fov);
+    if (m_fld.activeSkillFov) Il2CppApi::setStaticValue(nullptr, m_fld.activeSkillFov, &fov);
     LOGI("WidePOV: %.1f", fov);
 }
 
 void FeatureEngine::applyNoGrass(bool enable) {
-    if (!m_fld.grassEnable) return;
-    bool val = !enable;  // grassEnable=false means no grass
-    Il2CppApi::setStaticValue(nullptr, m_fld.grassEnable, &val);
-    LOGI("NoGrass: %s", enable ? "ON" : "OFF");
+    Il2CppImage *unityImg = Il2CppApi::getImage("UnityEngine.TerrainModule");
+    if (!unityImg) unityImg = Il2CppApi::getImage("UnityEngine");
+    if (!unityImg) return;
+    Il2CppClass *qs = Il2CppApi::getClass(unityImg, "UnityEngine", "QualitySettings");
+    if (!qs) return;
+    MethodInfo *setDens = Il2CppApi::getMethod(qs, "set_terrainDetailDensityScale", 1);
+    if (setDens && setDens->methodPointer) {
+        float val = enable ? 0.0f : 1.0f;
+        using SetFn = void(*)(float);
+        reinterpret_cast<SetFn>(setDens->methodPointer)(val);
+        LOGI("NoGrass: %s", enable ? "ON" : "OFF");
+    }
+}
+
+// ── COMBAT ────────────────────────────────────────────────────────────────────
+
+void FeatureEngine::applyAntiRecoil(bool enable) {
+    // Drives three hooks: ScatterMax, ScatterSpeed, ScatterSpeedCrouchCreep
+    // All confirmed setters on UGCAttachmentRepItem from global-metadata.dat
+    // "Recoil" in the metadata is an EWeaponScoreID enum value, not a float field
+    m_noSpread = enable;
+    LOGI("AntiRecoil: %s (via ScatterMax/ScatterSpeed hooks)", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyNoSpread(bool enable) {
+    // Hooks intercept set_ScatterMax on every UGCAttachmentRepItem write
+    m_noSpread = enable;
+    LOGI("NoSpread: %s (via set_ScatterMax hook)", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyRapidFire(bool enable) {
+    // Hooks intercept set_FireInterval — confirmed property setter in metadata
+    m_rapidFire = enable;
+    LOGI("RapidFire: %s (via set_FireInterval hook)", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyAimAssist(bool enable) {
+    // Hooks intercept set_SightAimAssist + set_SightAimAssistSnapRange
+    // Both confirmed property names from global-metadata.dat
+    m_aimAssist = enable;
+    // Also force the player's AimAssist setting toggle
+    if (m_fld.aimAssistSetting) {
+        bool v = enable;
+        Il2CppApi::setStaticValue(nullptr, m_fld.aimAssistSetting, &v);
+    }
+    LOGI("AimAssist: %s (via setter hooks + OperationSettingInfo)", enable ? "ON" : "OFF");
 }
 
 // ── SURVIVAL ─────────────────────────────────────────────────────────────────
 
 void FeatureEngine::applyMaxHealth(bool enable) {
-    if (!m_fld.maxHealth) return;
-    float val = enable ? 9999.0f : 200.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.maxHealth, &val);
-    LOGI("MaxHealth: %s", enable ? "ON" : "OFF");
+    (void)enable;
+    LOGI("MaxHealth: stub — needs FightingEntity/player ECS class resolution");
 }
 
 void FeatureEngine::applyAntiDamage(bool enable) {
-    if (!m_mth.takeDamage || !m_mth.takeDamage->methodPointer) return;
-
-    static void *orig_take_dmg = nullptr;
-
-    if (enable && !orig_take_dmg) {
-        static auto hook_dmg = [](void *self, float dmg, void *src) -> void {
-            (void)dmg; (void)src;
-            // Simply don't call original — damage ignored
-        };
-        HookEngine::get().hookAddr(
-            m_mth.takeDamage->methodPointer,
-            (void *)static_cast<void(*)(void*, float, void*)>(hook_dmg),
-            &orig_take_dmg, "AntiDamage");
-    } else if (!enable && orig_take_dmg) {
-        HookEngine::get().unhook(m_mth.takeDamage->methodPointer);
-        orig_take_dmg = nullptr;
-    }
-    LOGI("AntiDamage: %s", enable ? "ON" : "OFF");
+    (void)enable;
+    LOGI("AntiDamage: stub — needs TakeDamage method from player entity class");
 }

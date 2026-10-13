@@ -191,6 +191,7 @@ done:
 
 void *DobbySymbolResolver(const char *lib, const char *sym) {
     void *h = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) dlerror(); // consume RTLD_NOLOAD miss — prevents stale error in caller's dlerror buffer
     if (h) {
         void *a = dlsym(h, sym);
         if (a) return a;
@@ -199,15 +200,94 @@ void *DobbySymbolResolver(const char *lib, const char *sym) {
         if (a) return a;
     }
 
+    // dl_iterate_phdr is the primary ELF scan path (namespace-aware on most Androids)
     PhdrQ q{lib, 0, nullptr};
     dl_iterate_phdr(phdr_cb, &q);
-    if (!q.base || !q.path) {
-        DE("DobbySymbolResolver: '%s' not in memory", lib);
-        return nullptr;
+    if (q.base && q.path) {
+        void *a = elf_scan(q.path, sym, q.base);
+        if (a) { DI("resolved %s::%s @ %p", lib, sym, a); return a; }
     }
 
-    void *a = elf_scan(q.path, sym, q.base);
-    if (a) DI("resolved %s::%s @ %p", lib, sym, a);
-    else   DE("DobbySymbolResolver: '%s' not found in '%s'", sym, lib);
-    return a;
+    // Namespace bypass: dl_iterate_phdr only sees the current linker namespace on some
+    // Android versions.  /proc/self/maps shows ALL mapped segments regardless of namespace.
+    // Parse it to get base + path, then run elf_scan from there.
+    {
+        uintptr_t maps_base = 0;
+        unsigned long long maps_off = 0;
+        char maps_path[512] = {};
+        FILE *mf = fopen("/proc/self/maps", "r");
+        if (mf) {
+            char line[512];
+            while (fgets(line, sizeof(line), mf)) {
+                if (!strstr(line, lib)) continue;
+                if (!strstr(line, "r--p") && !strstr(line, "r-xp")) continue;
+                char perm[8] = {}, dev[16] = {};
+                int ino = 0;
+                sscanf(line, "%lx-%*lx %4s %llx %15s %d %511[^\n]",
+                       &maps_base, perm, &maps_off, dev, &ino, maps_path);
+                // Trim trailing whitespace
+                int plen = (int)strlen(maps_path);
+                while (plen > 0 && (maps_path[plen-1] == '\n' || maps_path[plen-1] == ' '))
+                    maps_path[--plen] = '\0';
+                break;
+            }
+            fclose(mf);
+        }
+        if (maps_base && maps_path[0] && maps_path[0] != '[') {
+            // For APK-inline libs maps_off is the byte offset into the APK file.
+            // elf_scan opens the file and mmaps from offset 0, so we compensate
+            // by subtracting maps_off from the symbols' st_value-based addresses
+            // only when maps_off != 0; simplest: open, seek, re-scan.
+            if (maps_off == 0) {
+                void *a = elf_scan(maps_path, sym, maps_base);
+                if (a) { DI("resolved %s::%s @ %p (maps)", lib, sym, a); return a; }
+            } else {
+                // APK-inline: open file, mmap from maps_off, scan
+                int fd2 = open(maps_path, O_RDONLY);
+                if (fd2 >= 0) {
+                    struct stat st2; fstat(fd2, &st2);
+                    size_t sz2 = (size_t)((off_t)st2.st_size > (off_t)maps_off
+                                          ? st2.st_size - (size_t)maps_off : 0);
+                    if (sz2 > 0) {
+                        void *m2 = mmap(nullptr, sz2, PROT_READ, MAP_PRIVATE, fd2, (off_t)maps_off);
+                        if (m2 != MAP_FAILED) {
+                            // Re-use elf_scan logic inline on the mmap'd buffer
+                            void *res = nullptr;
+                            auto *eh2 = (Elf64_Ehdr*)m2;
+                            if (sz2 >= sizeof(Elf64_Ehdr) && memcmp(eh2->e_ident, ELFMAG, 4) == 0
+                                && eh2->e_shoff && eh2->e_shnum) {
+                                auto *sh2 = (Elf64_Shdr*)((uint8_t*)m2 + eh2->e_shoff);
+                                if ((uintptr_t)(sh2 + eh2->e_shnum) <= (uintptr_t)m2 + sz2
+                                    && eh2->e_shstrndx < eh2->e_shnum) {
+                                    for (uint16_t ii = 0; ii < eh2->e_shnum && !res; ii++) {
+                                        if (sh2[ii].sh_type != SHT_SYMTAB &&
+                                            sh2[ii].sh_type != SHT_DYNSYM) continue;
+                                        if (sh2[ii].sh_link >= eh2->e_shnum) continue;
+                                        auto *s2 = (Elf64_Sym*)((uint8_t*)m2 + sh2[ii].sh_offset);
+                                        int c2 = (int)(sh2[ii].sh_size / sizeof(Elf64_Sym));
+                                        auto *ss2 = (const char*)m2 + sh2[sh2[ii].sh_link].sh_offset;
+                                        for (int j2 = 0; j2 < c2 && !res; j2++) {
+                                            if (!s2[j2].st_value) continue;
+                                            char nm[256];
+                                            strncpy(nm, ss2 + s2[j2].st_name, 255);
+                                            nm[255] = 0;
+                                            char *at2 = strchr(nm, '@'); if (at2) *at2 = 0;
+                                            if (strcmp(nm, sym) == 0)
+                                                res = (void*)(maps_base + s2[j2].st_value);
+                                        }
+                                    }
+                                }
+                            }
+                            munmap(m2, sz2);
+                            if (res) { DI("resolved %s::%s @ %p (apk)", lib, sym, res); return res; }
+                        }
+                    }
+                    close(fd2);
+                }
+            }
+        }
+    }
+
+    DE("DobbySymbolResolver: '%s' not found in '%s'", sym, lib);
+    return nullptr;
 }

@@ -27,9 +27,11 @@
 
 #include "stealth_ext.hpp"
 #include "stealth_ext2.hpp"   // stx2_register_rwx for new trampoline pages
+#include "stealth_ext7.hpp"   // anogs_patch_got_import, is_hookable_arm64
 #include "dobby_stub.hpp"
 #include "anti_detect.hpp"
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <link.h>
 #include <dirent.h>
@@ -40,8 +42,19 @@
 #include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <signal.h>
+#include <ucontext.h>
 #ifndef __NR_openat
 #define __NR_openat 56
+#endif
+#ifndef __NR_mprotect
+#define __NR_mprotect 226
+#endif
+#ifndef __NR_kill
+#define __NR_kill 129
+#endif
+#ifndef __NR_tgkill
+#define __NR_tgkill 131
 #endif
 #include <pthread.h>
 #include <cstring>
@@ -52,13 +65,8 @@
 #include <atomic>
 
 #define TAG "ZX-STX"
-#ifndef ZX_RELEASE
-#define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#else
-#define LI(...) ((void)0)
-#define LE(...) ((void)0)
-#endif
+#define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Compile-time XOR (same key as anti_detect.cpp)
@@ -316,6 +324,173 @@ static ssize_t hook_readlink(const char *path, char *buf, size_t sz) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Layer 10c — mprotect trap blocker
+//
+// libanogs calls mprotect(page, 4096, PROT_NONE) during its init to set up
+// an "intentional crash trap" page. When detection fires, it accesses that
+// page → SIGSEGV → process dies. We intercept mprotect from libanogs's GOT
+// and silently discard any PROT_NONE call, leaving the page accessible.
+// ═════════════════════════════════════════════════════════════════════════════
+
+using FnMprotect = int(*)(void*, size_t, int);
+static FnMprotect g_orig_mprotect = nullptr;
+
+static int hook_mprotect(void *addr, size_t len, int prot) {
+    // Only block PROT_NONE calls that target libanogs's own mapped region.
+    // Blocking all PROT_NONE breaks libanogs's internal memory protection,
+    // triggering detection via a path OTHER than the crash trap.
+    if (prot == PROT_NONE && s_stx_ano_base) {
+        uintptr_t a = (uintptr_t)addr;
+        uintptr_t e = a + len;
+        if (a >= s_stx_ano_base && e <= s_stx_ano_end) {
+            LI("[mprotect] blocked PROT_NONE inside libanogs @ %p sz=%zu", addr, (size_t)len);
+            return 0;
+        }
+    }
+    return g_orig_mprotect ? g_orig_mprotect(addr, len, prot)
+                           : (int)syscall(__NR_mprotect, addr, len, prot);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SIGSEGV suppressor — catches intentional crash-trap segfaults from libanogs
+//
+// libanogs's kill mechanism: it mprotect(PROT_NONE) a page at a fixed offset
+// inside itself (observed: base+0x502000) and accesses it when detection fires.
+// We install a SA_SIGINFO SIGSEGV handler; if si_addr falls inside libanogs's
+// mapped range we advance PC by 4 (skip the faulting instruction) and return.
+// This turns a fatal SIGSEGV into a skipped instruction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+static uintptr_t s_sigv_ano_base = 0;
+static uintptr_t s_sigv_ano_end  = 0;
+
+// Park function: scanner threads redirected here after the skip+4 timing window expires.
+// skip+4 × N buys time (each signal delivery starves the kill thread of CPU).
+// After N iterations the thread escapes garbage space and reaches live kill code.
+// Parking after N skips preserves the timing benefit AND prevents the escape.
+static void __attribute__((noreturn, noinline)) thread_park_fn() {
+    for (;;) {
+        struct timespec ts = {30, 0};
+        nanosleep(&ts, nullptr);
+    }
+}
+
+// Per-thread instruction-fetch SIGBUS counter.
+// Each scanner thread independently spins kIfetchParkThreshold times (≥ the 39
+// iterations observed at wp=7849) before being parked.
+// Immediate park (count=0) was wp=3465 — it removed the timing window entirely.
+// skip+4 forever was wp=7849 — thread eventually escapes at iteration 39.
+// skip+4 × 80 then park: preserves the timing window, eliminates the escape.
+static __thread int tl_ifetch_sigbus_count = 0;
+static constexpr int kIfetchParkThreshold  = 80;
+
+static void __attribute__((noinline))
+fault_suppressor(int sig, siginfo_t *info, void *raw_ctx) {
+    uintptr_t fault_addr = (uintptr_t)info->si_addr;
+    ucontext_t *ctx2 = (ucontext_t*)raw_ctx;
+#ifdef __aarch64__
+    uintptr_t pc = ctx2->uc_mcontext.pc;
+#elif defined(__arm__)
+    uintptr_t pc = ctx2->uc_mcontext.arm_pc;
+#else
+    uintptr_t pc = 0;
+#endif
+
+    if (s_sigv_ano_base && fault_addr >= s_sigv_ano_base && fault_addr < s_sigv_ano_end) {
+        // Fault inside libanogs crash-trap pages.
+        // skip+4: scanner gets stale register values from the skipped load.
+        // Do NOT mprotect R/W (scanner reads zeros → detects bypass).
+        uintptr_t fault_page = fault_addr & ~(uintptr_t)0xFFF;
+        LI("[SIG%d] trap %p → skip+4 pc=%p", sig, (void*)fault_page, (void*)pc);
+#ifdef __aarch64__
+        ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+        ctx2->uc_mcontext.arm_pc += 4;
+#endif
+        return;
+    }
+
+    if (sig == SIGBUS) {
+        if (fault_addr == pc) {
+            // Instruction-fetch fault: scanner thread at an invalid address.
+            // Strategy: skip+4 for the first kIfetchParkThreshold iterations to
+            // preserve the CPU-starvation timing window (each signal delivery
+            // delays the kill thread), then park permanently to prevent escape.
+            tl_ifetch_sigbus_count++;
+            if (tl_ifetch_sigbus_count > kIfetchParkThreshold) {
+                LI("[SIGBUS] ifetch=%p cnt=%d — park", (void*)pc, tl_ifetch_sigbus_count);
+#ifdef __aarch64__
+                ctx2->uc_mcontext.pc = (uint64_t)(uintptr_t)thread_park_fn;
+#endif
+            } else {
+                LI("[SIGBUS] ifetch=%p cnt=%d — skip+4", (void*)pc, tl_ifetch_sigbus_count);
+#ifdef __aarch64__
+                ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+                ctx2->uc_mcontext.arm_pc += 4;
+#endif
+            }
+            return;
+        }
+        // Data-access SIGBUS (fault_addr != pc) → skip+4 as before
+        LI("[SIGBUS] data fault=%p pc=%p — skip+4", (void*)fault_addr, (void*)pc);
+#ifdef __aarch64__
+        ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+        ctx2->uc_mcontext.arm_pc += 4;
+#endif
+        return;
+    }
+
+    if (sig == SIGTRAP) {
+        // BRK #1 integrity traps in libanogs .text fire SIGTRAP when scanner
+        // detects patched instructions. skip+4 skips past the BRK instruction.
+        LI("[SIGTRAP] pc=%p — skip+4", (void*)pc);
+#ifdef __aarch64__
+        ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+        ctx2->uc_mcontext.arm_pc += 4;
+#endif
+        return;
+    }
+
+    // SIGSEGV outside libanogs range.
+    // fault_addr == pc: scanner branched to an unmapped aligned address.
+    // skip+4 keeps the scanner from resolving back to a live kill path.
+    if (fault_addr == pc) {
+        LI("[SIG%d] fetch fault=%p — skip+4", sig, (void*)fault_addr);
+#ifdef __aarch64__
+        ctx2->uc_mcontext.pc += 4;
+#elif defined(__arm__)
+        ctx2->uc_mcontext.arm_pc += 4;
+#endif
+        return;
+    }
+
+    // Genuine SIGSEGV data fault outside our range — re-deliver as default crash
+    LI("[SIGSEGV] non-ano fault=%p — reinstating default handler", (void*)fault_addr);
+    struct sigaction dfl = {};
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    sigaction(sig, &dfl, nullptr);
+    raise(sig);
+}
+
+static void install_sigsegv_suppressor(uintptr_t ano_base, uintptr_t ano_end) {
+    s_sigv_ano_base = ano_base;
+    s_sigv_ano_end  = ano_end;
+    struct sigaction sa = {};
+    sa.sa_sigaction = fault_suppressor;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
+    sigemptyset(&sa.sa_mask);
+    int r  = sigaction(SIGSEGV, &sa, nullptr);
+    int r2 = sigaction(SIGBUS,  &sa, nullptr);
+    int r3 = sigaction(SIGTRAP, &sa, nullptr);
+    LI("fault suppressor installed for libanogs [%lx-%lx] SIGSEGV r=%d SIGBUS r=%d SIGTRAP r=%d",
+       (unsigned long)ano_base, (unsigned long)ano_end, r, r2, r3);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Layer 9 — inotify nullifier
 //
 // AnoSDK calls inotify_init() to create a watch fd, then inotify_add_watch()
@@ -386,6 +561,109 @@ static int hook_access(const char *path, int mode) {
         }
     }
     return g_orig_access ? g_orig_access(path, mode) : -1;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 10k — kill() / tgkill() neutraliser (libanogs GOT)
+//
+// libanogs calls kill(getpid(), SIGKILL) or tgkill(tgid, tid, SIGKILL) from
+// 0x258d14 (detection loop) after all other kill paths fail.  Block these in
+// the GOT so the call returns -EPERM without delivering any signal.
+// These are GOT-only hooks; bionic bodies stay pristine (no scanner trampoline).
+// ═════════════════════════════════════════════════════════════════════════════
+
+static inline bool is_fatal_sig_stx(int sig) {
+    return sig == SIGKILL || sig == SIGABRT || sig == SIGTERM;
+}
+
+static int hook_kill_ano(pid_t pid, int sig) {
+    pid_t my_pid = getpid();
+    if (is_fatal_sig_stx(sig) && (pid == my_pid || pid == 0 || pid == -1)) {
+        LI("[kill] blocked kill(%d,%d) via ano GOT", pid, sig);
+        errno = EPERM;
+        return -1;
+    }
+    return (int)syscall(__NR_kill, pid, sig);
+}
+
+static int hook_tgkill_ano(pid_t tgid, pid_t tid, int sig) {
+    pid_t my_pid = getpid();
+    if (is_fatal_sig_stx(sig) && (tgid == my_pid || tgid == 0)) {
+        LI("[tgkill] blocked tgkill(%d,%d,%d) via ano GOT", tgid, tid, sig);
+        errno = EPERM;
+        return -1;
+    }
+    return (int)syscall(__NR_tgkill, tgid, tid, sig);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 10d — fork() neutraliser
+//
+// libanogs detection dispatch at 0x258668:
+//   CBZ W8 (byte[obj+0x876]==0) → 0x2586e8: SKIP fork, run detection in-process
+//   fork@plt → CBZ W0 (child)  → 0x2586e8: same kill path from child
+//
+// Kill path 0x2586e8:
+//   1. 0x2588a8: signal_reset — resets SIGSEGV to SIG_DFL
+//   2. 0x25895c: detection loop → tail-calls 0x258d14 (ptrace/kill ops)
+//   3. 0x258700: _exit(127) — FINAL FAILSAFE even if kill ops are hooked
+//
+// Fork hook blocks the fork-child path. _exit hook (Layer 10f) is the
+// critical blocker for the in-process path (byte==0 bypasses fork entirely).
+// ═════════════════════════════════════════════════════════════════════════════
+
+using FnFork = pid_t(*)();
+static FnFork g_orig_fork = nullptr;
+
+static pid_t hook_fork() {
+    // Non-zero return → parent path; CBZ W0 at 0x2586d0 NOT taken.
+    LI("[fork] neutralised — no real fork");
+    return (pid_t)2;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 10f — _exit() / abort() blocker
+//
+// _exit(127) at 0x258700 is libanogs's FINAL failsafe after all kill ops.
+// Runs in the main process when byte[obj+0x876]==0 (no-fork path).
+// Hook both _exit and abort to return without terminating the process.
+// Also re-install the SIGSEGV suppressor since 0x2588a8 resets it first.
+// ═════════════════════════════════════════════════════════════════════════════
+
+using FnExit  = void(*)(int);
+using FnAbort = void(*)();
+static FnExit  g_orig__exit = nullptr;
+static FnAbort g_orig_abort = nullptr;
+
+static void hook__exit(int code) {
+    LI("[_exit] blocked code=%d — re-installing SIGSEGV suppressor", code);
+    // Re-arm the SIGSEGV suppressor: 0x2588a8 reset it to SIG_DFL before calling us
+    if (s_sigv_ano_base) install_sigsegv_suppressor(s_sigv_ano_base, s_sigv_ano_end);
+    // Return without exiting — execution falls to the next instruction (new function)
+}
+
+static void hook_abort() {
+    LI("[abort] blocked — re-installing SIGSEGV suppressor");
+    if (s_sigv_ano_base) install_sigsegv_suppressor(s_sigv_ano_base, s_sigv_ano_end);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Layer 10e — ptrace() neutraliser
+//
+// libanogs calls ptrace(PTRACE_TRACEME) in a loop (17 call sites, 0x258b10).
+// If PTRACE_TRACEME returns -EPERM (already traced), detection fires.
+// Hook in GOT always reports success (0) so the anti-debug check passes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+using FnPtrace = long(*)(int, pid_t, void*, void*);
+static FnPtrace g_orig_ptrace = nullptr;
+
+static long hook_ptrace(int req, pid_t pid, void *addr, void *data) {
+    if (req == 0 /* PTRACE_TRACEME */) {
+        LI("[ptrace] TRACEME spoofed → 0");
+        return 0;
+    }
+    return g_orig_ptrace ? g_orig_ptrace(req, pid, addr, data) : -1;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -617,18 +895,46 @@ void install_stealth_ext() {
 
     void *ano = dlopen(ano_name, RTLD_LAZY | RTLD_NOLOAD);
 
-    // ── Layer 7a — dl_iterate_phdr ──────────────────────────────────────────
-    if (libc) hk_libc(libc, "dl_iterate_phdr",
-        (void*)hook_dl_iterate_phdr, (void**)&g_orig_iter_phdr);
+    // Resolve libanogs base address synchronously — needed for GOT patching
+    // Must happen before L7a hooks dl_iterate_phdr
+    dl_iterate_phdr(phdr_find_anogs_stx, nullptr);
+    uintptr_t ano_base = s_stx_ano_base;
+    uintptr_t ano_end  = s_stx_ano_end;
+    if (ano_base) LI("libanogs base: 0x%lx end: 0x%lx", (unsigned long)ano_base, (unsigned long)ano_end);
+    else          LE("libanogs base NOT found — GOT patching unavailable");
 
-    // ── Layer 7b — dlopen ───────────────────────────────────────────────────
-    if (libc) hk_libc(libc, "dlopen",
-        (void*)hook_dlopen, (void**)&g_orig_dlopen);
+    // Install SIGSEGV suppressor BEFORE libanogs's background threads start scanning
+    // (libanogs's crash trap fires a SIGSEGV at its own base+0x502000)
+    LI("installing SIGSEGV suppressor...");
+    if (ano_base) install_sigsegv_suppressor(ano_base, ano_end);
+
+
+    // ── Layer 7a — dl_iterate_phdr ──────────────────────────────────────────
+    // dl_iterate_phdr IS in libanogs's import (RELA[208], GOT 0x50fc28).
+    // DobbyHook on bionic silently fails (non-hookable region); patch GOT instead.
+    // Bionic hook attempted as fallback to cover other callers (e.g. libil2cpp).
+    g_orig_iter_phdr = (FnIterPhdr)dlsym(libc, "dl_iterate_phdr");
+    if (!g_orig_iter_phdr) g_orig_iter_phdr = (FnIterPhdr)dlsym(RTLD_DEFAULT, "dl_iterate_phdr");
+    if (libc && !s_stx_ano_base) // only attempt bionic hook if GOT patch unavailable
+        hk_libc(libc, "dl_iterate_phdr", (void*)hook_dl_iterate_phdr, (void**)&g_orig_iter_phdr);
+    // GOT patch is done in L10 block below alongside other GOT patches
+
+    // ── Layer 7b — dlopen ──────────────────────────────────────────────────
+    // dlopen IS in libanogs imports — use GOT patch to avoid bionic body trampoline
+    g_orig_dlopen = (FnDlopen)dlsym(libc, "dlopen");
+    if (ano_base && g_orig_dlopen) {
+        anogs_patch_got_import(ano_base, "dlopen", (void*)hook_dlopen);
+        LI("L7b dlopen interceptor installed (GOT)");
+    } else if (libc) {
+        hk_libc(libc, "dlopen", (void*)hook_dlopen, (void**)&g_orig_dlopen);
+        LI("L7b dlopen interceptor installed (DobbyHook fallback)");
+    }
 
     // ── Layer 7c — AnoSDK missing exports ──────────────────────────────────
     if (ano) install_ano_missing(ano, ano_name);
 
     // ── Layer 8 — /proc/self/fd spoofing ───────────────────────────────────
+    // opendir/closedir/readdir/readlink NOT in libanogs imports; DobbyHook safe
     for (int i = 0; i < MAX_FD_DIRS; i++) g_fd_dirs[i].store(0);
     if (libc) {
         hk_libc(libc, "opendir",  (void*)hook_opendir,  (void**)&g_orig_opendir);
@@ -639,17 +945,59 @@ void install_stealth_ext() {
     }
 
     // ── Layer 9 — inotify nullifier ─────────────────────────────────────────
-    if (libc) {
+    // inotify_init + inotify_add_watch ARE in libanogs imports.
+    // DobbyHook on bionic puts trampolines in their bodies which libanogs's
+    // inline_hook_opcode_dismatch scanner detects immediately → process kill.
+    // GOT patch redirects only libanogs's calls; bionic bodies stay pristine.
+    g_orig_inotify_init = (FnInotifyInit)dlsym(libc, "inotify_init");
+    g_orig_inotify_add  = (FnInotifyAddWatch)dlsym(libc, "inotify_add_watch");
+    if (ano_base) {
+        anogs_patch_got_import(ano_base, "inotify_init",     (void*)hook_inotify_init);
+        anogs_patch_got_import(ano_base, "inotify_add_watch",(void*)hook_inotify_add);
+        LI("L9 inotify nullifier installed (GOT — no bionic trampoline)");
+    } else if (libc) {
         hk_libc(libc, "inotify_init",     (void*)hook_inotify_init, (void**)&g_orig_inotify_init);
         hk_libc(libc, "inotify_add_watch",(void*)hook_inotify_add,  (void**)&g_orig_inotify_add);
-        LI("L9 inotify nullifier installed");
+        LI("L9 inotify nullifier installed (DobbyHook fallback — may trip scanner)");
     }
 
     // ── Layer 10 — popen gate + access filter ───────────────────────────────
-    if (libc) {
+    // mprotect intentionally NOT hooked: libanogs must be able to call
+    // mprotect(PROT_NONE) on its own pages to set up crash-trap pages.
+    // Without crash-traps, the scanner falls back to direct tgkill SVC
+    // which bypasses our GOT kill stub → process dies. Let PROT_NONE go
+    // through; our SIGSEGV handler catches the trap and re-executes.
+    g_orig_popen    = (FnPopen)dlsym(libc, "popen");
+    g_orig_access   = (FnAccess)dlsym(libc, "access");
+    g_orig_mprotect = (FnMprotect)dlsym(libc, "mprotect");
+    g_orig_fork     = (FnFork)dlsym(libc, "fork");
+    g_orig_ptrace   = (FnPtrace)dlsym(libc, "ptrace");
+    g_orig__exit    = (FnExit)dlsym(libc, "_exit");
+    g_orig_abort    = (FnAbort)dlsym(libc, "abort");
+    if (ano_base) {
+        anogs_patch_got_import(ano_base, "popen",           (void*)hook_popen);
+        anogs_patch_got_import(ano_base, "access",          (void*)hook_access);
+        // fork: blocks fork-child path (CBZ W0 → 0x2586e8); byte==0 path still runs
+        anogs_patch_got_import(ano_base, "fork",            (void*)hook_fork);
+        // ptrace: PTRACE_TRACEME loop (0x258b10, 17 callers) always returns 0
+        anogs_patch_got_import(ano_base, "ptrace",          (void*)hook_ptrace);
+        // _exit/abort: final failsafe at 0x258700 — blocks process termination
+        anogs_patch_got_import(ano_base, "_exit",           (void*)hook__exit);
+        anogs_patch_got_import(ano_base, "abort",           (void*)hook_abort);
+        // dl_iterate_phdr: bionic DobbyHook fails; must go through libanogs GOT
+        // caller at 0x4fdaf4 scans all loaded ELFs for injected libs
+        anogs_patch_got_import(ano_base, "dl_iterate_phdr", (void*)hook_dl_iterate_phdr);
+        // kill/tgkill: blocks final detection loop at 0x258d14 via GOT
+        // (L57 DobbyHooks bionic as backup; GOT patch catches direct-import path)
+        anogs_patch_got_import(ano_base, "kill",            (void*)hook_kill_ano);
+        anogs_patch_got_import(ano_base, "tgkill",          (void*)hook_tgkill_ano);
+        LI("L10 popen/access/fork/ptrace/_exit/abort/dl_iterate_phdr/kill/tgkill installed (GOT)");
+    } else if (libc) {
         hk_libc(libc, "popen",  (void*)hook_popen,  (void**)&g_orig_popen);
         hk_libc(libc, "access", (void*)hook_access, (void**)&g_orig_access);
-        LI("L10 popen gate + access filter installed");
+        hk_libc(libc, "fork",   (void*)hook_fork,   (void**)&g_orig_fork);
+        hk_libc(libc, "ptrace", (void*)hook_ptrace, (void**)&g_orig_ptrace);
+        LI("L10 popen/access/fork/ptrace installed (DobbyHook fallback — may trip scanner)");
     }
 
     // ── Layer 11 — MADV_DONTDUMP + prctl ────────────────────────────────────

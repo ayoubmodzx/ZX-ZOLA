@@ -21,11 +21,20 @@ add_library(zx_payload SHARED
     stealth_ext4.cpp
     stealth_ext5.cpp
     stealth_ext6.cpp
+    stealth_ext7.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
 )
 target_include_directories(zx_payload PRIVATE .)
 target_link_libraries(zx_payload log dl GLESv3 EGL)
+# Payload is loaded from /data/local/tmp into classloader-namespace which does
+# not resolve libc++_shared.so for external libraries.  Bundle the C++ runtime
+# statically so the .so has zero libc++ DT_NEEDED entries.
+target_link_options(zx_payload PRIVATE
+    -nostdlib++
+    -l:libc++_static.a
+    -l:libc++abi.a
+)
 
 # ── Standalone root injector binary ──────────────────────────────────────────
 add_executable(zx_injector

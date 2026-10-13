@@ -14,6 +14,7 @@
 #include "dobby_stub.hpp"
 #include "anti_detect.hpp"
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -36,13 +37,8 @@
 #include <link.h>
 
 #define TAG "ZX-STX2"
-#ifndef ZX_RELEASE
-#define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#else
-#define LI(...) ((void)0)
-#define LE(...) ((void)0)
-#endif
+#define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ARM64 syscall numbers
 #ifndef __NR_ptrace
@@ -130,10 +126,54 @@ static bool rwx_contains(uintptr_t addr) {
 
 using FnTpSyscall = long(*)(long, long, long, long, long, long, long);
 static FnTpSyscall g_orig_tp_syscall = nullptr;
+// Stored at hook install time so forked children can still reference the original PID
+static pid_t g_protected_pid = 0;
 
 static inline bool is_lethal_sig(int s) {
     return s == SIGKILL || s == SIGABRT || s == SIGTERM;
 }
+
+// Direct inline SVC passthrough — bypasses g_orig_tp_syscall trampoline.
+// g_orig_tp_syscall is broken when injector pre-patches tp_syscall_imp with
+// MOV X0,XZR;RET before dlopen: Dobby saves those bytes as the "original",
+// so every passthrough call via g_orig_tp_syscall silently returns 0.
+// This helper issues SVC #0 directly without touching the Dobby trampoline.
+#if defined(__aarch64__)
+static __attribute__((always_inline)) long tp_svc_passthrough(
+        long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+    register long x8 __asm__("x8") = nr;
+    register long x0 __asm__("x0") = a1;
+    register long x1 __asm__("x1") = a2;
+    register long x2 __asm__("x2") = a3;
+    register long x3 __asm__("x3") = a4;
+    register long x4 __asm__("x4") = a5;
+    register long x5 __asm__("x5") = a6;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5) : "memory","cc");
+    return x0;
+}
+#else  // armeabi-v7a Thumb-2: r7 is the frame pointer and is reserved.
+// Named register variable for r7 is rejected by clang. Save/restore r7
+// around the svc instruction explicitly so the compiler is never confused.
+static __attribute__((always_inline)) long tp_svc_passthrough(
+        long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
+    register long r0 __asm__("r0") = a1;
+    register long r1 __asm__("r1") = a2;
+    register long r2 __asm__("r2") = a3;
+    register long r3 __asm__("r3") = a4;
+    register long r4 __asm__("r4") = a5;
+    register long r5 __asm__("r5") = a6;
+    __asm__ volatile(
+        "push {r7}\n\t"
+        "mov  r7, %1\n\t"
+        "svc  #0\n\t"
+        "pop  {r7}"
+        : "+r"(r0)
+        : "r"(nr), "r"(r1), "r"(r2), "r"(r3), "r"(r4), "r"(r5)
+        : "memory", "cc"
+    );
+    return r0;
+}
+#endif
 
 static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
     switch ((int)nr) {
@@ -148,9 +188,14 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
         errno = EPERM; return -1L;
 
     // kill(pid, sig) — a1=pid, a2=sig
+    // Block lethal signals to: self, broadcast (0/-1), or our stored protected PID
+    // The protected PID covers the forked-child scenario where child != getpid()
     case __NR_kill:
-        if (is_lethal_sig((int)a2) && ((pid_t)a1 == getpid() || (pid_t)a1 == 0))
-            return 0L;
+        if (is_lethal_sig((int)a2)) {
+            pid_t t = (pid_t)a1;
+            if (t == 0 || t == -1 || t == getpid() || (g_protected_pid && t == g_protected_pid))
+                return 0L;
+        }
         break;
 
     // tkill(tid, sig) — a1=tid, a2=sig
@@ -161,13 +206,21 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
 
     // tgkill(tgid, tid, sig) — a1=tgid, a2=tid, a3=sig
     case __NR_tgkill:
-        if (is_lethal_sig((int)a3) && (pid_t)a1 == getpid())
-            return 0L;
+        if (is_lethal_sig((int)a3)) {
+            pid_t tg = (pid_t)a1;
+            if (tg == getpid() || (g_protected_pid && tg == g_protected_pid))
+                return 0L;
+        }
         break;
 
     // process_vm_readv — block external memory read
     case __NR_process_vm_readv:
         errno = EPERM; return -1L;
+
+    // exit_group — ACE calls this via tp_syscall_imp after detecting hooks.
+    // Swallow it so the process keeps running; payload hooks finish installing.
+    case __NR_exit_group:
+        return 0L;
 
     // mincore(addr, len, vec) — a1=addr, a2=len, a3=vec
     // Return all-resident for our tracked RWX pages, passthrough rest
@@ -175,8 +228,7 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
         uintptr_t q_s = (uintptr_t)a1;
         size_t    q_n = (size_t)a2;
         uint8_t  *vec = (uint8_t*)a3;
-        if (!g_orig_tp_syscall) { errno = EFAULT; return -1L; }
-        long r = g_orig_tp_syscall(nr, a1, a2, a3, a4, a5, a6);
+        long r = tp_svc_passthrough(nr, a1, a2, a3, a4, a5, a6);
         // Patch vec: mark any page in our RWX registry as resident
         if (r == 0 && vec) {
             size_t npages = (q_n + 4095) / 4096;
@@ -193,8 +245,7 @@ static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5
     default: break;
     }
 
-    if (!g_orig_tp_syscall) return -1L;
-    return g_orig_tp_syscall(nr, a1, a2, a3, a4, a5, a6);
+    return tp_svc_passthrough(nr, a1, a2, a3, a4, a5, a6);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -459,6 +510,26 @@ static bool hk2(void *lib, const char *sym, void *rep, void **orig) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Early constructor — hooks tp_syscall_imp at priority 100 (BEFORE anosdk_bypass
+// at 101 and payload_init at 102).  This closes the window where Dobby trampolines
+// are live but ACE's raw-SVC scanner is unhoooked.  libanort.so is already loaded
+// in the target process before injection, so DobbySymbolResolver always finds it.
+// No libc hooks here — safe to call inside dlopen's call stack.
+// ═════════════════════════════════════════════════════════════════════════════
+
+__attribute__((constructor(100)))
+static void early_hook_tp_syscall() {
+    g_protected_pid = getpid();
+    void *tp = DobbySymbolResolver("libanort.so", "tp_syscall_imp");
+    if (tp) {
+        int rc = DobbyHook(tp, (void*)hook_tp_syscall, (void**)&g_orig_tp_syscall);
+        LI("early L13 tp_syscall_imp @ %p hook_rc=%d pid=%d", tp, rc, (int)g_protected_pid);
+    } else {
+        LE("early L13 tp_syscall_imp NOT FOUND — SIGKILL window open!");
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Public install
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -470,19 +541,22 @@ void install_stealth_ext2() {
     if (!libc)  libc = dlopen(libc_s, RTLD_LAZY);
     void *anort = dlopen(anort_s, RTLD_LAZY | RTLD_NOLOAD);
 
-    // ── Layer 13 — tp_syscall_imp (libanort.so direct SVC) ──────────────────
-    if (anort) {
-        void *tp = dlsym(anort, "tp_syscall_imp");
-        if (tp) {
-            if (DobbyHook(tp, (void*)hook_tp_syscall, (void**)&g_orig_tp_syscall) == 0)
-                LI("L13 tp_syscall_imp hooked @ %p", tp);
-            else
-                LE("L13 tp_syscall_imp hook FAILED");
-        } else {
-            LE("L13 tp_syscall_imp not found — libanort loaded? handle=%p", anort);
-        }
+    // ── Layer 13 — tp_syscall_imp (already hooked by early_hook_tp_syscall) ───
+    // The priority-100 constructor ran before anosdk_bypass, so g_orig_tp_syscall
+    // is already set.  Verify and log; no re-hook needed (Dobby would crash on double-hook).
+    if (g_orig_tp_syscall) {
+        LI("L13 tp_syscall_imp already hooked (early ctor) orig=%p", (void*)g_orig_tp_syscall);
     } else {
-        LE("L13 libanort.so not loaded yet — tp_syscall_imp unprotected");
+        // Early ctor failed — last-chance attempt with DobbySymbolResolver
+        void *tp = DobbySymbolResolver("libanort.so", "tp_syscall_imp");
+        if (!tp && anort) tp = dlsym(anort, "tp_syscall_imp");
+        if (tp) {
+            int rc = DobbyHook(tp, (void*)hook_tp_syscall, (void**)&g_orig_tp_syscall);
+            if (rc == 0) LI("L13 tp_syscall_imp late-hooked @ %p", tp);
+            else         LE("L13 tp_syscall_imp late-hook FAILED @ %p rc=%d", tp, rc);
+        } else {
+            LE("L13 tp_syscall_imp NOT FOUND — SIGKILL risk! anort_handle=%p", anort);
+        }
     }
 
     // ── Layer 14 — fork() gate (lazy range init on first call) ──────────────

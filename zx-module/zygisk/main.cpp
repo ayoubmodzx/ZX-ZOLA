@@ -5,6 +5,7 @@
 #include "feature_engine.hpp"
 #include "anosdk_bypass.hpp"
 #include "memory_guard.hpp"
+#include "kill_shield.hpp"
 #include <android/log.h>
 #include <cstring>
 
@@ -26,19 +27,18 @@ public:
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
         if (!args->nice_name) {
-            m_api->setOption(1); // DLCLOSE
+            m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
         const char *pkg = m_env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!pkg) { m_api->setOption(1); return; }
+        if (!pkg) { m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
 
         bool is_ff = (strcmp(pkg, FF_PKG) == 0 || strcmp(pkg, FF_PKG_MAX) == 0);
         m_env->ReleaseStringUTFChars(args->nice_name, pkg);
 
         if (!is_ff) {
-            // Unload from every non-FF process — zero overhead everywhere else
-            m_api->setOption(1);
+            m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
             return;
         }
 
@@ -52,12 +52,16 @@ public:
         g_worker.start();
 
         g_worker.post([] {
-            // 1. Hide ourselves from AnoSDK memory scan first
+            // 1. Kill-path neutraliser — FIRST: patches kill stubs + MVM
+            //    dispatcher on load, delivers seccomp to every new thread
+            KillShield::install();
+
+            // 2. Hide ourselves from AnoSDK memory scan
             if (MemoryGuard::init()) {
                 MemoryGuard::hideSelf();
             }
 
-            // 2. Intercept AnoSDK reporting — BEFORE it initializes
+            // 3. Intercept AnoSDK reporting — BEFORE it initializes
             AnoBypass::install();
 
             // 3. Init il2cpp API

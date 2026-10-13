@@ -25,4 +25,15 @@ namespace ProcMem {
 
     // Find a specific symbol offset inside a library using /proc/PID/mem
     uintptr_t findSymbol(int pid, const char *lib_name, const char *sym_name);
+
+    // Like findSymbol but loads the symbol offset from a known local path instead
+    // of relying on the soname being in the injector's linker namespace.
+    // Use this for memfd-injected libs that appear as "memfd:zx" in /proc/maps.
+    uintptr_t findSymbolFromPath(int pid, const char *remote_lib_name,
+                                 const char *sym_name, const char *local_path);
+
+    // Scan the loaded payload for the 16-byte magic tag placed before the ZxCtrl
+    // struct in __g_block (see payload.cpp).  Returns address of ctrl.cmd (tag+16).
+    // Used instead of findSymbolFromPath since __g_sdktbl1 is no longer exported.
+    uintptr_t findCtrlByMagic(int pid);
 }

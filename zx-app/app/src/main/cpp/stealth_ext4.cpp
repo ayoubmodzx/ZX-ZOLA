@@ -28,6 +28,7 @@
 #include "dobby_stub.hpp"
 
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <unistd.h>
 #include <signal.h>
@@ -54,13 +55,8 @@
 #include <link.h>
 
 #define TAG "ZX-STH4"
-#ifndef ZX_RELEASE
-#define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#else
-#define LI(...) ((void)0)
-#define LE(...) ((void)0)
-#endif
+#define LI(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define LE(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer 27 — clock_gettime CLOCK_BOOTTIME / CLOCK_MONOTONIC_RAW spoof

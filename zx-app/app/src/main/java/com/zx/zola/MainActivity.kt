@@ -2,6 +2,7 @@ package com.zx.zola
 
 import android.content.*
 import android.net.Uri
+import java.io.File
 import com.zx.zola.ZxEngine.Cmd
 import android.os.Bundle
 import android.os.Handler
@@ -57,6 +58,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         ZxEngine.init(this)
+        checkModuleStatus()
 
         val activateBtn   = findViewById<Button>(R.id.btn_activate)
         val stopBtn       = findViewById<Button>(R.id.btn_stop)
@@ -73,6 +75,7 @@ class MainActivity : AppCompatActivity() {
                     Toast.makeText(this@MainActivity, "Launch Free Fire first", Toast.LENGTH_SHORT).show()
                     return@launch
                 }
+                checkModuleStatus()
                 startFg()
                 setActive(true)
                 isFabOn = true
@@ -196,6 +199,31 @@ class MainActivity : AppCompatActivity() {
                 tv.text = "$pct%"
                 ZxEngine.setIntensity(rf.cmd, pct)
             }
+        }
+    }
+
+    private fun checkModuleStatus() {
+        val ok = File("/data/local/tmp/.zx_ks_ok").exists()
+        setModuleStatus(ok)
+    }
+
+    private fun setModuleStatus(ok: Boolean) {
+        val card = findViewById<View>(R.id.card_module_status)
+        val dot  = findViewById<View>(R.id.dot_module)
+        val tv   = findViewById<TextView>(R.id.tv_module_status)
+        val sub  = findViewById<TextView>(R.id.tv_module_sub)
+        if (ok) {
+            card.setBackgroundResource(R.drawable.bg_status_active)
+            dot.setBackgroundColor(getColor(R.color.zx_purple))
+            tv.text = "MODULE ACTIVE"
+            tv.setTextColor(getColor(R.color.zx_purple))
+            sub.text = "KillShield OK"
+        } else {
+            card.setBackgroundResource(R.drawable.bg_status_inactive)
+            dot.setBackgroundColor(0xFFFF4444.toInt())
+            tv.text = "MODULE NOT FOUND"
+            tv.setTextColor(0xFFFF4444.toInt())
+            sub.text = "Zygisk?"
         }
     }
 

@@ -198,6 +198,35 @@ static uintptr_t find_svc_gadget(pid_t pid) {
     return 0;
 }
 
+// PTRACE_SINGLESTEP wait helper: SIGCHLD from dying fork children can race with
+// the single-step stop.  Loop until we get a non-SIGCHLD ptrace-stop.
+// If SIGCHLD arrives after the SVC executed (PC advanced past svc_pc), we fake
+// a SIGTRAP status so the caller sees success and reads X0 normally.
+// If SIGCHLD arrives before the SVC executed (PC still == svc_pc), we suppress
+// the signal and re-issue PTRACE_SINGLESTEP.
+static int safe_singlestep_wait(pid_t pid, uintptr_t svc_pc) {
+    int wst = 0;
+    for (int _wi = 0; _wi < 64; ++_wi) {
+        waitpid(pid, &wst, 0);
+        if (!WIFSTOPPED(wst)) break;         // process died — propagate as-is
+        if (WSTOPSIG(wst) != SIGCHLD) break; // SIGTRAP or real fault — propagate
+        pt_regs chk; get_regs(pid, &chk);
+        if (chk.pc != svc_pc) {
+            // SVC completed; SIGCHLD arrived just after the syscall returned.
+            // Fake SIGTRAP stopped status so the check below sees success.
+            zerr("safe_singlestep_wait: SIGCHLD after SVC completed (PC=0x%lx), faking SIGTRAP",
+                 (unsigned long)chk.pc);
+            wst = (SIGTRAP << 8) | 0x7f;
+            break;
+        }
+        // SVC not yet executed — suppress SIGCHLD and re-issue the step
+        zerr("safe_singlestep_wait: SIGCHLD before SVC (PC=0x%lx==svc), restepping _wi=%d",
+             (unsigned long)chk.pc, _wi);
+        ptrace(PTRACE_SINGLESTEP, pid, nullptr, (void*)0L);
+    }
+    return wst;
+}
+
 // Allocate RWX memory in target via a raw SVC #0 gadget + PTRACE_SINGLESTEP.
 // Bypasses the mmap() C wrapper whose BTI guard (ARMv8.5+) causes SIGSEGV when
 // we teleport PC there via PTRACE_SETREGSET instead of a real BL/BLR instruction.
@@ -247,8 +276,7 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     // PTRACE_SINGLESTEP: executes exactly the SVC instruction, then stops with SIGTRAP.
     // The kernel handles the mmap syscall during the SVC, returns X0 = mapped address.
     ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int wst = 0;
-    waitpid(pid, &wst, 0);
+    int wst = safe_singlestep_wait(pid, svc_addr);
 
     if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
         pt_regs crash; get_regs(pid, &crash);
@@ -459,7 +487,7 @@ static uintptr_t find_real_loader_dlopen(int target_pid,
 static bool remote_dlopen(pid_t pid, const char *so_path) {
     size_t path_len     = strlen(so_path) + 1;
     size_t path_aligned = (path_len + 7) & ~(size_t)7;
-    size_t alloc        = path_aligned + 56; // path + 56-byte shellcode
+    size_t alloc        = path_aligned + 120; // path + 72-byte shellcode + 48-byte android_dlextinfo
 
     uintptr_t remote_buf = remote_mmap(pid, alloc);
     if (!remote_buf) { zerr("remote_dlopen: remote_mmap returned 0"); return false; }
@@ -526,25 +554,11 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: linker bases unknown — skipping full scan");
     }
 
-    // 56-byte shellcode calling __loader_dlopen(path, flags, fake_caller) directly.
-    // X2 (fake_caller = dlopen_addr = address inside libdl.so) is pre-loaded in regs
-    // before PTRACE_CONT and is NOT touched by __loader_dlopen at entry (only the
-    // wrapper overwrites X2 with X30; __loader_dlopen reads it as its 3rd argument).
-    //
-    //   [+0 ] LDR X8, #40    — load loader_dlopen_addr from pool at +40
-    //   [+4 ] NOP             — X2 already = dlopen_addr from pre-set regs (fake caller)
-    //   [+8 ] BLR X8          — call __loader_dlopen(X0=path, X1=flags, X2=fake_caller)
-    //   [+12] MOV X19, X0    — save handle (callee-saved)
-    //   [+16] LDR X8, #32    — load dlerror_addr from pool at +48
-    //   [+20] BLR X8          — call dlerror()
-    //   [+24] MOV X1, X0     — dlerror_ptr → X1
-    //   [+28] MOV X0, X19    — handle → X0
-    //   [+32] BRK #0          — stop
-    //   [+36] NOP             — align pool to 8-byte boundary
-    //   [+40] fn_loader_dlopen (8 bytes)
-    //   [+48] fn_dlerror       (8 bytes)
-    // Test: can FF's process open the staged file? Use a remote openat syscall.
+    // ANDROID_DLEXT_USE_LIBRARY_FD (0x10): call do_dlopen with extinfo.library_fd.
+    // Linker uses the fd for file I/O instead of re-opening by path — bypasses
+    // namespace path checks. fd is later bounced to a memfd to bypass noexec mount.
     // AT_FDCWD=-100, O_RDONLY=0
+    int64_t saved_fd = -1;
     {
         pt_regs ro, rr; get_regs(pid, &ro); memcpy(&rr, &ro, sizeof(rr));
         rr.pstate &= ~(uint64_t)(3u << 10);
@@ -556,56 +570,138 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         rr.pc = find_svc_gadget(pid);
         if (rr.pc && set_regs(pid, &rr)) {
             ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-            int wst = 0; waitpid(pid, &wst, 0);
+            safe_singlestep_wait(pid, rr.pc);
             pt_regs rp; get_regs(pid, &rp);
             int64_t fd_ret = (int64_t)rp.regs[0];
             zerr("remote_dlopen: openat test fd=%lld (neg=errno, >=0=ok)", (long long)fd_ret);
             if (fd_ret >= 0) {
-                // close fd via syscall
-                rp.regs[8] = 57; rp.regs[0] = (uint64_t)fd_ret;
-                rp.pc = find_svc_gadget(pid);
-                if (rp.pc && set_regs(pid, &rp)) {
-                    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-                    waitpid(pid, &wst, 0);
-                }
+                saved_fd = fd_ret;
+                zerr("remote_dlopen: fd=%lld kept open for ANDROID_DLEXT_USE_LIBRARY_FD", (long long)saved_fd);
             }
         }
         set_regs(pid, &ro);
     }
     uintptr_t sc_addr = remote_buf + path_aligned;
-    struct { uint32_t insns[10]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
-    sc.insns[0] = 0x58000148u; // LDR X8, #40  (PC=0, target=40, imm19=10)
-    sc.insns[1] = 0xD503201Fu; // NOP           (X2 = dlopen_addr already set in regs)
-    sc.insns[2] = 0xD63F0100u; // BLR X8        (__loader_dlopen(X0,X1,X2))
-    sc.insns[3] = 0xAA0003F3u; // MOV X19, X0   (save handle in callee-saved reg)
-    sc.insns[4] = 0x58000108u; // LDR X8, #32   (PC=16, target=48, imm19=8)
-    sc.insns[5] = 0xD63F0100u; // BLR X8        (dlerror())
-    sc.insns[6] = 0xAA0003E1u; // MOV X1, X0    (dlerror_ptr → X1)
-    sc.insns[7] = 0xAA1303E0u; // MOV X0, X19   (handle → X0)
-    sc.insns[8] = 0xD4200000u; // BRK #0
-    sc.insns[9] = 0xD503201Fu; // NOP            (pool alignment)
-    sc.fn_dlopen  = (uint64_t)loader_dlopen_addr;
-    sc.fn_dlerror = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
 
-    if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
-        zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
+    // Bounce the tmp file through a memfd to bypass /data/local/tmp noexec mount.
+    // mmap(PROT_EXEC, fd) from a noexec-mounted file → EACCES on segment 2.
+    // memfd pages are not filesystem-backed so the kernel never checks noexec.
+    if (saved_fd >= 0) {
+        uintptr_t svc = find_svc_gadget(pid);
+        if (svc) {
+            // Write memfd name into sc_addr scratch area (overwritten by shellcode later)
+            // Name matches Android ART JIT cache — ACE whitelists these in /proc/maps.
+            const char mfd_name[] = "jit-zygote-cache";
+            ProcMem::write(sc_addr, mfd_name, sizeof(mfd_name));
+
+            // Helper: run one SVC in FF's process, restore registers, return x0
+            auto do_svc = [&](uint64_t nr,
+                              uint64_t a0 = 0, uint64_t a1 = 0,
+                              uint64_t a2 = 0, uint64_t a3 = 0) -> int64_t {
+                pt_regs ro, rr; get_regs(pid, &ro); memcpy(&rr, &ro, sizeof(rr));
+                rr.pstate &= ~(uint64_t)(3u << 10);
+                rr.regs[8]=nr; rr.regs[0]=a0; rr.regs[1]=a1;
+                rr.regs[2]=a2; rr.regs[3]=a3;
+                rr.pc = svc;
+                if (!set_regs(pid, &rr)) { set_regs(pid, &ro); return -EINVAL; }
+                ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+                safe_singlestep_wait(pid, svc);
+                pt_regs rp; get_regs(pid, &rp);
+                set_regs(pid, &ro);
+                return (int64_t)rp.regs[0];
+            };
+
+            // memfd_create(name, MFD_EXEC|MFD_CLOEXEC=0x11)
+            // Kernel <6.3 doesn't know MFD_EXEC → EINVAL; retry with MFD_CLOEXEC=1
+            int64_t mfd = do_svc(279, sc_addr, 0x11u);
+            if (mfd < 0 && mfd > -4096)
+                mfd = do_svc(279, sc_addr, 1u);
+            zerr("remote_dlopen: memfd_create ret=%lld", (long long)mfd);
+
+            if (mfd >= 0) {
+                // sendfile(memfd, tmpfd, NULL, 64MB) — copies entire payload
+                int64_t sf = do_svc(71, (uint64_t)mfd, (uint64_t)saved_fd, 0, 64u*1024*1024);
+                zerr("remote_dlopen: sendfile(memfd=%lld, tmpfd=%lld) ret=%lld",
+                     (long long)mfd, (long long)saved_fd, (long long)sf);
+                do_svc(62, (uint64_t)mfd, 0, 0);  // lseek(memfd, 0, SEEK_SET)
+                do_svc(57, (uint64_t)saved_fd);    // close tmp fd
+                saved_fd = mfd;
+                zerr("remote_dlopen: using memfd=%lld (no-noexec, exec-mappable)", (long long)saved_fd);
+            }
+        }
+    }
+
+    uintptr_t caller_addr_val;
+    {
+        uintptr_t lb = ProcMem::findLibBase(pid, "libmain.so");
+        caller_addr_val = lb ? lb + 0x1000UL : dlopen_addr;
+        zerr("remote_dlopen: caller_addr=0x%lx", (unsigned long)caller_addr_val);
+    }
+
+    if (do_dlopen_target) {
+        // 72-byte shellcode: 4-arg do_dlopen + android_dlextinfo at sc_addr+72
+        //   [+0 ] LDR X8,#40  — do_dlopen_target at pool[0]+40
+        //   [+4 ] LDR X2,#44  — extinfo_ptr      at pool[1]+48
+        //   [+8 ] LDR X3,#48  — caller_addr       at pool[2]+56
+        //   [+12] BLR X8       — do_dlopen(X0=path,X1=flags,X2=extinfo,X3=caller)
+        //   [+16] MOV X19,X0  — save handle
+        //   [+20] LDR X8,#44  — dlerror_addr      at pool[3]+64
+        //   [+24] BLR X8       — dlerror()
+        //   [+28] MOV X1,X0   [+32] MOV X0,X19   [+36] BRK #0
+        struct { uint32_t insns[10]; uint64_t p0, p1, p2, p3; } sc4;
+        sc4.insns[0] = 0x58000148u; // LDR X8,#40  PC=0  imm19=10
+        sc4.insns[1] = 0x58000162u; // LDR X2,#44  PC=4  imm19=11
+        sc4.insns[2] = 0x58000183u; // LDR X3,#48  PC=8  imm19=12
+        sc4.insns[3] = 0xD63F0100u; // BLR X8
+        sc4.insns[4] = 0xAA0003F3u; // MOV X19,X0
+        sc4.insns[5] = 0x58000168u; // LDR X8,#44  PC=20 imm19=11
+        sc4.insns[6] = 0xD63F0100u; // BLR X8
+        sc4.insns[7] = 0xAA0003E1u; // MOV X1,X0
+        sc4.insns[8] = 0xAA1303E0u; // MOV X0,X19
+        sc4.insns[9] = 0xD4200000u; // BRK #0
+        sc4.p0 = (uint64_t)do_dlopen_target;
+        sc4.p1 = (uint64_t)(sc_addr + 72);
+        sc4.p2 = (uint64_t)caller_addr_val;
+        sc4.p3 = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
+        if (!ProcMem::write(sc_addr, &sc4, sizeof(sc4))) {
+            zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
+        }
+        // android_dlextinfo (48 bytes) at sc_addr+72
+        struct { uint64_t flags; uint64_t raddr; uint64_t rsz;
+                 int32_t rfd; int32_t lfd; int64_t off; uint64_t ns; } ei = {};
+        if (saved_fd >= 0) { ei.flags = 0x10ULL; ei.lfd = (int32_t)saved_fd; }  // ANDROID_DLEXT_USE_LIBRARY_FD=0x10
+        if (!ProcMem::write(sc_addr + 72, &ei, sizeof(ei))) {
+            zerr("remote_dlopen: write extinfo failed errno=%d", errno); return false;
+        }
+        zerr("remote_dlopen: extinfo at sc+72: flags=0x%llx lfd=%d",
+             (unsigned long long)ei.flags, ei.lfd);
+    } else {
+        // Fallback: 56-byte shellcode calling __loader_dlopen (no extinfo fd bypass)
+        struct { uint32_t insns[10]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
+        sc.insns[0] = 0x58000148u; // LDR X8,#40
+        sc.insns[1] = 0xD503201Fu; // NOP  (X2=caller pre-set in regs)
+        sc.insns[2] = 0xD63F0100u; // BLR X8
+        sc.insns[3] = 0xAA0003F3u; // MOV X19,X0
+        sc.insns[4] = 0x58000108u; // LDR X8,#32  PC=16 pool=48
+        sc.insns[5] = 0xD63F0100u; // BLR X8
+        sc.insns[6] = 0xAA0003E1u; // MOV X1,X0
+        sc.insns[7] = 0xAA1303E0u; // MOV X0,X19
+        sc.insns[8] = 0xD4200000u; // BRK #0
+        sc.insns[9] = 0xD503201Fu; // NOP
+        sc.fn_dlopen  = (uint64_t)loader_dlopen_addr;
+        sc.fn_dlerror = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
+        if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
+            zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
+        }
     }
 
     pt_regs orig, regs;
     get_regs(pid, &orig);
     memcpy(&regs, &orig, sizeof(regs));
-    regs.pstate &= ~(uint64_t)(3u << 10); // clear PSTATE.BTYPE
-    regs.regs[0] = remote_buf;   // __loader_dlopen arg0: path
-    regs.regs[1] = RTLD_NOW;    // __loader_dlopen arg1: flags
-    // caller_addr: use libmain.so+0x1000 (game namespace) so the linker resolves
-    // the load request in the main app namespace rather than the linker's own namespace.
-    // Fallback to dlopen_addr (libdl.so) if libmain_base is not available.
-    {
-        uintptr_t libmain_base = ProcMem::findLibBase(pid, "libmain.so");
-        regs.regs[2] = libmain_base ? libmain_base + 0x1000 : dlopen_addr;
-        zerr("remote_dlopen: caller_addr=0x%lx (libmain_base=0x%lx)",
-             (unsigned long)regs.regs[2], (unsigned long)libmain_base);
-    }
+    regs.pstate &= ~(uint64_t)(3u << 10);
+    regs.regs[0] = remote_buf;
+    regs.regs[1] = RTLD_NOW;
+    if (!do_dlopen_target) regs.regs[2] = caller_addr_val;
     regs.pc = sc_addr;
 
     if (!set_regs(pid, &regs)) {
@@ -627,8 +723,20 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: restored %d/%d ACE hooks before shellcode", actually_patched, n_patches);
 
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-    int status;
-    waitpid(pid, &status, 0);
+    int status = 0;
+    // Loop until the shellcode hits BRK #0 (SIGTRAP).
+    // Background threads can deliver SIGCHLD (dying fork child) or other
+    // async signals to the tracee while dlopen runs.  Each non-SIGTRAP
+    // ptrace-stop means the shellcode was interrupted, not finished.
+    // We suppress the signal (pass 0) and CONT — dlopen resumes in-place.
+    for (int _wi = 0; _wi < 64; ++_wi) {
+        waitpid(pid, &status, 0);
+        if (!WIFSTOPPED(status)) break;        // process died — bad
+        if (WSTOPSIG(status) == SIGTRAP) break; // hit BRK #0
+        zerr("remote_dlopen: non-SIGTRAP stop sig=%d (iter %d), continuing shellcode",
+             WSTOPSIG(status), _wi);
+        ptrace(PTRACE_CONT, pid, nullptr, nullptr); // suppress signal, resume dlopen
+    }
 
     // Re-apply ACE's hook instructions after shellcode stops at BRK #0.
     for (int i = 0; i < n_patches; i++) {
@@ -639,24 +747,40 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     if (n_patches > 0)
         zerr("remote_dlopen: re-applied %d ACE hooks after shellcode", n_patches);
 
+    // Capture handle+dlerror from BRK stop state BEFORE any register modifications.
+    uintptr_t handle = 0, err_ptr = 0, stop_pc = 0;
+    {
+        pt_regs post; get_regs(pid, &post);
+        handle  = (uintptr_t)post.regs[0];
+        err_ptr = (uintptr_t)post.regs[1];
+        stop_pc = (uintptr_t)post.pc;
+    }
+    zerr("remote_dlopen: handle=0x%lx dlerror_ptr=0x%lx stop_pc=0x%lx",
+         (unsigned long)handle, (unsigned long)err_ptr, (unsigned long)stop_pc);
+
+    // Close the fd kept open for ANDROID_DLEXT_USE_LIBRARY_FD
+    if (saved_fd >= 0) {
+        pt_regs rcl; get_regs(pid, &rcl);
+        rcl.regs[8] = 57; rcl.regs[0] = (uint64_t)saved_fd;
+        rcl.pc = find_svc_gadget(pid);
+        if (rcl.pc && set_regs(pid, &rcl)) {
+            ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+            safe_singlestep_wait(pid, rcl.pc);
+            zerr("remote_dlopen: closed fd=%lld", (long long)saved_fd);
+        }
+    }
+
     set_regs(pid, &orig);
 
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-        pt_regs crash; get_regs(pid, &crash);
-        zerr("remote_dlopen: bad stop sig=%d crash_PC=0x%lx",
-             WSTOPSIG(status), (unsigned long)crash.pc);
+        zerr("remote_dlopen: bad stop sig=%d stop_pc=0x%lx",
+             WSTOPSIG(status), (unsigned long)stop_pc);
         siginfo_t si = {};
         if (ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si) == 0)
             zerr("remote_dlopen: SIGINFO si_signo=%d si_code=%d si_addr=0x%lx",
                  si.si_signo, si.si_code, (unsigned long)(uintptr_t)si.si_addr);
         return false;
     }
-
-    pt_regs post; get_regs(pid, &post);
-    uintptr_t handle  = (uintptr_t)post.regs[0];
-    uintptr_t err_ptr = (uintptr_t)post.regs[1];
-
-    zerr("remote_dlopen: handle=0x%lx dlerror_ptr=0x%lx", (unsigned long)handle, (unsigned long)err_ptr);
     if (err_ptr) {
         char err_str[256] = {};
         if (ProcMem::read(err_ptr, err_str, sizeof(err_str) - 1))
@@ -676,7 +800,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         const char *bname = strrchr(so_path, '/');
         bname = bname ? bname + 1 : so_path;
         while (mf && fgets(mline, sizeof(mline), mf))
-            if (strstr(mline, bname)) { in_maps = true; break; }
+            if (strstr(mline, bname) || strstr(mline, "memfd:jit-zygote-cache")) { in_maps = true; break; }
         if (mf) fclose(mf);
         zerr("remote_dlopen: maps_check: in_maps=%d basename=%s", in_maps, bname);
     }
@@ -687,9 +811,9 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: __loader_dlopen@0x%lx bytes: %08x %08x %08x %08x",
              (unsigned long)loader_dlopen_addr, ldi[0], ldi[1], ldi[2], ldi[3]);
     }
-    // Valid handle: non-zero AND fits in 32 bits (random obfuscated cookie on Android 10+)
-    // OR the library simply appeared in maps (handle may be a cookie that looks like -4)
-    bool ok = (handle != 0 && handle <= 0xFFFFFFFFULL) || in_maps;
+    // Valid handle: non-zero (64-bit on Android 10+, no 32-bit limit)
+    // OR library appeared in maps (memfd injection: handle is real but > 32 bits)
+    bool ok = handle != 0 || in_maps;
     if (!ok)
         zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d", (unsigned long)handle, in_maps);
     return ok;
@@ -742,7 +866,7 @@ int main(int argc, char *argv[]) {
         // /data/local/tmp/ (shell_data_file context) is accessible to any process.
         {
             char tmp_path[256];
-            snprintf(tmp_path, sizeof(tmp_path), "/data/local/tmp/zxpl_%d.so", pid);
+            snprintf(tmp_path, sizeof(tmp_path), "/data/local/tmp/libdns_%d.so", pid);
             int fi = open(payload_path, O_RDONLY);
             if (fi >= 0) {
                 int fo = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
@@ -771,9 +895,84 @@ int main(int argc, char *argv[]) {
 
         if (!ptrace_attach(pid)) { ProcMem::close(); return 3; }
         freeze_threads(pid);       // stop anti-cheat threads during injection
+
+        // Pre-patch tp_syscall_imp → MOV X0,XZR; RET  BEFORE dlopen fires constructors.
+        // DobbySymbolResolver in constructor-100 takes ~50-100ms (full dl_iterate_phdr
+        // scan), leaving a window where ACE can call tp_syscall_imp to send SIGKILL.
+        // Writing a silent 8-byte trampoline here closes that window entirely — all
+        // tp_syscall_imp calls return 0 until constructor-100 installs the Dobby hook.
+        // libanort.so tp_syscall_imp is at ELF offset 0x146940 (binary-verified).
+        {
+            uintptr_t anort_base = ProcMem::findLibBase(pid, "libanort.so");
+            zerr("main: libanort.so base=0x%lx", (unsigned long)anort_base);
+            if (anort_base) {
+                uintptr_t tp_addr = anort_base + 0x146940UL;
+                // ARM64 LE: MOV X0,XZR=0xAA1F03E0  RET=0xD65F03C0
+                bool p0 = remote_poke_insn(pid, tp_addr,     0xAA1F03E0u);
+                bool p1 = remote_poke_insn(pid, tp_addr + 4, 0xD65F03C0u);
+                if (p0 && p1)
+                    zerr("main: tp_syscall_imp @ 0x%lx pre-patched MOV X0,XZR; RET",
+                         (unsigned long)tp_addr);
+                else
+                    zerr("main: WARNING tp_syscall_imp pre-patch FAILED p0=%d p1=%d",
+                         (int)p0, (int)p1);
+            } else {
+                zerr("main: WARNING libanort.so NOT FOUND — tp pre-patch skipped!");
+            }
+        }
+
+        // Pre-patch libanogs.so direct-SVC kill stub (ELF offset 0x3f0270) and
+        // scanner entries (0x1b9ce4, 0x1ba72c) BEFORE dlopen so they never fire.
+        // Kill stub confirmed from run 5: "L29: direct SVC kill hooked @ base+0x3f0270".
+        // Scanner NOP-patch closes the window before stealth_ext3 constructor runs.
+        {
+            uintptr_t anogs_base = ProcMem::findLibBase(pid, "libanogs.so");
+            zerr("main: libanogs.so base=0x%lx", (unsigned long)anogs_base);
+            if (anogs_base) {
+                // Kill SVC stub at ELF offset 0x3f0270 — MOV X0,XZR; RET
+                uintptr_t kill_stub = anogs_base + 0x3f0270UL;
+                bool p0 = remote_poke_insn(pid, kill_stub,     0xAA1F03E0u); // MOV X0,XZR
+                bool p1 = remote_poke_insn(pid, kill_stub + 4, 0xD65F03C0u); // RET
+                if (p0 && p1)
+                    zerr("main: libanogs kill stub @ 0x%lx pre-patched", (unsigned long)kill_stub);
+                else
+                    zerr("main: WARNING libanogs kill stub pre-patch FAILED p0=%d p1=%d", (int)p0, (int)p1);
+
+                // openat SVC stub at 0x3f02b0 — same treatment
+                uintptr_t openat_stub = anogs_base + 0x3f02b0UL;
+                bool q0 = remote_poke_insn(pid, openat_stub,     0xAA1F03E0u);
+                bool q1 = remote_poke_insn(pid, openat_stub + 4, 0xD65F03C0u);
+                zerr("main: libanogs openat stub @ 0x%lx pre-patched q0=%d q1=%d",
+                     (unsigned long)openat_stub, (int)q0, (int)q1);
+
+                // read SVC stub at 0x3f02d0 — same treatment
+                uintptr_t read_stub = anogs_base + 0x3f02d0UL;
+                bool r0 = remote_poke_insn(pid, read_stub,     0xAA1F03E0u);
+                bool r1 = remote_poke_insn(pid, read_stub + 4, 0xD65F03C0u);
+                zerr("main: libanogs read stub @ 0x%lx pre-patched r0=%d r1=%d",
+                     (unsigned long)read_stub, (int)r0, (int)r1);
+
+                // Scanner entry points — NOT pre-patched: silencing them prevents
+                // the crash-trap mechanism from firing, which is the only kill path
+                // our SIGSEGV handler can intercept. Let the scanners run; they will
+                // trigger crash-trap SIGSEGV which the payload handler absorbs.
+                zerr("main: libanogs scanners NOT pre-patched (crash-trap SIGSEGV path preserved)");
+            } else {
+                zerr("main: WARNING libanogs.so not found — kill stub pre-patch skipped");
+            }
+        }
+
         bool ok = remote_dlopen(pid, payload_path);
         thaw_threads();
         ptrace_detach(pid);
+
+        // Wipe the tmp file immediately after injection — payload is now inside
+        // FF's process via memfd. The file on disk is no longer needed and ACE
+        // scans /data/local/tmp for recognisable .so names.
+        if (strstr(payload_path, "/data/local/tmp/")) {
+            unlink(payload_path);
+            zerr("main: tmp staging file removed");
+        }
 
         if (!ok) { ERR("Injection failed"); ProcMem::close(); return 4; }
 
@@ -781,9 +980,10 @@ int main(int argc, char *argv[]) {
         LOG("Payload loaded at 0x%lx", payload_base);
     }
 
-    // Send command to payload via shared memory flag
-    // The payload polls a small control struct it mmap'd at a known offset
-    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, "libzx_payload.so", "__g_sdktbl1");
+    // Send command to payload via shared memory flag.
+    // Locate ctrl struct by scanning for the 16-byte magic tag placed before it
+    // in __g_block (payload.cpp).  No symbol lookup — __g_sdktbl1 is private now.
+    uintptr_t ctrl_addr = ProcMem::findCtrlByMagic(pid);
     if (ctrl_addr) {
         // Write enable (+4) and intensity (+8) before cmd (+0) so the payload never
         // reads a non-zero cmd with stale enable/intensity values (write-ordering fix)
@@ -793,6 +993,45 @@ int main(int argc, char *argv[]) {
         ProcMem::write(ctrl_addr + 8, &intensity_val, sizeof(int));
         ProcMem::write(ctrl_addr,     &cmd,           sizeof(int)); // cmd last as trigger
         LOG("Command sent: cmd=%d enable=%d intensity=%d", cmd, enable_val, intensity_val);
+
+        // Stream payload ring-buffer log → stderr so ZxEngine shows it in the console.
+        // ZxCtrlBlock layout (ctrl_addr = &ctrl.cmd = __g_block + 16):
+        //   ctrl_addr + 0  = ctrl.cmd       (4 bytes)
+        //   ctrl_addr + 4  = ctrl.enable    (4 bytes)
+        //   ctrl_addr + 8  = ctrl.intensity (4 bytes)
+        //   ctrl_addr + 12 = log_wp         (uint32_t monotonic write cursor)
+        //   ctrl_addr + 16 = log_buf        (char[8192] circular ring)
+        constexpr uint32_t LOG_BUF_SZ = 8192;
+        char chunk[LOG_BUF_SZ];
+        uint32_t last_wp = 0;
+        ProcMem::read(ctrl_addr + 12, &last_wp, sizeof(last_wp));
+        zerr("payload-log: start (wp=%u, polling 15s max)", last_wp);
+        int idle = 0;
+        for (int tick = 0; tick < 150; tick++) {    // 150 × 100ms = 15s max
+            usleep(100000);
+            uint32_t cur_wp = 0;
+            if (!ProcMem::read(ctrl_addr + 12, &cur_wp, sizeof(cur_wp))) {
+                zerr("payload-log: process gone");
+                break;
+            }
+            if (cur_wp == last_wp) {
+                // stop after 5s idle once we've been running >3s total
+                if (++idle >= 50 && tick >= 30) { zerr("payload-log: idle stop"); break; }
+                continue;
+            }
+            idle = 0;
+            uint32_t n = cur_wp - last_wp;
+            if (n > LOG_BUF_SZ) n = LOG_BUF_SZ;   // wrapped: read a full buffer's worth
+            ProcMem::read(ctrl_addr + 16, chunk, LOG_BUF_SZ);
+            for (uint32_t i = 0; i < n; i++) {
+                char c = chunk[(last_wp + i) % LOG_BUF_SZ];
+                fputc((c >= 0x20 || c == '\n' || c == '\t') ? c : '\n', stderr);
+            }
+            if (chunk[(last_wp + n - 1) % LOG_BUF_SZ] != '\n') fputc('\n', stderr);
+            fflush(stderr);
+            last_wp = cur_wp;
+        }
+        zerr("payload-log: end (wp=%u)", last_wp);
     }
 
     ProcMem::close();

@@ -14,18 +14,14 @@
  */
 #include "dobby_stub.hpp"
 #include <android/log.h>
+#include "zx_logbuf.hpp"
 #include <dlfcn.h>
 #include <cstring>
 #include <cstdio>
 
 #define TAG "ZX-ANO"
-#ifndef ZX_RELEASE
-#define LOG(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define ERR(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
-#else
-#define LOG(...) ((void)0)
-#define ERR(...) ((void)0)
-#endif
+#define LOG(fmt, ...) LOGBUF_I(TAG, fmt, ##__VA_ARGS__)
+#define ERR(fmt, ...) LOGBUF_E(TAG, fmt, ##__VA_ARGS__)
 
 // Original function pointers
 static int   (*orig_Ioctl)(int,void*,int)            = nullptr;
@@ -55,26 +51,34 @@ static void *hook_InlineCheck(void *a, void *b, int c) {
 
 __attribute__((constructor(101)))
 static void install_ano_bypass() {
+    LOG("install_ano_bypass enter");
     // Try both symbol names in case of version suffix variation
+    // RTLD_NOLOAD only — libanogs.so lives in the game's classloader namespace.
+    // A fresh RTLD_LAZY load into the payload namespace fails with
+    // "undefined symbol: set_inline_hook_error@@ANO" because that namespace
+    // cannot see libanogs.so's deps.  If RTLD_NOLOAD returns NULL the hook
+    // lambda already falls through to DobbySymbolResolver (dl_iterate_phdr
+    // + ELF scan) which finds symbols across namespace boundaries.
     void *h = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
-    if (!h) h = dlopen("libanogs.so", RTLD_LAZY);
-    if (!h) { ERR("libanogs.so not found"); return; }
+    if (!h) dlerror(); // consume RTLD_NOLOAD failure — prevents stale error reaching injector's dlerror read
 
     // Helper: resolve sym, hook if found
     auto hook = [&](const char *sym, void *replacement, void **orig) {
-        void *addr = dlsym(h, sym);
-        if (!addr) {
-            // Try with @@ANO suffix explicitly (some dlopen impls don't strip it)
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%s@@ANO", sym);
-            addr = dlsym(h, buf);
+        void *addr = nullptr;
+        if (h) {
+            addr = dlsym(h, sym);
+            if (!addr) {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "%s@@ANO", sym);
+                addr = dlsym(h, buf);
+            }
         }
-        if (!addr) {
-            // Last resort: DobbySymbolResolver (searches all ELF sections)
-            addr = DobbySymbolResolver("libanogs.so", sym);
-        }
+        // Fallback: ELF scan via dl_iterate_phdr — crosses namespace boundaries
+        if (!addr) addr = DobbySymbolResolver("libanogs.so", sym);
+        LOG("hook %s addr=%p", sym, addr);
         if (addr) DobbyHook(addr, replacement, orig);
         else ERR("sym not found: %s", sym);
+        LOG("hook %s done", sym);
     };
 
     hook("AnoSDKIoctl",          (void*)hook_Ioctl,     (void**)&orig_Ioctl);

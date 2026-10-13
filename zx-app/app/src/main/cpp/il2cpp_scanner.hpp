@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <functional>
 
+struct Il2CppThread;
+
 // Real il2cpp struct layout for Unity 2019+ (confirmed from libil2cpp.so ELF analysis)
 struct FieldInfo {
     const char  *name;
@@ -123,4 +125,10 @@ namespace Il2Cpp {
     Il2CppObject *invoke1(MethodInfo *m, Il2CppObject *obj, void *arg0);
     Il2CppObject *newString(const char *str);
     bool          getFieldBool(Il2CppObject *obj, FieldInfo *field);
+
+    // Thread attachment — MUST be called on any background pthread before
+    // any il2cpp_runtime_invoke call (findObjectsOfType, invoke0, invoke1, newString).
+    // Unattached threads cause GC stack-scan segfaults.
+    Il2CppThread *attachThread();
+    void          detachThread(Il2CppThread *t);
 }
