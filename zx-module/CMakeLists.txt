@@ -17,6 +17,7 @@ add_library(zx_zola SHARED
     zygisk/anosdk_bypass.cpp
     zygisk/memory_guard.cpp
     zygisk/kill_shield.cpp
+    zygisk/dobby_impl.cpp
 )
 
 target_include_directories(zx_zola PRIVATE include)

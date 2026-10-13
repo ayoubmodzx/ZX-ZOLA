@@ -1,0 +1,73 @@
+name: Build Zygisk Module ZIP
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build-module:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install NDK 27.2 and CMake
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "y" | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Build arm64-v8a
+        run: |
+          NDK=$ANDROID_SDK_ROOT/ndk/27.2.12479018
+          cmake -B build-arm64 \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            zx-module
+          cmake --build build-arm64 --target zx_zola -j$(nproc)
+
+      - name: Build armeabi-v7a
+        run: |
+          NDK=$ANDROID_SDK_ROOT/ndk/27.2.12479018
+          cmake -B build-arm32 \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=armeabi-v7a \
+            -DANDROID_PLATFORM=android-26 \
+            -DCMAKE_BUILD_TYPE=Release \
+            zx-module
+          cmake --build build-arm32 --target zx_zola -j$(nproc)
+
+      - name: Package module ZIP
+        run: |
+          mkdir -p module_staging/zygisk
+          cp zx-module/module.prop        module_staging/module.prop
+          cp zx-module/scripts/customize.sh module_staging/customize.sh
+          cp zx-module/scripts/service.sh   module_staging/service.sh
+          cp build-arm64/libzx_zola.so    module_staging/zygisk/arm64-v8a.so
+          cp build-arm32/libzx_zola.so    module_staging/zygisk/armeabi-v7a.so
+          chmod +x module_staging/customize.sh module_staging/service.sh
+          cd module_staging
+          zip -r ../ZX-ZOLA-module.zip .
+          cd ..
+          echo "Module size: $(du -sh ZX-ZOLA-module.zip)"
+
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ZX-ZOLA-module
+          path: ZX-ZOLA-module.zip
+          retention-days: 30
+
+      - name: Create Release (main branch)
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "module-${{ github.run_number }}"
+          name: "ZX-ZOLA Module Build ${{ github.run_number }}"
+          files: ZX-ZOLA-module.zip
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
