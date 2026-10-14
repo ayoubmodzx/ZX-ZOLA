@@ -1,10 +1,11 @@
 #pragma once
-// Zygisk API v5 — mirrors topjohnwu/zygisk-module-sample exactly
+// Zygisk API v4 — broadest compatibility (Magisk 26+, KernelSU+ZygiskNext)
+// API v5 is rejected by ZygiskNext whose ZYGISK_API_VERSION ceiling is 4.
 #include <jni.h>
 #include <cstdint>
 #include <sys/types.h>
 
-#define ZYGISK_API_VERSION 5
+#define ZYGISK_API_VERSION 4
 
 namespace zygisk {
 

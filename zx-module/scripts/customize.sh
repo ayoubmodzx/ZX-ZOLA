@@ -44,7 +44,8 @@ esac
     extract "$ZIPFILE" "zygisk/$ABI64.so" "$MODPATH/zygisk"
 }
 
-[ -n "$ABI32" ] && {
+# ABI32 is optional — only extract if present in the zip (arm64-only build skips this)
+[ -n "$ABI32" ] && unzip -l "$ZIPFILE" "zygisk/$ABI32.so" &>/dev/null && {
     ui_print "- Extracting $ABI32 library"
     extract "$ZIPFILE" "zygisk/$ABI32.so" "$MODPATH/zygisk"
 }
