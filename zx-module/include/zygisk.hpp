@@ -40,7 +40,7 @@ struct ServerSpecializeArgs {
     jlong     &effective_capabilities;
 };
 
-// Forward declarations
+// Forward declarations — must be complete before module_abi ctor body
 class Api;
 class ModuleBase;
 
@@ -68,17 +68,13 @@ struct module_abi {
     void (*preServerSpecialize)(ModuleBase *, ServerSpecializeArgs *);
     void (*postServerSpecialize)(ModuleBase *, const ServerSpecializeArgs *);
 
-    explicit module_abi(ModuleBase *module) : api_version(ZYGISK_API_VERSION), impl(module) {
-        preAppSpecialize     = [](ModuleBase *m, AppSpecializeArgs *a)         { m->preAppSpecialize(a); };
-        postAppSpecialize    = [](ModuleBase *m, const AppSpecializeArgs *a)   { m->postAppSpecialize(a); };
-        preServerSpecialize  = [](ModuleBase *m, ServerSpecializeArgs *a)      { m->preServerSpecialize(a); };
-        postServerSpecialize = [](ModuleBase *m, const ServerSpecializeArgs *a){ m->postServerSpecialize(a); };
-    }
+    // Defined after ModuleBase is complete (see bottom of this namespace block)
+    explicit module_abi(ModuleBase *module);
 };
 
 } // namespace internal
 
-// ── Api ───────────────────────────────────────────────────────────────────────
+// ── Api ── (defined before ModuleBase so ModuleBase can use Api*)
 class Api {
 public:
     internal::api_table *tbl = nullptr;
@@ -121,8 +117,16 @@ public:
     virtual ~ModuleBase() = default;
 };
 
-// ── entry_impl (defined after Api and ModuleBase are complete) ────────────────
+// ── module_abi constructor + entry_impl (ModuleBase now complete) ─────────────
 namespace internal {
+
+inline module_abi::module_abi(ModuleBase *module)
+    : api_version(ZYGISK_API_VERSION), impl(module) {
+    preAppSpecialize     = [](ModuleBase *m, AppSpecializeArgs *a)         { m->preAppSpecialize(a); };
+    postAppSpecialize    = [](ModuleBase *m, const AppSpecializeArgs *a)   { m->postAppSpecialize(a); };
+    preServerSpecialize  = [](ModuleBase *m, ServerSpecializeArgs *a)      { m->preServerSpecialize(a); };
+    postServerSpecialize = [](ModuleBase *m, const ServerSpecializeArgs *a){ m->postServerSpecialize(a); };
+}
 
 template <class T>
 void entry_impl(api_table *table, JNIEnv *env) {
