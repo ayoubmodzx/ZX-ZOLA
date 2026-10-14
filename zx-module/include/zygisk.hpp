@@ -1,10 +1,10 @@
 #pragma once
-// Zygisk API v2 — compatible with Magisk 24.2+ (any Zygisk-capable build)
+// Zygisk API v4 — compatible with Magisk 26.0+ (build 26000+)
 #include <jni.h>
 #include <cstdint>
 #include <sys/types.h>
 
-#define ZYGISK_API_VERSION 2
+#define ZYGISK_API_VERSION 4
 
 namespace zygisk {
 
@@ -42,42 +42,51 @@ struct ServerSpecializeArgs {
 
 class ModuleBase;
 
-// ── Internal ABI — must be fully defined before Api methods use it ─────────
+// ── Internal ABI ──────────────────────────────────────────────────────────────
 namespace internal {
 
-struct api_table {
-    void *_reserved;
-    bool (*registerModule)(api_table *, long *);
-    void (*hookJniNativeMethods)(JNIEnv *, const char *, JNINativeMethod *, int);
-    void (*pltHookRegister)(dev_t, ino_t, const char *, void *, void **);
-    void (*pltHookExclude)(const char *, const char *);
-    bool (*pltHookCommit)();
-    int  (*connectCompanion)(api_table *);
-    void (*setOption)(api_table *, Option);
-};
-
 struct module_abi {
-    long        api_version;  // first field — Magisk reads this to gate compat
-    ModuleBase *module;
+    long        api_version;
+    ModuleBase *impl;
     void (*preAppSpecialize)   (ModuleBase *, AppSpecializeArgs *);
     void (*postAppSpecialize)  (ModuleBase *, const AppSpecializeArgs *);
     void (*preServerSpecialize)(ModuleBase *, ServerSpecializeArgs *);
     void (*postServerSpecialize)(ModuleBase *, const ServerSpecializeArgs *);
 };
 
+// Matches Magisk's internal api_table exactly — field order and types are ABI.
+// impl is an opaque context pointer; pass it as first arg to every callback.
+struct api_table {
+    void    *impl;
+    bool     (*registerModule)(api_table *, module_abi *);
+    void     (*hookJniNativeMethods)(JNIEnv *, const char *, JNINativeMethod *, int);
+    void     (*pltHookRegister)(dev_t, ino_t, const char *, void *, void **);
+    bool     (*exemptFd)(int);
+    bool     (*pltHookCommit)();
+    int      (*connectCompanion)(void *);
+    void     (*setOption)(void *, Option);
+    int      (*getModuleDir)(void *);
+    uint32_t (*getFlags)(void *);
+};
+
 } // namespace internal
 
-// ── Api — wraps api_table*; full definition now safe since api_table complete ─
+// ── Api ───────────────────────────────────────────────────────────────────────
 class Api {
 public:
-    // Public constructor — macro expands outside zygisk namespace, needs access
     explicit Api(internal::api_table *t) : impl(t) {}
 
     void setOption(Option opt) {
-        if (impl && impl->setOption) impl->setOption(impl, opt);
+        if (impl && impl->setOption) impl->setOption(impl->impl, opt);
     }
     int connectCompanion() {
-        return (impl && impl->connectCompanion) ? impl->connectCompanion(impl) : -1;
+        return (impl && impl->connectCompanion) ? impl->connectCompanion(impl->impl) : -1;
+    }
+    int getModuleDir() {
+        return (impl && impl->getModuleDir) ? impl->getModuleDir(impl->impl) : -1;
+    }
+    uint32_t getFlags() {
+        return (impl && impl->getFlags) ? impl->getFlags(impl->impl) : 0u;
     }
     void hookJniNativeMethods(JNIEnv *env, const char *cls,
                               JNINativeMethod *methods, int count) {
@@ -89,9 +98,6 @@ public:
         if (impl && impl->pltHookRegister)
             impl->pltHookRegister(dev, inode, sym, newFn, oldFn);
     }
-    void pltHookExclude(const char *mod, const char *sym) {
-        if (impl && impl->pltHookExclude) impl->pltHookExclude(mod, sym);
-    }
     bool pltHookCommit() {
         return (impl && impl->pltHookCommit) ? impl->pltHookCommit() : false;
     }
@@ -100,7 +106,7 @@ private:
     internal::api_table *impl;
 };
 
-// ── ModuleBase ─────────────────────────────────────────────────────────────
+// ── ModuleBase ────────────────────────────────────────────────────────────────
 class ModuleBase {
 public:
     virtual void onLoad(Api *api, JNIEnv *env)                          {}
@@ -111,8 +117,7 @@ public:
     virtual ~ModuleBase() = default;
 };
 
-// ── Module entry-point macro ───────────────────────────────────────────────
-// Expands in global scope (main.cpp); Api constructor is public for this.
+// ── Entry-point macro ─────────────────────────────────────────────────────────
 #define REGISTER_ZYGISK_MODULE(clazz)                                             \
 extern "C" __attribute__((visibility("default")))                                 \
 void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) {      \
@@ -134,7 +139,7 @@ void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) {     
         },                                                                        \
     };                                                                            \
     static zygisk::Api _api(table);                                               \
-    if (table && table->registerModule && table->registerModule(table, (long *)&_abi)) { \
+    if (table && table->registerModule && table->registerModule(table, &_abi)) { \
         _module.onLoad(&_api, env);                                               \
     }                                                                             \
 }
