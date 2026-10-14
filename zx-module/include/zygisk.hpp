@@ -1,10 +1,10 @@
 #pragma once
-// Zygisk API v5 — compatible with Magisk 26.0+ (build 26000+)
+// Zygisk API v4 — compatible with Magisk 26.0+ / Magisk 30.x stable
 #include <jni.h>
 #include <cstdint>
 #include <sys/types.h>
 
-#define ZYGISK_API_VERSION 5
+#define ZYGISK_API_VERSION 4
 
 namespace zygisk {
 
