@@ -34,8 +34,8 @@ jobs:
             zx-module/include/zygisk.hpp
           echo "OK: header present and contains required symbols"
 
-      # ── Build arm64-v8a ──────────────────────────────────────────────────
-      - name: Build arm64-v8a
+      # ── Configure arm64-v8a (Dobby is fetched during configure) ──────────
+      - name: Configure arm64-v8a
         run: |
           cmake -S zx-module -B build/arm64 \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
@@ -44,10 +44,24 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DANDROID_STL=c++_static \
             -GNinja
-          cmake --build build/arm64 --config Release
 
-      # ── Build armeabi-v7a ────────────────────────────────────────────────
-      - name: Build armeabi-v7a
+      # Dobby master ships macOS Mach-O @PAGE/@PAGEOFF in its ARM64 ASM.
+      # Android NDK clang on Linux (ELF target) rejects those relocations.
+      # Patch the downloaded source file between configure and build.
+      - name: Patch Dobby ARM64 ASM for Linux ELF
+        run: |
+          ASM="build/arm64/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
+          [ -f "$ASM" ] || { echo "ASM file not found — skipping patch"; exit 0; }
+          sed -i 's/common_closure_bridge_handler@PAGEOFF/:lo12:common_closure_bridge_handler/g' "$ASM"
+          sed -i 's/common_closure_bridge_handler@PAGE/common_closure_bridge_handler/g' "$ASM"
+          remaining=$(grep -cE '@PAGE|@PAGEOFF' "$ASM" 2>/dev/null || echo 0)
+          echo "Patch done — remaining @PAGE/@PAGEOFF: $remaining (expect 0)"
+
+      - name: Build arm64-v8a
+        run: cmake --build build/arm64 --config Release
+
+      # ── Configure + build armeabi-v7a ────────────────────────────────────
+      - name: Configure armeabi-v7a
         run: |
           cmake -S zx-module -B build/arm32 \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
@@ -56,7 +70,9 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DANDROID_STL=c++_static \
             -GNinja
-          cmake --build build/arm32 --config Release
+
+      - name: Build armeabi-v7a
+        run: cmake --build build/arm32 --config Release
 
       # ── Verify zygisk_module_entry is exported ───────────────────────────
       - name: Verify symbol export
