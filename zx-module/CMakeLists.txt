@@ -17,13 +17,7 @@ set(DOBBY_DEBUG                            OFF CACHE BOOL "" FORCE)
 set(Plugin.SymbolResolver                  OFF CACHE BOOL "" FORCE)
 set(Plugin.Darwin.HideLibrary              OFF CACHE BOOL "" FORCE)
 set(Plugin.Android.BionicLinkerRestriction OFF CACHE BOOL "" FORCE)
-# Force Dobby to build as STATIC — device has no libdobby.so
-set(DOBBY_GENERATE_SHARED   OFF CACHE BOOL "" FORCE)
-set(DOBBY_BUILD_SHARED      OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS       OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Dobby)
-# Restore so our own target stays SHARED
-set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 
 # Patch macOS-only @PAGE/@PAGEOFF ARM64 ASM relocations → ELF :lo12: syntax.
 # Dobby master ships Mach-O style relocations in the closure bridge ASM; the
@@ -64,5 +58,5 @@ target_compile_options(zx_zola PRIVATE
 target_link_libraries(zx_zola
     log
     dl
-    dobby
+    dobby_static
 )
