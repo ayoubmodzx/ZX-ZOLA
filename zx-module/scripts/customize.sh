@@ -24,8 +24,8 @@ done
 [ "$support" = "false" ] && abort "! Unsupported ABI: $ARCH"
 
 ui_print "- Extracting module files"
-extract "$ZIPFILE" 'module.prop'   "$MODPATH"
-extract "$ZIPFILE" 'service.sh'    "$MODPATH"
+unzip -o -j "$ZIPFILE" 'module.prop' -d "$MODPATH" >&2 || abort "! Failed to extract module.prop"
+unzip -o -j "$ZIPFILE" 'service.sh'  -d "$MODPATH" >&2 || abort "! Failed to extract service.sh"
 
 mkdir -p "$MODPATH/zygisk"
 

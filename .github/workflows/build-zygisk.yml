@@ -146,22 +146,6 @@ jobs:
       - name: Build arm64-v8a
         run: cmake --build build/arm64 --config Release
 
-      # ── Strip banned NEEDED entries (patchelf is the right tool; llvm-objcopy lacks --remove-needed) ──
-      - name: Strip banned NEEDED entries
-        run: |
-          ARM64_SO="build/arm64/libzx_zola.so"
-          sudo apt-get install -y -q patchelf
-          echo "--- NEEDED before strip ---"
-          patchelf --print-needed "$ARM64_SO"
-          for lib in libc++_shared.so libdobby.so libandroid.so; do
-            if patchelf --print-needed "$ARM64_SO" | grep -qF "$lib"; then
-              patchelf --remove-needed "$lib" "$ARM64_SO"
-              echo "Removed $lib from NEEDED"
-            fi
-          done
-          echo "--- NEEDED after strip ---"
-          patchelf --print-needed "$ARM64_SO"
-
       # ── Verify zygisk_module_entry is exported ───────────────────────────
       - name: Verify symbol export
         run: |
@@ -178,7 +162,9 @@ jobs:
 
           echo "--- NEEDED libs (must NOT contain libandroid.so) ---"
           "$READELF" -d "$ARM64_SO" | grep NEEDED
-          BANNED="libandroid.so libdobby.so libc++_shared.so"
+          # libc++_shared.so IS available at runtime via ART APEX on Android 12+
+          # Only libdobby.so (static-linked) and libandroid.so are truly banned
+          BANNED="libandroid.so libdobby.so"
           FAIL=0
           for lib in $BANNED; do
             if "$READELF" -d "$ARM64_SO" | grep NEEDED | grep -q "$lib"; then
