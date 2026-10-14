@@ -526,14 +526,17 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: linker bases unknown — skipping full scan");
     }
 
-    // 56-byte shellcode calling __loader_dlopen(path, flags, fake_caller) directly.
-    // X2 (fake_caller = dlopen_addr = address inside libdl.so) is pre-loaded in regs
-    // before PTRACE_CONT and is NOT touched by __loader_dlopen at entry (only the
-    // wrapper overwrites X2 with X30; __loader_dlopen reads it as its 3rd argument).
+    // 56-byte shellcode calling the libdl.so dlopen() WRAPPER (not __loader_dlopen directly).
+    // Root cause of handle=-4/dlerror="": __loader_dlopen validates X30 (LR at entry) must
+    // point inside libdl.so. Our BLR from anonymous RWX shellcode sets X30 to shellcode addr
+    // → immediate rejection. Fix: call the wrapper via BLR; wrapper does BL __loader_dlopen
+    // which sets X30 = return addr inside libdl.so — caller check passes.
+    // Wrapper also does MOV X2, X30 (overwriting any pre-set X2), so X2 in our regs is
+    // irrelevant; __loader_dlopen gets X2 = return-into-libdl, perfectly legitimate caller.
     //
-    //   [+0 ] LDR X8, #40    — load loader_dlopen_addr from pool at +40
-    //   [+4 ] NOP             — X2 already = dlopen_addr from pre-set regs (fake caller)
-    //   [+8 ] BLR X8          — call __loader_dlopen(X0=path, X1=flags, X2=fake_caller)
+    //   [+0 ] LDR X8, #40    — load dlopen_addr (wrapper) from pool at +40
+    //   [+4 ] NOP             — padding
+    //   [+8 ] BLR X8          — call dlopen(X0=path, X1=flags) → wrapper BL sets LR in libdl
     //   [+12] MOV X19, X0    — save handle (callee-saved)
     //   [+16] LDR X8, #32    — load dlerror_addr from pool at +48
     //   [+20] BLR X8          — call dlerror()
@@ -541,8 +544,8 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     //   [+28] MOV X0, X19    — handle → X0
     //   [+32] BRK #0          — stop
     //   [+36] NOP             — align pool to 8-byte boundary
-    //   [+40] fn_loader_dlopen (8 bytes)
-    //   [+48] fn_dlerror       (8 bytes)
+    //   [+40] fn_dlopen (wrapper, 8 bytes)
+    //   [+48] fn_dlerror      (8 bytes)
     // Test: can FF's process open the staged file? Use a remote openat syscall.
     // AT_FDCWD=-100, O_RDONLY=0
     {
@@ -575,8 +578,8 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     uintptr_t sc_addr = remote_buf + path_aligned;
     struct { uint32_t insns[10]; uint64_t fn_dlopen; uint64_t fn_dlerror; } sc;
     sc.insns[0] = 0x58000148u; // LDR X8, #40  (PC=0, target=40, imm19=10)
-    sc.insns[1] = 0xD503201Fu; // NOP           (X2 = dlopen_addr already set in regs)
-    sc.insns[2] = 0xD63F0100u; // BLR X8        (__loader_dlopen(X0,X1,X2))
+    sc.insns[1] = 0xD503201Fu; // NOP
+    sc.insns[2] = 0xD63F0100u; // BLR X8        (dlopen wrapper; its BL sets LR inside libdl)
     sc.insns[3] = 0xAA0003F3u; // MOV X19, X0   (save handle in callee-saved reg)
     sc.insns[4] = 0x58000108u; // LDR X8, #32   (PC=16, target=48, imm19=8)
     sc.insns[5] = 0xD63F0100u; // BLR X8        (dlerror())
@@ -584,7 +587,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     sc.insns[7] = 0xAA1303E0u; // MOV X0, X19   (handle → X0)
     sc.insns[8] = 0xD4200000u; // BRK #0
     sc.insns[9] = 0xD503201Fu; // NOP            (pool alignment)
-    sc.fn_dlopen  = (uint64_t)loader_dlopen_addr;
+    sc.fn_dlopen  = (uint64_t)dlopen_addr;       // wrapper, NOT loader_dlopen_addr
     sc.fn_dlerror = dlerror_addr ? (uint64_t)dlerror_addr : 0ULL;
 
     if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
