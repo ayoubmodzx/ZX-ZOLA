@@ -162,11 +162,16 @@ jobs:
 
           echo "--- NEEDED libs (must NOT contain libandroid.so) ---"
           "$READELF" -d "$ARM64_SO" | grep NEEDED
-          if "$READELF" -d "$ARM64_SO" | grep NEEDED | grep -q "libandroid.so"; then
-            echo "ERROR: libandroid.so in NEEDED — ZygiskNext linker namespace will reject this"
-            exit 1
-          fi
-          echo "OK: no libandroid.so in NEEDED"
+          BANNED="libandroid.so libdobby.so libc++_shared.so"
+          FAIL=0
+          for lib in $BANNED; do
+            if "$READELF" -d "$ARM64_SO" | grep NEEDED | grep -q "$lib"; then
+              echo "ERROR: $lib in NEEDED — not available in ZygiskNext linker namespace"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" = "1" ] && exit 1
+          echo "OK: no banned libs in NEEDED"
 
       # ── Compute SHA256 for runtime verification ──────────────────────────
       - name: Compute library hashes
