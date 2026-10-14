@@ -189,17 +189,21 @@ jobs:
           [ "$FAIL" = "1" ] && exit 1
           echo "OK: no banned libs in NEEDED"
 
-          # Critical: all C++ symbols must be statically absorbed — zero UND C++ deps allowed
+          # Critical: all C++ symbols from libc++_shared must be statically absorbed.
+          # @LIBC-versioned symbols (__cxa_atexit@LIBC, __cxa_finalize@LIBC) come from
+          # libc.so (always available in every namespace) — exclude them from the check.
           UND_CXX=$("$READELF" --dyn-syms "$ARM64_SO" | grep ' UND ' \
-            | grep -cE '_ZN|__cxa|_Znw|_Zdl|_ZSt|_ZTI|_ZTV' || true)
-          echo "UND C++ symbols: $UND_CXX"
+            | grep -E '_ZN|__cxa|_Znw|_Zdl|_ZSt|_ZTI|_ZTV' \
+            | grep -v '@LIBC' \
+            | wc -l || echo 0)
+          echo "UND C++ symbols (libc++_shared): $UND_CXX"
           if [ "$UND_CXX" -gt "0" ]; then
             echo "ERROR: $UND_CXX UND C++ symbols remain — static absorption incomplete"
             "$READELF" --dyn-syms "$ARM64_SO" | grep ' UND ' \
-              | grep -E '_ZN|__cxa|_Znw|_Zdl|_ZSt|_ZTI|_ZTV' | head -30
+              | grep -E '_ZN|__cxa|_Znw|_Zdl|_ZSt|_ZTI|_ZTV' | grep -v '@LIBC' | head -30
             exit 1
           fi
-          echo "OK: all C++ symbols statically absorbed — zero shared runtime dependency"
+          echo "OK: all C++ runtime symbols statically absorbed — zero libc++_shared dependency"
 
       # ── Compute SHA256 for runtime verification ──────────────────────────
       - name: Compute library hashes
