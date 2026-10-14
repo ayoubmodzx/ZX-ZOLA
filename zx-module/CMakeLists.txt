@@ -68,5 +68,4 @@ target_link_libraries(zx_zola
     log
     dl
     dobby_static
-    c++_static          # absorb static C++ runtime; prevents libc++_shared.so in NEEDED
 )
