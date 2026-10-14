@@ -1,4 +1,5 @@
 #include "il2cpp_scanner.hpp"
+#include "dobby_stub.hpp"
 #include <dlfcn.h>
 #include <cstring>
 #include <android/log.h>
@@ -46,14 +47,18 @@ static Il2CppImage *g_unity  = nullptr;  // UnityEngine.CoreModule
 static std::unordered_map<std::string, Il2CppClass*> g_cls_cache;
 static pthread_mutex_t g_cls_mu = PTHREAD_MUTEX_INITIALIZER;
 
-// ── bind macro ───────────────────────────────────────────────────────────────
+// ── bind macros ───────────────────────────────────────────────────────────────
+// dlsym first; DobbySymbolResolver fallback for stripped exports (e.g. Free Fire).
+// Never return false on miss — payload must survive even with fully stripped il2cpp.
 
 #define BIND(ptr, sym) \
     (ptr) = (__typeof__(ptr))dlsym(h, (sym)); \
-    if (!(ptr)) { ERR("missing: %s", (sym)); return false; }
+    if (!(ptr)) (ptr) = (__typeof__(ptr))DobbySymbolResolver("libil2cpp.so", (sym)); \
+    if (!(ptr)) { ERR("stripped: %s", (sym)); }
 
 #define BIND_OPT(ptr, sym) \
-    (ptr) = (__typeof__(ptr))dlsym(h, (sym));
+    (ptr) = (__typeof__(ptr))dlsym(h, (sym)); \
+    if (!(ptr)) (ptr) = (__typeof__(ptr))DobbySymbolResolver("libil2cpp.so", (sym));
 
 // ── init ─────────────────────────────────────────────────────────────────────
 
@@ -86,11 +91,26 @@ bool Il2Cpp::init() {
     BIND_OPT(p_type_get_object,  "il2cpp_type_get_object")
     BIND_OPT(p_string_new_utf8,  "il2cpp_string_new")
 
+    // Free Fire strips ALL il2cpp_ exports from .dynsym.  DobbySymbolResolver also
+    // fails when both .dynsym and .symtab are stripped.  In that case we keep the
+    // payload alive in degraded mode — injection succeeded; feature hooks remain
+    // dormant until a future sym-scan pass locates them.
+    if (!p_domain_get || !p_domain_assemblies || !p_asm_image) {
+        ERR("il2cpp symbols stripped — payload alive, features degraded");
+        return true;
+    }
+
     Il2CppDomain *dom = p_domain_get();
-    if (!dom) { ERR("il2cpp domain not ready"); return false; }
+    if (!dom) {
+        ERR("il2cpp domain not ready — degraded");
+        return true;
+    }
     size_t n = 0;
     const Il2CppAssembly **asms = p_domain_assemblies(dom, &n);
-    if (!asms) { ERR("no assemblies"); return false; }
+    if (!asms) {
+        ERR("no assemblies — degraded");
+        return true;
+    }
 
     for (size_t i = 0; i < n; i++) {
         Il2CppImage *img = p_asm_image(asms[i]);
@@ -101,8 +121,11 @@ bool Il2Cpp::init() {
         if (!g_unity && strstr(nm, "UnityEngine.CoreModule.dll")) g_unity = img;
         if (g_img && g_unity) break;
     }
-    if (!g_img) { ERR("Assembly-CSharp not found (n=%zu)", n); return false; }
-    LOG("Assembly-CSharp: %p  (%u classes)", g_img, p_image_class_count(g_img));
+    if (!g_img) {
+        ERR("Assembly-CSharp not found (n=%zu) — degraded", n);
+        return true;
+    }
+    LOG("Assembly-CSharp: %p  (%u classes)", g_img, p_image_class_count ? p_image_class_count(g_img) : 0);
     return true;
 }
 
@@ -177,7 +200,6 @@ uint8_t Il2Cpp::fieldTypeId(FieldInfo *f) {
 }
 
 // ── FindObjectOfType shim ─────────────────────────────────────────────────────
-// Calls UnityEngine.Object::FindObjectOfType(Type) which returns first active instance
 
 Il2CppObject *Il2Cpp::findObject(Il2CppClass *klass) {
     if (!klass || !g_unity || !p_class_from_name || !p_method_from_name || !p_runtime_invoke)
@@ -195,10 +217,7 @@ Il2CppObject *Il2Cpp::findObject(Il2CppClass *klass) {
     }
     if (!s_findFn) return nullptr;
 
-    // il2cpp_runtime_invoke requires a Type object for the generic arg
-    // Easier: search all live objects by walking il2cpp GC heap, but that's risky.
-    // Instead we enumerate all classes looking for a singleton pattern (checked caller sets this up).
-    (void)klass;  // caller resolves singleton via static getter method
+    (void)klass;
     return nullptr;
 }
 
@@ -210,7 +229,6 @@ Il2CppObject *Il2Cpp::invoke0(MethodInfo *m, Il2CppObject *obj) {
     return result;
 }
 
-// ── invoke1 ───────────────────────────────────────────────────────────────────
 Il2CppObject *Il2Cpp::invoke1(MethodInfo *m, Il2CppObject *obj, void *arg0) {
     if (!m || !p_runtime_invoke) return nullptr;
     void *exc = nullptr;
@@ -220,13 +238,11 @@ Il2CppObject *Il2Cpp::invoke1(MethodInfo *m, Il2CppObject *obj, void *arg0) {
     return result;
 }
 
-// ── newString ─────────────────────────────────────────────────────────────────
 Il2CppObject *Il2Cpp::newString(const char *str) {
     if (!str || !p_string_new_utf8) return nullptr;
     return p_string_new_utf8(str);
 }
 
-// ── getFieldBool ──────────────────────────────────────────────────────────────
 bool Il2Cpp::getFieldBool(Il2CppObject *obj, FieldInfo *field) {
     if (!obj || !field) return false;
     int32_t off = fieldOffset(field);
@@ -234,8 +250,6 @@ bool Il2Cpp::getFieldBool(Il2CppObject *obj, FieldInfo *field) {
     return readField<bool>(obj, off);
 }
 
-// ── findObjectsOfType ─────────────────────────────────────────────────────────
-// Calls UnityEngine.Object::FindObjectsOfType(Type); caller must free(*arr).
 void Il2Cpp::findObjectsOfType(Il2CppClass *klass, Il2CppObject ***arr, int *count) {
     *arr   = nullptr;
     *count = 0;
@@ -259,7 +273,6 @@ void Il2Cpp::findObjectsOfType(Il2CppClass *klass, Il2CppObject ***arr, int *cou
     Il2CppObject *res       = p_runtime_invoke(s_findFn, nullptr, params, &exc);
     if (exc || !res) return;
 
-    // Il2CppArray: Il2CppObject hdr (16B) | void* bounds (8B) | uintptr_t max_length (8B) | data
     struct Array {
         Il2CppObject hdr;
         void        *bounds;
@@ -278,8 +291,6 @@ void Il2Cpp::findObjectsOfType(Il2CppClass *klass, Il2CppObject ***arr, int *cou
     *count = n;
 }
 
-// ── getLocalInstance ──────────────────────────────────────────────────────────
-// Tries IsLocalPlayer field; falls back to first valid instance.
 Il2CppObject *Il2Cpp::getLocalInstance(Il2CppClass *klass) {
     Il2CppObject **arr   = nullptr;
     int            count = 0;
