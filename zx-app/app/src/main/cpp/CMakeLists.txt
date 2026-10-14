@@ -8,7 +8,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3 -flto -fvisibility=hidden -ffunction-sections -
 set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--strip-all")
 set(CMAKE_EXE_LINKER_FLAGS    "-pie -Wl,--gc-sections -Wl,--strip-all")
 
-# ── Payload .so — dlopen'd into FF address space ──────────────────────────────
+# ── Payload .so — dlopen'd into FF address space ────────────────────────────────────────────
 add_library(zx_payload SHARED
     payload.cpp
     features.cpp
@@ -26,8 +26,15 @@ add_library(zx_payload SHARED
 )
 target_include_directories(zx_payload PRIVATE .)
 target_link_libraries(zx_payload log dl GLESv3 EGL)
+# libc++_shared.so is NOT in FF's classloader-namespace so dlopen fails.
+# Statically bundle the C++ runtime into the .so to make it self-contained.
+target_link_options(zx_payload PRIVATE
+    -nostdlib++
+    -l:libc++_static.a
+    -l:libc++abi.a
+)
 
-# ── Standalone root injector binary ──────────────────────────────────────────
+# ── Standalone root injector binary ────────────────────────────────────────────
 add_executable(zx_injector
     injector.cpp
     proc_mem.cpp
