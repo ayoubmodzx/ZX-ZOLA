@@ -16,6 +16,7 @@ import com.google.android.material.slider.Slider
 import com.google.android.material.switchmaterial.SwitchMaterial
 import android.widget.Button
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -25,6 +26,12 @@ class MainActivity : AppCompatActivity() {
     private val handler = Handler(Looper.getMainLooper())
     private var isActive = false
     private var isFabOn  = false
+    private var modulePollingActive = false
+
+    companion object {
+        private const val MODULE_ID = "zx_zola_v2"
+        private const val UNLOADED_MARKER = "/data/adb/modules/$MODULE_ID/zygisk/unloaded"
+    }
 
     // Feature switch → Cmd constant mapping (standard features)
     private val featureMap = mapOf(
@@ -57,6 +64,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         ZxEngine.init(this)
+        startModulePolling()
 
         val activateBtn   = findViewById<Button>(R.id.btn_activate)
         val stopBtn       = findViewById<Button>(R.id.btn_stop)
@@ -252,6 +260,53 @@ class MainActivity : AppCompatActivity() {
     override fun onActivityResult(req: Int, res: Int, data: Intent?) {
         super.onActivityResult(req, res, data)
         if (req == OVERLAY_REQ && Settings.canDrawOverlays(this)) startFg()
+    }
+
+    // Returns true if module is loaded (unloaded marker absent) via su
+    private suspend fun isZygiskModuleLoaded(): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c",
+                "test ! -f $UNLOADED_MARKER && echo 1 || echo 0"))
+            val out = proc.inputStream.bufferedReader().readText().trim()
+            proc.waitFor()
+            out == "1"
+        } catch (e: Exception) { false }
+    }
+
+    private fun setModuleStatus(loaded: Boolean) {
+        val card   = findViewById<View>(R.id.card_module_status) ?: return
+        val dot    = findViewById<View>(R.id.dot_module) ?: return
+        val tv     = findViewById<TextView>(R.id.tv_module_status) ?: return
+        val tvSub  = findViewById<TextView>(R.id.tv_module_sub) ?: return
+        if (loaded) {
+            card.setBackgroundResource(R.drawable.bg_status_active)
+            dot.setBackgroundColor(getColor(R.color.zx_purple))
+            tv.text = "MODULE ACTIVE"
+            tv.setTextColor(getColor(R.color.zx_purple))
+            tvSub.text = "Zygisk OK"
+        } else {
+            card.setBackgroundResource(R.drawable.bg_status_error)
+            dot.setBackgroundColor(0xFFC0392B.toInt())
+            tv.text = "MODULE NOT FOUND"
+            tv.setTextColor(0xFFC0392B.toInt())
+            tvSub.text = "Zygisk?"
+        }
+    }
+
+    private fun startModulePolling() {
+        modulePollingActive = true
+        lifecycleScope.launch {
+            while (modulePollingActive) {
+                val loaded = isZygiskModuleLoaded()
+                withContext(Dispatchers.Main) { setModuleStatus(loaded) }
+                delay(5000)
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        modulePollingActive = false
     }
 
     private fun startFg() = ContextCompat.startForegroundService(

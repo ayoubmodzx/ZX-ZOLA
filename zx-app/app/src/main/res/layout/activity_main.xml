@@ -124,6 +124,45 @@
                     android:layout_height="wrap_content"/>
             </LinearLayout>
 
+            <!-- ── ZYGISK MODULE STATUS ── -->
+            <LinearLayout
+                android:id="@+id/card_module_status"
+                android:layout_width="match_parent"
+                android:layout_height="56dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:paddingStart="20dp"
+                android:paddingEnd="20dp"
+                android:background="@drawable/bg_status_inactive"
+                android:layout_marginBottom="16dp">
+
+                <View
+                    android:id="@+id/dot_module"
+                    android:layout_width="8dp"
+                    android:layout_height="8dp"
+                    android:background="#2D2D42"
+                    android:layout_marginEnd="12dp"/>
+
+                <TextView
+                    android:id="@+id/tv_module_status"
+                    android:text="MODULE NOT FOUND"
+                    android:textColor="@color/zx_text_dim"
+                    android:textSize="13sp"
+                    android:textStyle="bold"
+                    android:letterSpacing="0.2"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"/>
+
+                <TextView
+                    android:id="@+id/tv_module_sub"
+                    android:text="Zygisk?"
+                    android:textColor="@color/zx_text_muted"
+                    android:textSize="11sp"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"/>
+            </LinearLayout>
+
             <!-- ── CONTROL BUTTONS ── -->
             <LinearLayout
                 android:layout_width="match_parent"
