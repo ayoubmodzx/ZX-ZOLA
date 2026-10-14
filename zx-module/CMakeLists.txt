@@ -19,6 +19,15 @@ set(Plugin.Darwin.HideLibrary              OFF CACHE BOOL "" FORCE)
 set(Plugin.Android.BionicLinkerRestriction OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Dobby)
 
+# dobby_static carries libc++_shared in its INTERFACE_LINK_LIBRARIES on Android.
+# Clearing it prevents libc++_shared.so from appearing in our NEEDED list.
+# C++ symbols are still resolved from libc++_static (absorbed via ANDROID_STL=c++_static).
+foreach(_t dobby_static dobby)
+    if(TARGET ${_t})
+        set_property(TARGET ${_t} PROPERTY INTERFACE_LINK_LIBRARIES "")
+    endif()
+endforeach()
+
 # Patch macOS-only @PAGE/@PAGEOFF ARM64 ASM relocations → ELF :lo12: syntax.
 # Dobby master ships Mach-O style relocations in the closure bridge ASM; the
 # Android NDK clang (Linux host, ELF target) rejects them at assemble time.
@@ -59,4 +68,15 @@ target_link_libraries(zx_zola
     log
     dl
     dobby_static
+    c++_static          # absorb static C++ runtime; prevents libc++_shared.so in NEEDED
+)
+
+# Safety net: strip any banned NEEDED entries that slipped through
+get_filename_component(_ndk_bin "${CMAKE_C_COMPILER}" DIRECTORY)
+add_custom_command(TARGET zx_zola POST_BUILD
+    COMMAND "${_ndk_bin}/llvm-objcopy"
+        --remove-needed=libc++_shared.so
+        --remove-needed=libdobby.so
+        $<TARGET_FILE:zx_zola>
+    COMMENT "Stripping banned NEEDED entries from libzx_zola.so"
 )
