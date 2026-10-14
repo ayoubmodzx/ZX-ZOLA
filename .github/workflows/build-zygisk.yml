@@ -216,6 +216,29 @@ jobs:
                   c = c.replace('a.start < b.start', 'a.start() < b.start()')
                   with open(pr_cc, 'w') as f: f.write(c)
                   print("[ProcessRuntime.cc] arm32 patched")
+
+          # CodeMemBuffer.h: ARM32 build uses arm_inst_t/thumb1_inst_t/thumb2_inst_t
+          # which are no longer forward-declared before this header in master.
+          code_buf_h = f"{DOBBY}/source/MemoryAllocator/CodeMemBuffer.h"
+          if os.path.exists(code_buf_h):
+              with open(code_buf_h) as f: c = f.read()
+              if 'arm_inst_t' in c and 'typedef uint32_t arm_inst_t' not in c:
+                  prefix = (
+                      '#ifndef DOBBY_ARM_INST_TYPES\n'
+                      '#define DOBBY_ARM_INST_TYPES\n'
+                      '#include <stdint.h>\n'
+                      'typedef uint32_t  arm_inst_t;\n'
+                      'typedef uint16_t  thumb1_inst_t;\n'
+                      'typedef uint32_t  thumb2_inst_t;\n'
+                      '#endif\n'
+                  )
+                  c = prefix + c
+                  with open(code_buf_h, 'w') as f: f.write(c)
+                  print("[CodeMemBuffer.h] arm32 patched: added ARM inst type aliases")
+              else:
+                  print("[CodeMemBuffer.h] arm32 types already present, skip")
+          else:
+              print(f"[CodeMemBuffer.h] not found — skip")
           PYEOF
 
       - name: Build armeabi-v7a
