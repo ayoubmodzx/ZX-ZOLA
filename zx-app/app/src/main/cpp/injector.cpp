@@ -742,7 +742,7 @@ int main(int argc, char *argv[]) {
         // /data/local/tmp/ (shell_data_file context) is accessible to any process.
         {
             char tmp_path[256];
-            snprintf(tmp_path, sizeof(tmp_path), "/data/local/tmp/zxpl_%d.so", pid);
+            snprintf(tmp_path, sizeof(tmp_path), "/data/local/tmp/libzx_payload.so");
             int fi = open(payload_path, O_RDONLY);
             if (fi >= 0) {
                 int fo = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);

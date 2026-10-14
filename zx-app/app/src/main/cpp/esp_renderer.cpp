@@ -51,7 +51,7 @@ struct Color { float r, g, b, a; };
 using FnGLBegin   = void(*)(int mode);
 using FnGLEnd     = void(*)();
 using FnGLVertex3 = void(*)(float x, float y, float z);
-using FnGLColor   = void(*)(Color* c);
+using FnGLColor   = void(*)(float r, float g, float b, float a);
 using FnGLPush    = void(*)();
 using FnGLPop     = void(*)();
 using FnGLLoadOrtho = void(*)();
@@ -186,7 +186,7 @@ static void draw_line_neon(Vec2 a, Vec2 b, Color col) {
 
     for (int p = 0; p < 3; p++) {
         Color c = { col.r, col.g, col.b, col.a * alphas[p] };
-        g_glColor(&c);
+        g_glColor(c.r, c.g, c.b, c.a);
         g_glBegin(UNITY_GL_LINES);
         g_glVertex3(an.x, an.y, 0.f);
         g_glVertex3(bn.x, bn.y, 0.f);
@@ -284,8 +284,8 @@ static void gl_restore(const GlSave &s) {
     if (s.blend)      glEnable(GL_BLEND);      else glDisable(GL_BLEND);
     glBlendFunc((GLenum)s.blend_src, (GLenum)s.blend_dst);
     glLineWidth(s.line_width);
-    glBindVertexArray(s.vao);
-    glUseProgram(s.program);
+    // Do NOT restore VAO/program with raw GL — Unity manages these through its own
+    // state machine; bypassing it corrupts the renderer on the next draw call.
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -397,7 +397,7 @@ static const char *k_rft_names[]   = { "RightFoot","r_foot","Bip001 R Foot","mix
 static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
     if (!transform) return nullptr;
     MethodInfo *findM = Il2Cpp::getMethod(
-        Il2Cpp::cls("Transform"), "Find", 1);
+        Il2Cpp::cls("Transform", "UnityEngine"), "Find", 1);
     if (!findM || !findM->methodPointer) return nullptr;
 
     for (int i = 0; names[i]; i++) {
@@ -411,7 +411,7 @@ static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
 
 static Vec3 get_position(Il2CppObject *transform) {
     Vec3 pos{};
-    MethodInfo *m = Il2Cpp::getMethod(Il2Cpp::cls("Transform"), "get_position", 0);
+    MethodInfo *m = Il2Cpp::getMethod(Il2Cpp::cls("Transform", "UnityEngine"), "get_position", 0);
     if (!m || !m->methodPointer) return pos;
     // invoke0 returns a boxed Vector3; unbox by skipping the 16-byte Il2CppObject header
     Il2CppObject *boxed = Il2Cpp::invoke0(m, transform);
@@ -427,7 +427,7 @@ static float dist3(Vec3 a, Vec3 b) {
 // Find local player's position (to compute distances)
 static Vec3 get_local_pos() {
     if (!g_local_player) return {};
-    MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component"), "get_transform", 0);
+    MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component", "UnityEngine"), "get_transform", 0);
     if (!getT || !getT->methodPointer) return {};
     Il2CppObject *tr = Il2Cpp::invoke0(getT, (Il2CppObject*)g_local_player);
     if (!tr) return {};
@@ -444,7 +444,7 @@ static void *position_updater(void *) {
         return nullptr;
     }
 
-    MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component"), "get_transform", 0);
+    MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component", "UnityEngine"), "get_transform", 0);
 
     while (true) {
         usleep(50000); // 50ms — smooth update, no CPU burn
@@ -606,7 +606,7 @@ void ESP::init() {
        g_glBegin, g_glEnd, g_glVertex3, g_w2s, g_w2s_v2);
 
     // Hook Camera.OnPostRender
-    Il2CppClass *camCls = Il2Cpp::cls("Camera");
+    Il2CppClass *camCls = Il2Cpp::cls("Camera", "UnityEngine");
     if (camCls) {
         MethodInfo *opr = Il2Cpp::getMethod(camCls, "OnPostRender", 0);
         if (opr && opr->methodPointer) {
