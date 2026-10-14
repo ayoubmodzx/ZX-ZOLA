@@ -47,15 +47,33 @@ jobs:
 
       # Dobby master ships macOS Mach-O @PAGE/@PAGEOFF in its ARM64 ASM.
       # Android NDK clang on Linux (ELF target) rejects those relocations.
-      # Patch the downloaded source file between configure and build.
+      # Use Python regex to patch: any symbol@PAGEOFF → :lo12:symbol,
+      # any symbol@PAGE → symbol. Prints exact matching lines for diagnostics.
       - name: Patch Dobby ARM64 ASM for Linux ELF
         run: |
-          ASM="build/arm64/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
-          [ -f "$ASM" ] || { echo "ASM file not found — skipping patch"; exit 0; }
-          sed -i 's/common_closure_bridge_handler@PAGEOFF/:lo12:common_closure_bridge_handler/g' "$ASM"
-          sed -i 's/common_closure_bridge_handler@PAGE/common_closure_bridge_handler/g' "$ASM"
-          remaining=$(grep -cE '@PAGE|@PAGEOFF' "$ASM" 2>/dev/null || echo 0)
-          echo "Patch done — remaining @PAGE/@PAGEOFF: $remaining (expect 0)"
+          python3 << 'PYEOF'
+          import re, sys, os
+          asm = "build/arm64/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
+          if not os.path.exists(asm):
+              print("ASM not found — skip"); sys.exit(0)
+          with open(asm) as f:
+              content = f.read()
+          print(f"File: {asm}  ({len(content)} bytes)")
+          hits = [(i+1, l) for i,l in enumerate(content.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+          print(f"Lines with @PAGE/@PAGEOFF before patch: {len(hits)}")
+          for n, l in hits:
+              print(f"  {n}: {repr(l)}")
+          patched = re.sub(r'(\w+)@PAGEOFF', r':lo12:\1', content)
+          patched = re.sub(r'(\w+)@PAGE\b', r'\1', patched)
+          with open(asm, 'w') as f:
+              f.write(patched)
+          after = [(i+1, l) for i,l in enumerate(patched.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+          print(f"Remaining after patch: {len(after)}  (expect 0)")
+          for n, l in after:
+              print(f"  {n}: {repr(l)}")
+          if after:
+              sys.exit(1)
+          PYEOF
 
       - name: Build arm64-v8a
         run: cmake --build build/arm64 --config Release
