@@ -35,7 +35,7 @@ endif()
 
 # ── Global flags ──────────────────────────────────────────────────────────────
 set(CMAKE_CXX_FLAGS_RELEASE   "-O2 -ffunction-sections -fdata-sections")
-set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--strip-all -Wl,-z,relro,-z,now")
+set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed -Wl,--strip-all -Wl,-z,relro,-z,now")
 
 add_library(zx_zola SHARED
     zygisk/main.cpp
@@ -56,7 +56,6 @@ target_compile_options(zx_zola PRIVATE
 )
 
 target_link_libraries(zx_zola
-    android
     log
     dl
     dobby

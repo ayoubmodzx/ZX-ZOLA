@@ -150,14 +150,23 @@ jobs:
       - name: Verify symbol export
         run: |
           ARM64_SO="build/arm64/libzx_zola.so"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          NM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
 
-          if ! "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-                -D "$ARM64_SO" 2>/dev/null | grep -q "zygisk_module_entry"; then
+          if ! "$NM" -D "$ARM64_SO" 2>/dev/null | grep -q "zygisk_module_entry"; then
             echo "ERROR: zygisk_module_entry not exported in $ARM64_SO"
-            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D "$ARM64_SO" || true
+            "$NM" -D "$ARM64_SO" || true
             exit 1
           fi
           echo "OK: zygisk_module_entry found in $ARM64_SO"
+
+          echo "--- NEEDED libs (must NOT contain libandroid.so) ---"
+          "$READELF" -d "$ARM64_SO" | grep NEEDED
+          if "$READELF" -d "$ARM64_SO" | grep NEEDED | grep -q "libandroid.so"; then
+            echo "ERROR: libandroid.so in NEEDED — ZygiskNext linker namespace will reject this"
+            exit 1
+          fi
+          echo "OK: no libandroid.so in NEEDED"
 
       # ── Compute SHA256 for runtime verification ──────────────────────────
       - name: Compute library hashes
