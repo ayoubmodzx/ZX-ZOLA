@@ -146,178 +146,26 @@ jobs:
       - name: Build arm64-v8a
         run: cmake --build build/arm64 --config Release
 
-      # ── Configure + build armeabi-v7a ────────────────────────────────────
-      - name: Configure armeabi-v7a
-        run: |
-          cmake -S zx-module -B build/arm32 \
-            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI=armeabi-v7a \
-            -DANDROID_PLATFORM=android-28 \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DANDROID_STL=c++_static \
-            -GNinja
-
-      - name: Patch Dobby ARM32 (C++ NDK compat)
-        run: |
-          python3 << 'PYEOF'
-          import re, os
-
-          DOBBY = "build/arm32/_deps/dobby-src"
-
-          # os_arch_features.h
-          feat_h = f"{DOBBY}/common/os_arch_features.h"
-          if os.path.exists(feat_h):
-              with open(feat_h) as f: c = f.read()
-              if 'OSMemory' in c:
-                  c = '#include <unistd.h>\n#include <sys/mman.h>\n' + c
-                  c = c.replace('OSMemory::PageSize()', 'getpagesize()')
-                  c = re.sub(
-                      r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
-                      r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)', c)
-                  with open(feat_h, 'w') as f: f.write(c)
-                  print("[C++] arm32 os_arch_features.h patched")
-
-          # core/arch/Cpu.h stub
-          for cpu_dir in [f"{DOBBY}/core/arch", f"{DOBBY}/source/core/arch"]:
-              cpu_h = f"{cpu_dir}/Cpu.h"
-              if not os.path.exists(cpu_h):
-                  os.makedirs(cpu_dir, exist_ok=True)
-                  with open(cpu_h, 'w') as f:
-                      f.write('#pragma once\n#include <stddef.h>\n'
-                              'struct Cpu {\n'
-                              '  static void FlushCache(void* s, size_t n) {\n'
-                              '    __builtin___clear_cache((char*)s, (char*)s + n);\n'
-                              '  }\n'
-                              '  static void FlushCache(void* s, void* e) {\n'
-                              '    __builtin___clear_cache((char*)s, (char*)e);\n'
-                              '  }\n'
-                              '};\n')
-                  print(f"[Cpu.h] arm32 stub at {cpu_h}")
-
-          # ProcessRuntime.h
-          for rt_h in [
-              f"{DOBBY}/source/PlatformUtil/ProcessRuntime.h",
-              f"{DOBBY}/source/Backend/UserMode/PlatformUtil/ProcessRuntime.h",
-          ]:
-              if os.path.exists(rt_h):
-                  with open(rt_h) as f: c = f.read()
-                  if 'RuntimeModule' in c and 'load_address' not in c:
-                      c = re.sub(r'(struct RuntimeModule\s*\{)',
-                                 r'\1\n  void* load_address = nullptr;', c)
-                      with open(rt_h, 'w') as f: f.write(c)
-                      print("[ProcessRuntime.h] arm32 patched")
-                  break
-
-          # ProcessRuntime.cc
-          pr_cc = f"{DOBBY}/source/Backend/UserMode/PlatformUtil/Linux/ProcessRuntime.cc"
-          if os.path.exists(pr_cc):
-              with open(pr_cc) as f: c = f.read()
-              if 'a.start < b.start' in c:
-                  c = c.replace('a.start < b.start', 'a.start() < b.start()')
-                  with open(pr_cc, 'w') as f: f.write(c)
-                  print("[ProcessRuntime.cc] arm32 patched")
-
-          # CodeMemBuffer.h: ARM32 build uses arm_inst_t/thumb1_inst_t/thumb2_inst_t
-          # which are no longer forward-declared before this header in master.
-          code_buf_h = f"{DOBBY}/source/MemoryAllocator/CodeMemBuffer.h"
-          if os.path.exists(code_buf_h):
-              with open(code_buf_h) as f: c = f.read()
-              if 'arm_inst_t' in c and 'typedef uint32_t arm_inst_t' not in c:
-                  prefix = (
-                      '#ifndef DOBBY_ARM_INST_TYPES\n'
-                      '#define DOBBY_ARM_INST_TYPES\n'
-                      '#include <stdint.h>\n'
-                      'typedef uint32_t  arm_inst_t;\n'
-                      'typedef uint16_t  thumb1_inst_t;\n'
-                      'typedef uint32_t  thumb2_inst_t;\n'
-                      '#endif\n'
-                  )
-                  c = prefix + c
-                  with open(code_buf_h, 'w') as f: f.write(c)
-                  print("[CodeMemBuffer.h] arm32 patched: added ARM inst type aliases")
-              else:
-                  print("[CodeMemBuffer.h] arm32 types already present, skip")
-          else:
-              print(f"[CodeMemBuffer.h] not found — skip")
-
-          # registers-arm.h: two regressions in master
-          reg_h = f"{DOBBY}/source/core/arch/arm/registers-arm.h"
-          if os.path.exists(reg_h):
-              with open(reg_h) as f: c = f.read()
-              changed = False
-              # 1. RegisterBase class undefined — inject minimal definition before Register
-              if 'class Register' in c and 'class RegisterBase' not in c:
-                  rb = (
-                      'class RegisterBase {\npublic:\n'
-                      '  explicit RegisterBase(int code) : reg_id(code) {}\n'
-                      '  int reg_id;\n};\n'
-                  )
-                  c = re.sub(r'(?=\bclass Register\b)', rb, c, count=1)
-                  changed = True
-                  print("[registers-arm.h] arm32: injected RegisterBase class")
-              # 2. Fix DECLARE_REGISTER macro ONLY — not the constructor definition
-              new_c = re.sub(
-                  r'(#define DECLARE_REGISTER\([^)]*\)\s*)constexpr\s+(Register\s)',
-                  r'\1const \2',
-                  c
-              )
-              if new_c != c:
-                  c = new_c
-                  changed = True
-                  print("[registers-arm.h] arm32: DECLARE_REGISTER constexpr → const")
-              if changed:
-                  with open(reg_h, 'w') as f: f.write(c)
-          else:
-              print(f"[registers-arm.h] not found — skip")
-
-          # code_buffer_arm.h: required by assembler-arm.h inside TARGET_ARCH_ARM guard
-          # but removed in Dobby master. Create minimal stub.
-          code_buf_arm_dir = f"{DOBBY}/source/MemoryAllocator/CodeBuffer"
-          os.makedirs(code_buf_arm_dir, exist_ok=True)
-          code_buf_arm_h = f"{code_buf_arm_dir}/code_buffer_arm.h"
-          if not os.path.exists(code_buf_arm_h):
-              with open(code_buf_arm_h, 'w') as f:
-                  f.write(
-                      '#pragma once\n'
-                      '// stub: ARM32 code buffer — merged into CodeMemBuffer.h in master\n'
-                      '#include "../CodeMemBuffer.h"\n'
-                  )
-              print(f"[code_buffer_arm.h] created stub at {code_buf_arm_h}")
-          PYEOF
-
-      - name: Build armeabi-v7a
-        run: cmake --build build/arm32 --config Release
-
       # ── Verify zygisk_module_entry is exported ───────────────────────────
       - name: Verify symbol export
         run: |
           ARM64_SO="build/arm64/libzx_zola.so"
-          ARM32_SO="build/arm32/libzx_zola.so"
 
-          check_sym() {
-            local so="$1"
-            if ! "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
-                  -D "$so" 2>/dev/null | grep -q "zygisk_module_entry"; then
-              echo "ERROR: zygisk_module_entry not exported in $so"
-              "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D "$so" || true
-              exit 1
-            fi
-            echo "OK: zygisk_module_entry found in $so"
-          }
-
-          check_sym "$ARM64_SO"
-          check_sym "$ARM32_SO"
+          if ! "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" \
+                -D "$ARM64_SO" 2>/dev/null | grep -q "zygisk_module_entry"; then
+            echo "ERROR: zygisk_module_entry not exported in $ARM64_SO"
+            "$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" -D "$ARM64_SO" || true
+            exit 1
+          fi
+          echo "OK: zygisk_module_entry found in $ARM64_SO"
 
       # ── Compute SHA256 for runtime verification ──────────────────────────
       - name: Compute library hashes
         id: hashes
         run: |
           ARM64_HASH=$(sha256sum build/arm64/libzx_zola.so | awk '{print $1}')
-          ARM32_HASH=$(sha256sum build/arm32/libzx_zola.so | awk '{print $1}')
           echo "arm64=$ARM64_HASH" >> "$GITHUB_OUTPUT"
-          echo "arm32=$ARM32_HASH" >> "$GITHUB_OUTPUT"
           echo "arm64 SHA256: $ARM64_HASH"
-          echo "arm32 SHA256: $ARM32_HASH"
 
       # ── Stage module ZIP contents ────────────────────────────────────────
       - name: Stage module structure
@@ -335,9 +183,8 @@ jobs:
           cp zx-module/scripts/customize.sh  "$STAGE/customize.sh"
           cp zx-module/scripts/service.sh    "$STAGE/service.sh"
 
-          # Native libraries (Zygisk expects <abi>.so names)
+          # Native library (Zygisk arm64-v8a only — Free Fire is 64-bit on modern Android)
           cp build/arm64/libzx_zola.so       "$STAGE/zygisk/arm64-v8a.so"
-          cp build/arm32/libzx_zola.so       "$STAGE/zygisk/armeabi-v7a.so"
 
           chmod 755 "$STAGE/META-INF/com/google/android/update-binary"
           chmod 755 "$STAGE/customize.sh"
@@ -377,7 +224,6 @@ jobs:
             ## ZX-ZOLA Zygisk Module
 
             **arm64-v8a SHA256:** `${{ steps.hashes.outputs.arm64 }}`
-            **armeabi-v7a SHA256:** `${{ steps.hashes.outputs.arm32 }}`
 
             ### Install
             Flash in Magisk or KernelSU → reboot → hide root + Zygisk.
