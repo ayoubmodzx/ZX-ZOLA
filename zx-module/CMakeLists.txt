@@ -70,13 +70,3 @@ target_link_libraries(zx_zola
     dobby_static
     c++_static          # absorb static C++ runtime; prevents libc++_shared.so in NEEDED
 )
-
-# Safety net: strip any banned NEEDED entries that slipped through
-get_filename_component(_ndk_bin "${CMAKE_C_COMPILER}" DIRECTORY)
-add_custom_command(TARGET zx_zola POST_BUILD
-    COMMAND "${_ndk_bin}/llvm-objcopy"
-        --remove-needed=libc++_shared.so
-        --remove-needed=libdobby.so
-        $<TARGET_FILE:zx_zola>
-    COMMENT "Stripping banned NEEDED entries from libzx_zola.so"
-)
