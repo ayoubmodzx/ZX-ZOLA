@@ -491,12 +491,20 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         if (!dlerror_addr) dlerror_addr = ProcMem::findSymbol(pid, "libc.so", "dlerror");
     }
     if (!dlopen_addr) { zerr("remote_dlopen: no dlopen address found"); return false; }
-    // Dump first 4 instructions at dlopen_addr to confirm we have a real function
+    // Dump 8 instructions at dlopen_addr and verify it's the 4-insn libdl wrapper.
+    // Wrapper fingerprint: insn[2] == MOV X2,X30 == 0xAA1E03E2
+    // If missing, we have the wrong address and BL inside it won't set LR in libdl.
     {
-        uint32_t insns[4] = {};
+        uint32_t insns[8] = {};
         ProcMem::read(dlopen_addr, insns, sizeof(insns));
-        zerr("remote_dlopen: dlopen@0x%lx bytes: %08x %08x %08x %08x",
-             (unsigned long)dlopen_addr, insns[0], insns[1], insns[2], insns[3]);
+        zerr("remote_dlopen: dlopen@0x%lx: %08x %08x %08x %08x %08x %08x %08x %08x",
+             (unsigned long)dlopen_addr,
+             insns[0],insns[1],insns[2],insns[3],insns[4],insns[5],insns[6],insns[7]);
+        bool is_wrapper = (insns[2] == 0xAA1E03E2u); // MOV X2,X30
+        zerr("remote_dlopen: is_libdl_wrapper=%d (insn[2]=0x%08x, need 0xaa1e03e2)",
+             is_wrapper, insns[2]);
+        if (!is_wrapper)
+            zerr("remote_dlopen: WARNING — dlopen_addr is NOT the wrapper; LR check will still fail");
     }
     zerr("remote_dlopen: dlopen=0x%lx dlerror=0x%lx path=%s",
          (unsigned long)dlopen_addr, (unsigned long)dlerror_addr, so_path);
@@ -593,6 +601,17 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
         zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
     }
+    // Readback: confirm shellcode landed correctly in remote memory
+    {
+        struct { uint32_t insns[10]; uint64_t fn_dlopen; uint64_t fn_dlerror; } rb = {};
+        ProcMem::read(sc_addr, &rb, sizeof(rb));
+        zerr("remote_dlopen: sc_readback fn_dlopen=0x%lx fn_dlerror=0x%lx",
+             (unsigned long)rb.fn_dlopen, (unsigned long)rb.fn_dlerror);
+        zerr("remote_dlopen: sc_readback insns: %08x %08x %08x %08x %08x",
+             rb.insns[0],rb.insns[1],rb.insns[2],rb.insns[3],rb.insns[4]);
+        zerr("remote_dlopen: sc_addr=0x%lx brk_expected_at=0x%lx",
+             (unsigned long)sc_addr, (unsigned long)(sc_addr + 32));
+    }
 
     pt_regs orig, regs;
     get_regs(pid, &orig);
@@ -632,6 +651,21 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
     int status;
     waitpid(pid, &status, 0);
+    // Dump stop state immediately — before re-hooking clobbers anything.
+    {
+        pt_regs sr; get_regs(pid, &sr);
+        zerr("remote_dlopen: stop wstatus=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
+             status, WSTOPSIG(status),
+             (unsigned long)sr.pc, (long)sr.pc - (long)sc_addr);
+        zerr("remote_dlopen: stop X0(handle)=0x%lx X1(err_ptr)=0x%lx X19(saved)=0x%lx X30(LR)=0x%lx",
+             (unsigned long)sr.regs[0], (unsigned long)sr.regs[1],
+             (unsigned long)sr.regs[19], (unsigned long)sr.regs[30]);
+        zerr("remote_dlopen: stop X2=0x%lx SP=0x%lx pstate=0x%lx",
+             (unsigned long)sr.regs[2], (unsigned long)sr.sp, (unsigned long)sr.pstate);
+        // If PC is not at BRK (+32), something else stopped us
+        if (sr.pc != sc_addr + 32)
+            zerr("remote_dlopen: WARNING PC not at BRK — crashed before BRK");
+    }
 
     // Re-apply ACE's hook instructions after shellcode stops at BRK #0.
     for (int i = 0; i < n_patches; i++) {
