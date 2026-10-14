@@ -208,6 +208,18 @@
                 android:layout_width="match_parent"
                 android:layout_height="46dp"
                 android:background="@drawable/bg_btn_stop"
+                android:layout_marginBottom="8dp"
+                android:stateListAnimator="@null"/>
+
+            <Button
+                android:id="@+id/btn_console"
+                android:text="⚡ DEBUG CONSOLE"
+                android:textColor="#9E9E9E"
+                android:textSize="12sp"
+                android:letterSpacing="0.08"
+                android:layout_width="match_parent"
+                android:layout_height="46dp"
+                android:background="@drawable/bg_btn_stop"
                 android:layout_marginBottom="28dp"
                 android:stateListAnimator="@null"/>
 

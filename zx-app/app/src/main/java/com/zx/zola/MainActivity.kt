@@ -19,6 +19,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import android.content.Intent
 
 class MainActivity : AppCompatActivity() {
 
@@ -69,6 +70,7 @@ class MainActivity : AppCompatActivity() {
         val activateBtn   = findViewById<Button>(R.id.btn_activate)
         val stopBtn       = findViewById<Button>(R.id.btn_stop)
         val fabToggleBtn  = findViewById<Button>(R.id.btn_float_icon)
+        val consoleBtn    = findViewById<Button>(R.id.btn_console)
 
         activateBtn.setOnClickListener {
             if (!Settings.canDrawOverlays(this)) {
@@ -92,6 +94,10 @@ class MainActivity : AppCompatActivity() {
         stopBtn.setOnClickListener {
             stopFg()
             setActive(false)
+        }
+
+        consoleBtn.setOnClickListener {
+            startActivity(Intent(this, LogConsoleActivity::class.java))
         }
 
         fabToggleBtn.setOnClickListener {
@@ -119,7 +125,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // ── Aim System ──────────────────────────────────────────────────────
+        // ── Aim System
         val swAim    = findViewById<SwitchMaterial>(R.id.sw_aim_system)
         val aimBody  = findViewById<View>(R.id.ll_aim_body)
         val btnAI    = findViewById<Button>(R.id.btn_bone_ai)
@@ -154,7 +160,7 @@ class MainActivity : AppCompatActivity() {
                 return@setOnCheckedChangeListener
             }
             aimBody.visibility = if (checked) View.VISIBLE else View.GONE
-            if (!isActive) return@setOnCheckedChangeListener // deactivation reset — no engine call
+            if (!isActive) return@setOnCheckedChangeListener
             ZxEngine.toggle(Cmd.AIM_ENABLE, checked)
             if (checked) {
                 ZxEngine.setIntensity(Cmd.AIM_BONE,   selectedBone)
@@ -190,7 +196,7 @@ class MainActivity : AppCompatActivity() {
                     return@setOnCheckedChangeListener
                 }
                 row.visibility = if (checked) View.VISIBLE else View.GONE
-                if (!isActive) return@setOnCheckedChangeListener // deactivation reset — no engine call
+                if (!isActive) return@setOnCheckedChangeListener
                 ZxEngine.toggle(rf.cmd, checked)
                 if (!checked) {
                     sl.value = 0f
@@ -226,27 +232,21 @@ class MainActivity : AppCompatActivity() {
             tv.text = "INACTIVE"
             tv.setTextColor(getColor(R.color.zx_text_dim))
             tvSub.text = "Ready"
-            // Reset FAB button state
             isFabOn = false
             findViewById<Button>(R.id.btn_float_icon).also {
                 it.text = "FLOATING ICON  ○"
                 it.setTextColor(getColor(R.color.zx_text_muted))
             }
-            // isActive is already false here — listener guards prevent redundant root dispatches
             featureMap.keys.forEach { id ->
                 findViewById<SwitchMaterial>(id).isChecked = false
             }
-            // Reset aim system — isChecked=false here triggers the swAim listener which
-            // checks isActive first, so no ZxEngine call fires
             val swAimReset = findViewById<SwitchMaterial>(R.id.sw_aim_system)
             swAimReset.isChecked = false
             findViewById<View>(R.id.ll_aim_body).visibility = View.GONE
-            // Reset aim sliders to defaults (consistent with risk slider reset below)
             findViewById<Slider>(R.id.sl_aim_fov).value   = 35f
             findViewById<TextView>(R.id.tv_aim_fov).text   = "35°"
             findViewById<Slider>(R.id.sl_aim_smooth).value = 50f
             findViewById<TextView>(R.id.tv_aim_smooth).text = "50%"
-            // Reset risk switches + hide sliders
             riskSwitchIds.forEachIndexed { idx, switchId ->
                 val rf = riskFeatures[idx]
                 findViewById<SwitchMaterial>(switchId).isChecked = false
@@ -262,7 +262,6 @@ class MainActivity : AppCompatActivity() {
         if (req == OVERLAY_REQ && Settings.canDrawOverlays(this)) startFg()
     }
 
-    // Returns true if module is loaded (unloaded marker absent) via su
     private suspend fun isZygiskModuleLoaded(): Boolean = withContext(Dispatchers.IO) {
         try {
             val proc = Runtime.getRuntime().exec(arrayOf("su", "-c",
