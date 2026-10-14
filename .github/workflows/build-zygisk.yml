@@ -45,61 +45,99 @@ jobs:
             -DANDROID_STL=c++_static \
             -GNinja
 
-      # Dobby master ships macOS Mach-O @PAGE/@PAGEOFF in its ARM64 ASM, and
-      # os_arch_features.h references OSMemory before it's in scope (circular
-      # include chain: platform-posix.cc→platform.h→common.h→os_arch_features.h).
-      # Patch both issues with Python after configure (files are now on disk).
+      # Dobby master has multiple Android NDK regressions in its C++ source.
+      # Patch all known broken files after configure (source is on disk).
       - name: Patch Dobby ARM64 (ASM + C++ NDK compat)
         run: |
           python3 << 'PYEOF'
           import re, sys, os
 
-          # ── 1. ARM64 ASM: @PAGE/@PAGEOFF → ELF :lo12: syntax ─────────────
-          asm = "build/arm64/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
-          if os.path.exists(asm):
-              with open(asm) as f:
-                  content = f.read()
-              print(f"[ASM] File: {asm}  ({len(content)} bytes)")
-              hits = [(i+1, l) for i,l in enumerate(content.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
-              print(f"[ASM] Lines with @PAGE/@PAGEOFF before patch: {len(hits)}")
-              for n, l in hits:
-                  print(f"  {n}: {repr(l)}")
-              patched = re.sub(r'([^\s,]+)@PAGEOFF', r':lo12:\1', content)
-              patched = re.sub(r'([^\s,]+)@PAGE\b', r'\1', patched)
-              with open(asm, 'w') as f:
-                  f.write(patched)
-              after = [(i+1, l) for i,l in enumerate(patched.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
-              print(f"[ASM] Remaining after patch: {len(after)}  (expect 0)")
-              for n, l in after:
-                  print(f"  {n}: {repr(l)}")
-              if after:
-                  sys.exit(1)
-          else:
-              print("[ASM] Not found — skip")
+          DOBBY = "build/arm64/_deps/dobby-src"
 
-          # ── 2. os_arch_features.h: replace OSMemory calls with POSIX ──────
-          # OSMemory is defined later in the include chain; inlining POSIX calls
-          # breaks the circular dependency without touching the class definition.
-          feat_h = "build/arm64/_deps/dobby-src/common/os_arch_features.h"
-          if os.path.exists(feat_h):
-              with open(feat_h) as f:
-                  c = f.read()
-              if 'OSMemory' in c:
-                  posix = '#include <unistd.h>\n#include <sys/mman.h>\n'
-                  c = posix + c
-                  c = c.replace('OSMemory::PageSize()', 'getpagesize()')
-                  c = re.sub(
-                      r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
-                      r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)',
-                      c
-                  )
-                  with open(feat_h, 'w') as f:
-                      f.write(c)
-                  print(f"[C++] Patched os_arch_features.h — replaced OSMemory with POSIX calls")
+          def patch_dobby(dobby):
+              # ── 1. ARM64 ASM: @PAGE/@PAGEOFF → ELF :lo12: ──────────────────
+              asm = f"{dobby}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
+              if os.path.exists(asm):
+                  with open(asm) as f:
+                      c = f.read()
+                  hits = [(i+1, l) for i,l in enumerate(c.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+                  print(f"[ASM] @PAGE/@PAGEOFF lines before: {len(hits)}")
+                  for n, l in hits: print(f"  {n}: {repr(l)}")
+                  c = re.sub(r'([^\s,]+)@PAGEOFF', r':lo12:\1', c)
+                  c = re.sub(r'([^\s,]+)@PAGE\b',  r'\1',       c)
+                  after = [(i+1, l) for i,l in enumerate(c.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+                  print(f"[ASM] Remaining: {len(after)}  (expect 0)")
+                  for n, l in after: print(f"  {n}: {repr(l)}")
+                  if after: sys.exit(1)
+                  with open(asm, 'w') as f: f.write(c)
+                  print("[ASM] Patched")
               else:
-                  print("[C++] os_arch_features.h has no OSMemory — skip")
-          else:
-              print(f"[C++] {feat_h} not found — skip")
+                  print("[ASM] Not found — skip")
+
+              # ── 2. os_arch_features.h: OSMemory→POSIX (circular include) ───
+              feat_h = f"{dobby}/common/os_arch_features.h"
+              if os.path.exists(feat_h):
+                  with open(feat_h) as f: c = f.read()
+                  if 'OSMemory' in c:
+                      c = '#include <unistd.h>\n#include <sys/mman.h>\n' + c
+                      c = c.replace('OSMemory::PageSize()', 'getpagesize()')
+                      c = re.sub(
+                          r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
+                          r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)', c)
+                      with open(feat_h, 'w') as f: f.write(c)
+                      print("[C++] os_arch_features.h patched")
+              else:
+                  print(f"[C++] {feat_h} not found — skip")
+
+              # ── 3. core/arch/Cpu.h stub (removed/moved in master) ──────────
+              # code-patch-tool-posix.cc includes "core/arch/Cpu.h" which no
+              # longer exists in the master source tree.  Create a minimal stub
+              # using __builtin___clear_cache (standard Android NDK approach).
+              for cpu_dir in [f"{dobby}/core/arch", f"{dobby}/source/core/arch"]:
+                  cpu_h = f"{cpu_dir}/Cpu.h"
+                  if not os.path.exists(cpu_h):
+                      os.makedirs(cpu_dir, exist_ok=True)
+                      with open(cpu_h, 'w') as f:
+                          f.write('#pragma once\n#include <stddef.h>\n'
+                                  'struct Cpu {\n'
+                                  '  static void FlushCache(void* s, size_t n) {\n'
+                                  '    __builtin___clear_cache((char*)s, (char*)s + n);\n'
+                                  '  }\n'
+                                  '  static void FlushCache(void* s, void* e) {\n'
+                                  '    __builtin___clear_cache((char*)s, (char*)e);\n'
+                                  '  }\n'
+                                  '};\n')
+                      print(f"[Cpu.h] Created stub at {cpu_h}")
+
+              # ── 4. ProcessRuntime.h: add load_address field back ────────────
+              # RuntimeModule struct was refactored; .load_address removed.
+              # ProcessRuntime.cc still assigns to it — add the field back.
+              for rt_h in [
+                  f"{dobby}/source/PlatformUtil/ProcessRuntime.h",
+                  f"{dobby}/source/Backend/UserMode/PlatformUtil/ProcessRuntime.h",
+              ]:
+                  if os.path.exists(rt_h):
+                      with open(rt_h) as f: c = f.read()
+                      print(f"[ProcessRuntime.h] {rt_h}:\n{c[:600]}")
+                      if 'RuntimeModule' in c and 'load_address' not in c:
+                          c = re.sub(r'(struct RuntimeModule\s*\{)',
+                                     r'\1\n  void* load_address = nullptr;', c)
+                          with open(rt_h, 'w') as f: f.write(c)
+                          print("[ProcessRuntime.h] Patched: added load_address")
+                      break
+
+              # ── 5. ProcessRuntime.cc: a.start → a.start() ──────────────────
+              pr_cc = f"{dobby}/source/Backend/UserMode/PlatformUtil/Linux/ProcessRuntime.cc"
+              if os.path.exists(pr_cc):
+                  with open(pr_cc) as f: c = f.read()
+                  if 'a.start < b.start' in c:
+                      c = c.replace('a.start < b.start', 'a.start() < b.start()')
+                      with open(pr_cc, 'w') as f: f.write(c)
+                      print("[ProcessRuntime.cc] Patched: a.start() call")
+              else:
+                  print(f"[ProcessRuntime.cc] Not found — skip")
+
+          patch_dobby(DOBBY)
           PYEOF
 
       - name: Build arm64-v8a
@@ -120,24 +158,61 @@ jobs:
         run: |
           python3 << 'PYEOF'
           import re, os
-          feat_h = "build/arm32/_deps/dobby-src/common/os_arch_features.h"
-          if not os.path.exists(feat_h):
-              print(f"[C++] {feat_h} not found — skip"); exit(0)
-          with open(feat_h) as f:
-              c = f.read()
-          if 'OSMemory' not in c:
-              print("[C++] os_arch_features.h has no OSMemory — skip"); exit(0)
-          posix = '#include <unistd.h>\n#include <sys/mman.h>\n'
-          c = posix + c
-          c = c.replace('OSMemory::PageSize()', 'getpagesize()')
-          c = re.sub(
-              r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
-              r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)',
-              c
-          )
-          with open(feat_h, 'w') as f:
-              f.write(c)
-          print("[C++] Patched arm32 os_arch_features.h")
+
+          DOBBY = "build/arm32/_deps/dobby-src"
+
+          # os_arch_features.h
+          feat_h = f"{DOBBY}/common/os_arch_features.h"
+          if os.path.exists(feat_h):
+              with open(feat_h) as f: c = f.read()
+              if 'OSMemory' in c:
+                  c = '#include <unistd.h>\n#include <sys/mman.h>\n' + c
+                  c = c.replace('OSMemory::PageSize()', 'getpagesize()')
+                  c = re.sub(
+                      r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
+                      r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)', c)
+                  with open(feat_h, 'w') as f: f.write(c)
+                  print("[C++] arm32 os_arch_features.h patched")
+
+          # core/arch/Cpu.h stub
+          for cpu_dir in [f"{DOBBY}/core/arch", f"{DOBBY}/source/core/arch"]:
+              cpu_h = f"{cpu_dir}/Cpu.h"
+              if not os.path.exists(cpu_h):
+                  os.makedirs(cpu_dir, exist_ok=True)
+                  with open(cpu_h, 'w') as f:
+                      f.write('#pragma once\n#include <stddef.h>\n'
+                              'struct Cpu {\n'
+                              '  static void FlushCache(void* s, size_t n) {\n'
+                              '    __builtin___clear_cache((char*)s, (char*)s + n);\n'
+                              '  }\n'
+                              '  static void FlushCache(void* s, void* e) {\n'
+                              '    __builtin___clear_cache((char*)s, (char*)e);\n'
+                              '  }\n'
+                              '};\n')
+                  print(f"[Cpu.h] arm32 stub at {cpu_h}")
+
+          # ProcessRuntime.h
+          for rt_h in [
+              f"{DOBBY}/source/PlatformUtil/ProcessRuntime.h",
+              f"{DOBBY}/source/Backend/UserMode/PlatformUtil/ProcessRuntime.h",
+          ]:
+              if os.path.exists(rt_h):
+                  with open(rt_h) as f: c = f.read()
+                  if 'RuntimeModule' in c and 'load_address' not in c:
+                      c = re.sub(r'(struct RuntimeModule\s*\{)',
+                                 r'\1\n  void* load_address = nullptr;', c)
+                      with open(rt_h, 'w') as f: f.write(c)
+                      print("[ProcessRuntime.h] arm32 patched")
+                  break
+
+          # ProcessRuntime.cc
+          pr_cc = f"{DOBBY}/source/Backend/UserMode/PlatformUtil/Linux/ProcessRuntime.cc"
+          if os.path.exists(pr_cc):
+              with open(pr_cc) as f: c = f.read()
+              if 'a.start < b.start' in c:
+                  c = c.replace('a.start < b.start', 'a.start() < b.start()')
+                  with open(pr_cc, 'w') as f: f.write(c)
+                  print("[ProcessRuntime.cc] arm32 patched")
           PYEOF
 
       - name: Build armeabi-v7a
