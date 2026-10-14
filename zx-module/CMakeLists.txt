@@ -29,17 +29,6 @@ foreach(_t dobby_static dobby c++_static c++abi c++)
     endif()
 endforeach()
 
-# Force the linker to take ALL libc++ symbols from the static archive.
-# -Bstatic wrapping ensures lld picks libc++_static.a over any sysroot .so.
-# -Wl,--exclude-libs prevents these symbols from leaking out as exported globals.
-add_link_options(
-    -Wl,--push-state,-Bstatic
-    -lc++_static
-    -lc++abi
-    -Wl,--pop-state
-    -Wl,--exclude-libs,libc++_static.a:libc++abi.a
-)
-
 # Patch macOS-only @PAGE/@PAGEOFF ARM64 ASM relocations → ELF :lo12: syntax.
 # Dobby master ships Mach-O style relocations in the closure bridge ASM; the
 # Android NDK clang (Linux host, ELF target) rejects them at assemble time.
@@ -76,8 +65,22 @@ target_compile_options(zx_zola PRIVATE
     -fvisibility-inlines-hidden
 )
 
-target_link_libraries(zx_zola
+target_link_libraries(zx_zola PRIVATE
     log
     dl
     dobby_static
+)
+
+# Static C++ runtime absorption — runs AFTER objects so lld sees references first.
+# Order matters: compiler-rt builtins (provides __emutls_get_address, __muldc3, etc.)
+# must precede c++_static/c++abi so their internal refs are resolved within the bracket.
+# target_link_options appends AFTER object files; add_link_options prepends BEFORE
+# objects (lld would see no references yet and pull nothing in from the archive).
+target_link_options(zx_zola PRIVATE
+    -Wl,--push-state,-Bstatic
+    -lclang_rt.builtins-aarch64-android
+    -lc++_static
+    -lc++abi
+    -Wl,--pop-state
+    -Wl,--exclude-libs,libc++_static.a:libc++abi.a:libclang_rt.builtins-aarch64-android.a
 )
