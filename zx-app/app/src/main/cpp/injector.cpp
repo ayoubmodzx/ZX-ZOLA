@@ -737,16 +737,54 @@ int main(int argc, char *argv[]) {
 
         LOG("Injecting payload from %s", payload_path);
 
-        // Copy payload to /data/local/tmp/ — cross-UID dlopen in FF's linker context
-        // may be blocked by SELinux when loading from our app's data dir, but
-        // /data/local/tmp/ (shell_data_file context) is accessible to any process.
+        // Stage payload to FF's own lib directory (always in its linker namespace).
+        // /data/local/tmp is file-accessible but NOT in FF's linker namespace → handle=-4.
+        // Staging next to libmain.so guarantees the namespace path check passes.
         {
-            char tmp_path[256];
-            snprintf(tmp_path, sizeof(tmp_path), "/data/local/tmp/libzx_payload.so");
+            // Parse /proc/<pid>/maps to extract directory of libmain.so
+            char ff_lib_dir[512] = {};
+            {
+                char maps_path[64];
+                snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+                FILE *mf = fopen(maps_path, "r");
+                if (mf) {
+                    char mline[1024];
+                    while (fgets(mline, sizeof(mline), mf)) {
+                        if (!strstr(mline, "libmain.so")) continue;
+                        if (!strstr(mline, "r-xp") && !strstr(mline, "r--p")) continue;
+                        char mpath[512] = {};
+                        if (sscanf(mline, "%*lx-%*lx %*s %*lx %*s %*lu %511[^\n]", mpath) == 1) {
+                            char *p = mpath; while (*p == ' ') p++;
+                            if (*p == '/') {
+                                char *sl = strrchr(p, '/');
+                                if (sl && (size_t)(sl - p + 2) < sizeof(ff_lib_dir)) {
+                                    size_t dlen = (size_t)(sl - p + 1);
+                                    memcpy(ff_lib_dir, p, dlen);
+                                    ff_lib_dir[dlen] = '\0';
+                                }
+                            }
+                        }
+                        break;
+                    }
+                    fclose(mf);
+                }
+            }
+            zerr("main: ff_lib_dir=\"%s\"", ff_lib_dir);
+
+            // Try FF lib dir first (in namespace), then fall back to /data/local/tmp/
+            const char *candidates[2] = { ff_lib_dir, "/data/local/tmp/" };
+            bool staged = false;
             int fi = open(payload_path, O_RDONLY);
-            if (fi >= 0) {
-                int fo = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
-                if (fo >= 0) {
+            if (fi < 0) {
+                zerr("main: cannot open source %s errno=%d", payload_path, errno);
+            } else {
+                for (int ci = 0; ci < 2 && !staged; ci++) {
+                    if (!candidates[ci][0]) continue;
+                    char tmp_path[512];
+                    snprintf(tmp_path, sizeof(tmp_path), "%slibzx_payload.so", candidates[ci]);
+                    lseek(fi, 0, SEEK_SET);
+                    int fo = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+                    if (fo < 0) { zerr("main: cannot create %s errno=%d", tmp_path, errno); continue; }
                     char cbuf[8192]; ssize_t n;
                     bool write_ok = true;
                     while ((n = read(fi, cbuf, sizeof(cbuf))) > 0)
@@ -756,16 +794,13 @@ int main(int argc, char *argv[]) {
                         zerr("main: payload staged at %s", tmp_path);
                         strncpy(payload_path, tmp_path, sizeof(payload_path) - 1);
                         payload_path[sizeof(payload_path) - 1] = '\0';
+                        staged = true;
                     } else {
-                        zerr("main: copy write failed errno=%d, using original path", errno);
+                        zerr("main: write failed %s errno=%d", tmp_path, errno);
                         unlink(tmp_path);
                     }
-                } else {
-                    zerr("main: cannot create %s errno=%d, using original path", tmp_path, errno);
                 }
                 close(fi);
-            } else {
-                zerr("main: cannot open source %s errno=%d", payload_path, errno);
             }
         }
 
