@@ -239,6 +239,21 @@ jobs:
                   print("[CodeMemBuffer.h] arm32 types already present, skip")
           else:
               print(f"[CodeMemBuffer.h] not found — skip")
+
+          # registers-arm.h: Register::Create() is no longer constexpr in master;
+          # DECLARE_REGISTER uses constexpr Register R = Register::Create(...) which
+          # the compiler rejects.  Downgrade to const.
+          reg_h = f"{DOBBY}/source/core/arch/arm/registers-arm.h"
+          if os.path.exists(reg_h):
+              with open(reg_h) as f: c = f.read()
+              if 'constexpr Register' in c:
+                  c = c.replace('constexpr Register', 'const Register')
+                  with open(reg_h, 'w') as f: f.write(c)
+                  print("[registers-arm.h] arm32 patched: constexpr → const Register")
+              else:
+                  print("[registers-arm.h] arm32 already OK, skip")
+          else:
+              print(f"[registers-arm.h] not found — skip")
           PYEOF
 
       - name: Build armeabi-v7a
