@@ -240,20 +240,49 @@ jobs:
           else:
               print(f"[CodeMemBuffer.h] not found — skip")
 
-          # registers-arm.h: Register::Create() is no longer constexpr in master;
-          # DECLARE_REGISTER uses constexpr Register R = Register::Create(...) which
-          # the compiler rejects.  Downgrade to const.
+          # registers-arm.h: two regressions in master
           reg_h = f"{DOBBY}/source/core/arch/arm/registers-arm.h"
           if os.path.exists(reg_h):
               with open(reg_h) as f: c = f.read()
-              if 'constexpr Register' in c:
-                  c = c.replace('constexpr Register', 'const Register')
+              changed = False
+              # 1. RegisterBase class undefined — inject minimal definition before Register
+              if 'class Register' in c and 'class RegisterBase' not in c:
+                  rb = (
+                      'class RegisterBase {\npublic:\n'
+                      '  explicit RegisterBase(int code) : reg_id(code) {}\n'
+                      '  int reg_id;\n};\n'
+                  )
+                  c = re.sub(r'(?=\bclass Register\b)', rb, c, count=1)
+                  changed = True
+                  print("[registers-arm.h] arm32: injected RegisterBase class")
+              # 2. Fix DECLARE_REGISTER macro ONLY — not the constructor definition
+              new_c = re.sub(
+                  r'(#define DECLARE_REGISTER\([^)]*\)\s*)constexpr\s+(Register\s)',
+                  r'\1const \2',
+                  c
+              )
+              if new_c != c:
+                  c = new_c
+                  changed = True
+                  print("[registers-arm.h] arm32: DECLARE_REGISTER constexpr → const")
+              if changed:
                   with open(reg_h, 'w') as f: f.write(c)
-                  print("[registers-arm.h] arm32 patched: constexpr → const Register")
-              else:
-                  print("[registers-arm.h] arm32 already OK, skip")
           else:
               print(f"[registers-arm.h] not found — skip")
+
+          # code_buffer_arm.h: required by assembler-arm.h inside TARGET_ARCH_ARM guard
+          # but removed in Dobby master. Create minimal stub.
+          code_buf_arm_dir = f"{DOBBY}/source/MemoryAllocator/CodeBuffer"
+          os.makedirs(code_buf_arm_dir, exist_ok=True)
+          code_buf_arm_h = f"{code_buf_arm_dir}/code_buffer_arm.h"
+          if not os.path.exists(code_buf_arm_h):
+              with open(code_buf_arm_h, 'w') as f:
+                  f.write(
+                      '#pragma once\n'
+                      '// stub: ARM32 code buffer — merged into CodeMemBuffer.h in master\n'
+                      '#include "../CodeMemBuffer.h"\n'
+                  )
+              print(f"[code_buffer_arm.h] created stub at {code_buf_arm_h}")
           PYEOF
 
       - name: Build armeabi-v7a
