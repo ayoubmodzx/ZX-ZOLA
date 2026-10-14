@@ -18,7 +18,10 @@
 #endif
 
 // Control struct — written by injector via /proc/PID/mem
-extern "C" struct ZxCtrl {
+// visibility("default") ensures the symbol lands in .dynsym even with
+// -fvisibility=hidden, so the Android dynamic linker resolves the GOT
+// relocation internally and dlsym() can locate it after injection.
+extern "C" __attribute__((visibility("default"))) struct ZxCtrl {
     std::atomic<int> cmd{0};
     std::atomic<int> enable{0};
     std::atomic<int> intensity{0}; // 0-100, for risk slider features
