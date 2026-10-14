@@ -13,13 +13,27 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
     GIT_PROGRESS   FALSE
 )
-set(DOBBY_DEBUG                          OFF CACHE BOOL "" FORCE)
-set(Plugin.SymbolResolver                ON  CACHE BOOL "" FORCE)
-set(Plugin.Darwin.HideLibrary            OFF CACHE BOOL "" FORCE)
+set(DOBBY_DEBUG                            OFF CACHE BOOL "" FORCE)
+set(Plugin.SymbolResolver                  ON  CACHE BOOL "" FORCE)
+set(Plugin.Darwin.HideLibrary              OFF CACHE BOOL "" FORCE)
 set(Plugin.Android.BionicLinkerRestriction OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Dobby)
 
-# ── Global flags — no LTO or visibility here; set per-target below ────────────
+# Patch macOS-only @PAGE/@PAGEOFF ARM64 ASM relocations → ELF :lo12: syntax.
+# Dobby master ships Mach-O style relocations in the closure bridge ASM; the
+# Android NDK clang (Linux host, ELF target) rejects them at assemble time.
+set(_dobby_asm
+    "${dobby_SOURCE_DIR}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm")
+if(EXISTS "${_dobby_asm}")
+    file(READ "${_dobby_asm}" _asm)
+    string(REPLACE "common_closure_bridge_handler@PAGEOFF"
+                   ":lo12:common_closure_bridge_handler" _asm "${_asm}")
+    string(REPLACE "common_closure_bridge_handler@PAGE"
+                   "common_closure_bridge_handler" _asm "${_asm}")
+    file(WRITE "${_dobby_asm}" "${_asm}")
+endif()
+
+# ── Global flags ──────────────────────────────────────────────────────────────
 set(CMAKE_CXX_FLAGS_RELEASE   "-O2 -ffunction-sections -fdata-sections")
 set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--strip-all -Wl,-z,relro,-z,now")
 
