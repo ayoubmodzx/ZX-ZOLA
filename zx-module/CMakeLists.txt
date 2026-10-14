@@ -19,14 +19,26 @@ set(Plugin.Darwin.HideLibrary              OFF CACHE BOOL "" FORCE)
 set(Plugin.Android.BionicLinkerRestriction OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Dobby)
 
-# dobby_static carries libc++_shared in its INTERFACE_LINK_LIBRARIES on Android.
-# Clearing it prevents libc++_shared.so from appearing in our NEEDED list.
-# C++ symbols are still resolved from libc++_static (absorbed via ANDROID_STL=c++_static).
-foreach(_t dobby_static dobby)
+# The NDK's c++_static imported target carries libc++_shared in INTERFACE_LINK_LIBRARIES.
+# Dobby's targets do the same. ZygiskNext's linker namespace cannot reach libc++_shared.so,
+# so we must absorb ALL C++ runtime symbols statically — no shared C++ dep at runtime.
+# Clearing every interface dep here stops libc++_shared from appearing in NEEDED.
+foreach(_t dobby_static dobby c++_static c++abi c++)
     if(TARGET ${_t})
         set_property(TARGET ${_t} PROPERTY INTERFACE_LINK_LIBRARIES "")
     endif()
 endforeach()
+
+# Force the linker to take ALL libc++ symbols from the static archive.
+# -Bstatic wrapping ensures lld picks libc++_static.a over any sysroot .so.
+# -Wl,--exclude-libs prevents these symbols from leaking out as exported globals.
+add_link_options(
+    -Wl,--push-state,-Bstatic
+    -lc++_static
+    -lc++abi
+    -Wl,--pop-state
+    -Wl,--exclude-libs,libc++_static.a:libc++abi.a
+)
 
 # Patch macOS-only @PAGE/@PAGEOFF ARM64 ASM relocations → ELF :lo12: syntax.
 # Dobby master ships Mach-O style relocations in the closure bridge ASM; the
