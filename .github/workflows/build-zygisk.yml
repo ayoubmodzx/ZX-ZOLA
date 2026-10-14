@@ -63,8 +63,11 @@ jobs:
                   hits = [(i+1, l) for i,l in enumerate(c.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
                   print(f"[ASM] @PAGE/@PAGEOFF lines before: {len(hits)}")
                   for n, l in hits: print(f"  {n}: {repr(l)}")
-                  c = re.sub(r'([^\s,]+)@PAGEOFF', r':lo12:\1', c)
-                  c = re.sub(r'([^\s,]+)@PAGE\b',  r'\1',       c)
+                  # adrp REG, SYM@PAGE  →  adrp REG, :got:SYM  (ELF PIC GOT-indirect)
+                  c = re.sub(r'(adrp\s+[^\s,]+,\s*)([^\s,@]+)@PAGE\b', r'\1:got:\2', c)
+                  # add DST, SRC, SYM@PAGEOFF  →  ldr DST, [SRC, :got_lo12:SYM]
+                  c = re.sub(r'add\s+([^\s,]+),\s*([^\s,]+),\s*([^\s,@]+)@PAGEOFF',
+                             r'ldr \1, [\2, :got_lo12:\3]', c)
                   after = [(i+1, l) for i,l in enumerate(c.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
                   print(f"[ASM] Remaining: {len(after)}  (expect 0)")
                   for n, l in after: print(f"  {n}: {repr(l)}")
