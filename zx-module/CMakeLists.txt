@@ -72,12 +72,27 @@ target_link_libraries(zx_zola PRIVATE
 )
 
 # Static C++ runtime absorption — runs AFTER objects so lld sees references first.
-# Order matters: compiler-rt builtins (provides __emutls_get_address, __muldc3, etc.)
-# must precede c++_static/c++abi so their internal refs are resolved within the bracket.
-# target_link_options appends AFTER object files; add_link_options prepends BEFORE
-# objects (lld would see no references yet and pull nothing in from the archive).
+# compiler-rt builtins (provides __emutls_get_address) live in the clang lib dir
+# which is NOT in the NDK sysroot's default search path — find it explicitly.
+execute_process(
+    COMMAND ${CMAKE_CXX_COMPILER} --print-file-name=libclang_rt.builtins-aarch64-android.a
+    OUTPUT_VARIABLE _compiler_rt_path
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(NOT IS_ABSOLUTE "${_compiler_rt_path}")
+    file(GLOB _compiler_rt_candidates
+        "${CMAKE_ANDROID_NDK}/toolchains/llvm/prebuilt/linux-x86_64/lib/clang/*/lib/linux/libclang_rt.builtins-aarch64-android.a")
+    list(GET _compiler_rt_candidates 0 _compiler_rt_path)
+endif()
+if(NOT _compiler_rt_path OR NOT EXISTS "${_compiler_rt_path}")
+    message(FATAL_ERROR "Cannot find libclang_rt.builtins-aarch64-android.a in NDK ${CMAKE_ANDROID_NDK}")
+endif()
+message(STATUS "compiler-rt builtins: ${_compiler_rt_path}")
+get_filename_component(_compiler_rt_dir "${_compiler_rt_path}" DIRECTORY)
+
 target_link_options(zx_zola PRIVATE
     -Wl,--push-state,-Bstatic
+    -L${_compiler_rt_dir}
     -lclang_rt.builtins-aarch64-android
     -lc++_static
     -lc++abi
