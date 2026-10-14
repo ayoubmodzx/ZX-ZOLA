@@ -45,35 +45,61 @@ jobs:
             -DANDROID_STL=c++_static \
             -GNinja
 
-      # Dobby master ships macOS Mach-O @PAGE/@PAGEOFF in its ARM64 ASM.
-      # Android NDK clang on Linux (ELF target) rejects those relocations.
-      # Use Python regex to patch: any symbol@PAGEOFF → :lo12:symbol,
-      # any symbol@PAGE → symbol. Prints exact matching lines for diagnostics.
-      - name: Patch Dobby ARM64 ASM for Linux ELF
+      # Dobby master ships macOS Mach-O @PAGE/@PAGEOFF in its ARM64 ASM, and
+      # os_arch_features.h references OSMemory before it's in scope (circular
+      # include chain: platform-posix.cc→platform.h→common.h→os_arch_features.h).
+      # Patch both issues with Python after configure (files are now on disk).
+      - name: Patch Dobby ARM64 (ASM + C++ NDK compat)
         run: |
           python3 << 'PYEOF'
           import re, sys, os
+
+          # ── 1. ARM64 ASM: @PAGE/@PAGEOFF → ELF :lo12: syntax ─────────────
           asm = "build/arm64/_deps/dobby-src/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
-          if not os.path.exists(asm):
-              print("ASM not found — skip"); sys.exit(0)
-          with open(asm) as f:
-              content = f.read()
-          print(f"File: {asm}  ({len(content)} bytes)")
-          hits = [(i+1, l) for i,l in enumerate(content.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
-          print(f"Lines with @PAGE/@PAGEOFF before patch: {len(hits)}")
-          for n, l in hits:
-              print(f"  {n}: {repr(l)}")
-          # Symbol is cdecl(name) — parens break \w+, use [^\s,]+ instead
-          patched = re.sub(r'([^\s,]+)@PAGEOFF', r':lo12:\1', content)
-          patched = re.sub(r'([^\s,]+)@PAGE\b', r'\1', patched)
-          with open(asm, 'w') as f:
-              f.write(patched)
-          after = [(i+1, l) for i,l in enumerate(patched.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
-          print(f"Remaining after patch: {len(after)}  (expect 0)")
-          for n, l in after:
-              print(f"  {n}: {repr(l)}")
-          if after:
-              sys.exit(1)
+          if os.path.exists(asm):
+              with open(asm) as f:
+                  content = f.read()
+              print(f"[ASM] File: {asm}  ({len(content)} bytes)")
+              hits = [(i+1, l) for i,l in enumerate(content.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+              print(f"[ASM] Lines with @PAGE/@PAGEOFF before patch: {len(hits)}")
+              for n, l in hits:
+                  print(f"  {n}: {repr(l)}")
+              patched = re.sub(r'([^\s,]+)@PAGEOFF', r':lo12:\1', content)
+              patched = re.sub(r'([^\s,]+)@PAGE\b', r'\1', patched)
+              with open(asm, 'w') as f:
+                  f.write(patched)
+              after = [(i+1, l) for i,l in enumerate(patched.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+              print(f"[ASM] Remaining after patch: {len(after)}  (expect 0)")
+              for n, l in after:
+                  print(f"  {n}: {repr(l)}")
+              if after:
+                  sys.exit(1)
+          else:
+              print("[ASM] Not found — skip")
+
+          # ── 2. os_arch_features.h: replace OSMemory calls with POSIX ──────
+          # OSMemory is defined later in the include chain; inlining POSIX calls
+          # breaks the circular dependency without touching the class definition.
+          feat_h = "build/arm64/_deps/dobby-src/common/os_arch_features.h"
+          if os.path.exists(feat_h):
+              with open(feat_h) as f:
+                  c = f.read()
+              if 'OSMemory' in c:
+                  posix = '#include <unistd.h>\n#include <sys/mman.h>\n'
+                  c = posix + c
+                  c = c.replace('OSMemory::PageSize()', 'getpagesize()')
+                  c = re.sub(
+                      r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
+                      r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)',
+                      c
+                  )
+                  with open(feat_h, 'w') as f:
+                      f.write(c)
+                  print(f"[C++] Patched os_arch_features.h — replaced OSMemory with POSIX calls")
+              else:
+                  print("[C++] os_arch_features.h has no OSMemory — skip")
+          else:
+              print(f"[C++] {feat_h} not found — skip")
           PYEOF
 
       - name: Build arm64-v8a
@@ -89,6 +115,30 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DANDROID_STL=c++_static \
             -GNinja
+
+      - name: Patch Dobby ARM32 (C++ NDK compat)
+        run: |
+          python3 << 'PYEOF'
+          import re, os
+          feat_h = "build/arm32/_deps/dobby-src/common/os_arch_features.h"
+          if not os.path.exists(feat_h):
+              print(f"[C++] {feat_h} not found — skip"); exit(0)
+          with open(feat_h) as f:
+              c = f.read()
+          if 'OSMemory' not in c:
+              print("[C++] os_arch_features.h has no OSMemory — skip"); exit(0)
+          posix = '#include <unistd.h>\n#include <sys/mman.h>\n'
+          c = posix + c
+          c = c.replace('OSMemory::PageSize()', 'getpagesize()')
+          c = re.sub(
+              r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
+              r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)',
+              c
+          )
+          with open(feat_h, 'w') as f:
+              f.write(c)
+          print("[C++] Patched arm32 os_arch_features.h")
+          PYEOF
 
       - name: Build armeabi-v7a
         run: cmake --build build/arm32 --config Release

@@ -14,7 +14,7 @@ FetchContent_Declare(
     GIT_PROGRESS   FALSE
 )
 set(DOBBY_DEBUG                            OFF CACHE BOOL "" FORCE)
-set(Plugin.SymbolResolver                  ON  CACHE BOOL "" FORCE)
+set(Plugin.SymbolResolver                  OFF CACHE BOOL "" FORCE)
 set(Plugin.Darwin.HideLibrary              OFF CACHE BOOL "" FORCE)
 set(Plugin.Android.BionicLinkerRestriction OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Dobby)

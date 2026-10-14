@@ -54,8 +54,8 @@ bool HookEngine::hookSym(const char *lib, const char *symbol,
     dlclose(handle);
 
     if (!sym) {
-        // Try Dobby's resolver as fallback
-        sym = DobbySymbolResolver(lib, symbol);
+        // Fallback: global symbol table
+        sym = dlsym(RTLD_DEFAULT, symbol);
     }
 
     if (!sym) {
