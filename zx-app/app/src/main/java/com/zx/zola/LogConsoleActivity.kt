@@ -1,5 +1,8 @@
 package com.zx.zola
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
@@ -7,12 +10,12 @@ import android.os.Handler
 import android.os.Looper
 import android.text.Spannable
 import android.text.SpannableString
+import android.text.SpannableStringBuilder
 import android.text.style.ForegroundColorSpan
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import java.io.BufferedReader
 import java.io.InputStreamReader
-import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -24,13 +27,18 @@ class LogConsoleActivity : AppCompatActivity() {
     private val lines = ArrayDeque<CharSequence>(MAX_LINES + 1)
     private lateinit var tv: TextView
     private lateinit var scroll: ScrollView
+    private lateinit var tvStatus: TextView
     private var autoScroll = true
-    private var filterLevel = 'V' // V=all, I=info+, W=warn+, E=error
+    private var filterLevel = 'V'
+
+    // Persistent builder — only rebuilt when trimming oldest line (rare)
+    private val ssb = SpannableStringBuilder()
 
     companion object {
         private const val MAX_LINES = 500
-        private const val TAGS = "ZX-PAYLOAD:V ZX-IL2:V ZX-FEAT:V ZX-ANO:V ZX-ESP:V ZX-INJECT:V"
-        private val TS_FMT = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+        // *:S silences everything else — only ZX tags come through
+        private const val TAGS =
+            "ZX-PAYLOAD:V ZX-IL2:V ZX-FEAT:V ZX-ANO:V ZX-ESP:V ZX-INJECT:V ZX-ADET:V ZX:V *:S"
 
         private val COL_VERBOSE = Color.parseColor("#9E9E9E")
         private val COL_DEBUG   = Color.parseColor("#64B5F6")
@@ -44,26 +52,23 @@ class LogConsoleActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
         val root = buildLayout()
         setContentView(root)
         title = "ZX Console"
-
         startCapture()
     }
 
     private fun buildLayout(): android.view.View {
         val ctx = this
 
-        val root = android.widget.LinearLayout(ctx).apply {
-            orientation = android.widget.LinearLayout.VERTICAL
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0D0D0D"))
-            setPadding(0, 0, 0, 0)
         }
 
-        // ── top bar
-        val bar = android.widget.LinearLayout(ctx).apply {
-            orientation = android.widget.LinearLayout.HORIZONTAL
+        // ── top bar ──────────────────────────────────────────────────────────
+        val bar = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
             setBackgroundColor(Color.parseColor("#1A1A1A"))
             setPadding(16, 12, 16, 12)
         }
@@ -73,64 +78,44 @@ class LogConsoleActivity : AppCompatActivity() {
             setTextColor(Color.parseColor("#AB47BC"))
             textSize = 13f
             typeface = Typeface.MONOSPACE
-            layoutParams = android.widget.LinearLayout.LayoutParams(0,
+            layoutParams = LinearLayout.LayoutParams(0,
                 android.view.ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
-        val btnClear = Button(ctx).apply {
-            text = "CLEAR"
-            textSize = 11f
+        fun barBtn(label: String, end: Int = 8): Button = Button(ctx).apply {
+            text = label
+            textSize = 10f
             setTextColor(Color.parseColor("#9E9E9E"))
             setBackgroundColor(Color.parseColor("#252525"))
-            setPadding(20, 4, 20, 4)
+            setPadding(18, 2, 18, 2)
             minHeight = 0
             minimumHeight = 0
-            val p = android.widget.LinearLayout.LayoutParams(
+            val p = LinearLayout.LayoutParams(
                 android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
                 android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
-            p.marginEnd = 8
+            p.marginEnd = end
             layoutParams = p
         }
 
-        val btnFilter = Button(ctx).apply {
-            text = "LVL: V"
-            textSize = 11f
-            setTextColor(Color.parseColor("#9E9E9E"))
-            setBackgroundColor(Color.parseColor("#252525"))
-            setPadding(20, 4, 20, 4)
-            minHeight = 0
-            minimumHeight = 0
-            val p = android.widget.LinearLayout.LayoutParams(
-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
-            p.marginEnd = 8
-            layoutParams = p
-        }
-
-        val btnScroll = Button(ctx).apply {
-            text = "↓ AUTO"
-            textSize = 11f
-            setTextColor(Color.parseColor("#66BB6A"))
-            setBackgroundColor(Color.parseColor("#252525"))
-            setPadding(20, 4, 20, 4)
-            minHeight = 0
-            minimumHeight = 0
-            layoutParams = android.widget.LinearLayout.LayoutParams(
-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
-                android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
+        val btnClear  = barBtn("CLEAR")
+        val btnFilter = barBtn("LVL:V")
+        val btnCopy   = barBtn("COPY")
+        val btnScroll = barBtn("↓AUTO", 0).also {
+            it.setTextColor(Color.parseColor("#66BB6A"))
         }
 
         bar.addView(tvTitle)
         bar.addView(btnClear)
         bar.addView(btnFilter)
+        bar.addView(btnCopy)
         bar.addView(btnScroll)
         root.addView(bar)
 
-        // ── log area
+        // ── log area ─────────────────────────────────────────────────────────
         scroll = ScrollView(ctx).apply {
             setBackgroundColor(Color.parseColor("#0D0D0D"))
             isVerticalScrollBarEnabled = true
-            layoutParams = android.widget.LinearLayout.LayoutParams(
+            layoutParams = LinearLayout.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
 
@@ -144,23 +129,24 @@ class LogConsoleActivity : AppCompatActivity() {
         scroll.addView(tv)
         root.addView(scroll)
 
-        // ── status bar
-        val tvStatus = TextView(ctx).apply {
+        // ── status bar ───────────────────────────────────────────────────────
+        tvStatus = TextView(ctx).apply {
             text = "● connecting…"
             textSize = 10f
             setTextColor(Color.parseColor("#616161"))
             typeface = Typeface.MONOSPACE
             setPadding(16, 6, 16, 6)
             setBackgroundColor(Color.parseColor("#111111"))
-            layoutParams = android.widget.LinearLayout.LayoutParams(
+            layoutParams = LinearLayout.LayoutParams(
                 android.view.ViewGroup.LayoutParams.MATCH_PARENT,
                 android.view.ViewGroup.LayoutParams.WRAP_CONTENT)
         }
         root.addView(tvStatus)
 
-        // ── listeners
+        // ── listeners ────────────────────────────────────────────────────────
         btnClear.setOnClickListener {
             lines.clear()
+            ssb.clear()
             tv.text = ""
             appendLine(colorLine("--- cleared ---", COL_TS))
         }
@@ -169,28 +155,38 @@ class LogConsoleActivity : AppCompatActivity() {
         btnFilter.setOnClickListener {
             val idx = (levels.indexOf(filterLevel) + 1) % levels.size
             filterLevel = levels[idx]
-            btnFilter.text = "LVL: $filterLevel"
+            btnFilter.text = "LVL:$filterLevel"
+        }
+
+        btnCopy.setOnClickListener {
+            try {
+                val text = lines.joinToString("\n") { it.toString() }
+                val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                cm.setPrimaryClip(ClipData.newPlainText("ZX Log", text))
+                Toast.makeText(ctx, "Copied ${lines.size} lines", Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                Toast.makeText(ctx, "Copy failed", Toast.LENGTH_SHORT).show()
+            }
         }
 
         btnScroll.setOnClickListener {
             autoScroll = !autoScroll
-            btnScroll.text = if (autoScroll) "↓ AUTO" else "PAUSED"
-            btnScroll.setTextColor(if (autoScroll) Color.parseColor("#66BB6A") else COL_WARN)
+            btnScroll.text = if (autoScroll) "↓AUTO" else "PAUSED"
+            btnScroll.setTextColor(
+                if (autoScroll) Color.parseColor("#66BB6A") else COL_WARN)
             if (autoScroll) scrollBottom()
         }
 
         scroll.viewTreeObserver.addOnScrollChangedListener {
-            val maxScroll = scroll.getChildAt(0).height - scroll.height
-            if (scroll.scrollY < maxScroll - 40) {
-                if (autoScroll) {
-                    autoScroll = false
-                    btnScroll.text = "PAUSED"
-                    btnScroll.setTextColor(COL_WARN)
-                }
+            val child = scroll.getChildAt(0) ?: return@addOnScrollChangedListener
+            val maxScroll = child.height - scroll.height
+            if (autoScroll && scroll.scrollY < maxScroll - 40) {
+                autoScroll = false
+                btnScroll.text = "PAUSED"
+                btnScroll.setTextColor(COL_WARN)
             }
         }
 
-        root.setTag(R.id.tv_status_sub, tvStatus)
         return root
     }
 
@@ -204,7 +200,7 @@ class LogConsoleActivity : AppCompatActivity() {
                 logProcess = proc
                 updateStatus("● running (su)")
 
-                val reader = BufferedReader(InputStreamReader(proc.inputStream), 8192)
+                val reader = BufferedReader(InputStreamReader(proc.inputStream), 16384)
                 var line: String?
                 while (running.get()) {
                     line = reader.readLine() ?: break
@@ -227,21 +223,23 @@ class LogConsoleActivity : AppCompatActivity() {
     }
 
     private fun updateStatus(msg: String) {
-        handler.post {
-            try {
-                val tvStatus = window.decorView
-                    .findViewById<TextView>(R.id.tv_status_sub)
-                tvStatus?.text = msg
-            } catch (_: Exception) {}
-        }
+        handler.post { tvStatus.text = msg }
     }
 
+    // Fast-path incremental append; full rebuild only when trimming oldest line.
     private fun appendLine(span: CharSequence) {
-        if (lines.size >= MAX_LINES) lines.removeFirst()
+        val overflow = lines.size >= MAX_LINES
+        if (overflow) lines.removeFirst()
         lines.addLast(span)
-        val sb = android.text.SpannableStringBuilder()
-        lines.forEach { sb.append(it); sb.append("\n") }
-        tv.text = sb
+
+        if (overflow) {
+            ssb.clear()
+            lines.forEach { ssb.append(it); ssb.append("\n") }
+            tv.text = ssb
+        } else {
+            tv.append(span)
+            tv.append("\n")
+        }
         if (autoScroll) scrollBottom()
     }
 
@@ -282,7 +280,7 @@ class LogConsoleActivity : AppCompatActivity() {
     }
 
     private fun formatLine(e: LogEntry): CharSequence {
-        val sb = android.text.SpannableStringBuilder()
+        val sb = SpannableStringBuilder()
         sb.append(colorSpan("${e.ts} ", COL_TS))
         sb.append(colorSpan("${e.level}/", levelColor(e.level)))
         sb.append(colorSpan("${e.tag}: ", COL_TAG))

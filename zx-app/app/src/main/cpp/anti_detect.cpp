@@ -29,6 +29,7 @@
 #include "stealth_ext4.hpp"
 #include "stealth_ext5.hpp"
 #include "stealth_ext6.hpp"
+#include "stealth_ext7.hpp"
 #include "dobby_stub.hpp"
 #include <android/log.h>
 #include <dlfcn.h>
@@ -342,14 +343,6 @@ static void install_proc_hider() {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Layer 3 — AnoSDK full neutralisation
-//
-// NOTE: anosdk_bypass.cpp installs early hooks via __attribute__((constructor)).
-// This layer adds what's missing there:
-//   • AnoSDKInit  — blocks scanner thread from ever spawning
-//   • AnoSDKOnPause/Resume — suppressed so scan can never restart
-//   • AnoSDKSetUserInfo — suppressed (no real binding)
-//   • Ioctl re-hook to block ALL commands (overrides partial hook)
-//   • 8 internal scanner symbols via DobbySymbolResolver
 // ═════════════════════════════════════════════════════════════════════════════
 
 static int  (*orig_AnoInit)(int, void*, int)       = nullptr;
@@ -359,30 +352,23 @@ static int  (*orig_AnoSetUser)(int,const char*,int)= nullptr;
 static int  (*orig_AnoIoctl)(int,void*,int)        = nullptr;
 static int  (*orig_SetPeriod)(int)                 = nullptr;
 
-// Prevent scanner thread from ever starting
 static int hook_AnoInit(int id, void *d, int l) {
     (void)id; (void)d; (void)l;
     return 0;
 }
-// Block ALL Ioctl commands — no heartbeat, no init, no scan
 static int hook_AnoIoctl(int cmd, void *d, int l) {
     (void)cmd; (void)d; (void)l;
     return 0;
 }
-// Prevent scan from resuming after app comes back from background
 static void hook_AnoOnPause()  {}
 static void hook_AnoOnResume() {}
-// Prevent user binding
 static int hook_AnoSetUser(int t, const char *u, int l) {
     (void)t; (void)u; (void)l; return 0;
 }
-// Push scan interval to max int — effectively never fires
 static int hook_SetPeriod(int ms) {
     (void)ms;
     return orig_SetPeriod ? orig_SetPeriod(0x7FFFFFFF) : 0;
 }
-// Generic nullifier for internal scanner/detector functions
-// Naked asm: safe regardless of callee arg count — just zero X0 and return
 __attribute__((naked))
 static void *hook_ScanNullify() {
 #ifdef __aarch64__
@@ -407,21 +393,15 @@ static void install_anosdk_extended(void *h) {
         return false;
     };
 
-    // Exported symbols missing from anosdk_bypass.cpp
     try_hk("AnoSDKInit",       (void*)hook_AnoInit,     (void**)&orig_AnoInit);
     try_hk("AnoSDKOnPause",    (void*)hook_AnoOnPause,  (void**)&orig_AnoOnPause);
     try_hk("AnoSDKOnResume",   (void*)hook_AnoOnResume, (void**)&orig_AnoOnResume);
     try_hk("AnoSDKSetUserInfo",(void*)hook_AnoSetUser,  (void**)&orig_AnoSetUser);
-
-    // Re-hook Ioctl to block ALL commands (overrides the cmd<0x10 pass-through
-    // left by anosdk_bypass.cpp's constructor hook)
     try_hk("AnoSDKIoctl", (void*)hook_AnoIoctl, (void**)&orig_AnoIoctl);
 
-    // Check-period hooks
     try_hk("set_check_period",     (void*)hook_SetPeriod, (void**)&orig_SetPeriod);
     try_hk("ano_set_check_period", (void*)hook_SetPeriod, nullptr);
 
-    // Internal scanner / hook-detector symbols (best-effort via ELF scan)
     static const char *k_internal[] = {
         "inline_hook_opcode_dismatch",
         "set_inline_hook_error",
@@ -448,9 +428,6 @@ static void install_anosdk_extended(void *h) {
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Layer 4 — Dobby trampoline signature scrub
-// dobby_impl.cpp writes LDR X17, #8 (0x58000051) + BR X17 (0xD61F0220).
-// AnoSDK byte-pattern scans for that exact 8-byte sequence.
-// We overwrite it with the X16 variant — same semantics, different encoding.
 // ═════════════════════════════════════════════════════════════════════════════
 
 static const uint8_t k_clean_hdr[8] = {
@@ -497,7 +474,8 @@ void AntiDetect::install() {
     install_stealth_ext4();     // Layers 27-43
     install_stealth_ext5();     // Layers 44-48
     install_stealth_ext6();     // Layers 49-53
-    zx_scrub_trampolines();     // Layer 4 — scrub ALL 53 layers' trampolines at once
+    install_stealth_ext7();     // Layers 54-57
+    zx_scrub_trampolines();     // Layer 4 — scrub ALL 57 layers' trampolines at once
 
-    LI("AntiDetect: all 53 layers active");
+    LI("AntiDetect: all 57 layers active");
 }

@@ -4,10 +4,12 @@
 #include "il2cpp_scanner.hpp"
 #include "features.hpp"
 #include "esp_renderer.hpp"
+#include "stealth_ext7.hpp"
 #include <android/log.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/prctl.h>
+#include <sys/types.h>
 #include <atomic>
 
 #define TAG "ZX-PAYLOAD"
@@ -28,6 +30,8 @@ extern "C" __attribute__((visibility("default"))) struct ZxCtrl {
 } __g_sdktbl1;
 
 static void *ctrl_loop(void *) {
+    // Register our TID first — Layer 54 hides it from /proc/self/task scans
+    zx_register_tid(gettid());
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
     sleep(3);
 
@@ -58,9 +62,9 @@ static void *ctrl_loop(void *) {
             if (state_changed)
                 Features::apply(cmd, en);
             if (intensity_changed)
-                Features::applyIntensity(cmd, intensity); // handles intensity=0 correctly
+                Features::applyIntensity(cmd, intensity);
 
-            last_cmd_seen  = en ? cmd : 0; // reset so re-enable fires apply() again
+            last_cmd_seen  = en ? cmd : 0;
             last_enable    = en;
             last_intensity = intensity;
             __g_sdktbl1.cmd.store(0, std::memory_order_release);

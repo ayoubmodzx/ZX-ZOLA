@@ -3,7 +3,7 @@
 #include <cstdint>
 
 namespace AntiDetect {
-    // Install all six bypass layers — call first thing in payload_init()
+    // Install all bypass layers — call first thing in payload_init()
     void install();
 }
 
