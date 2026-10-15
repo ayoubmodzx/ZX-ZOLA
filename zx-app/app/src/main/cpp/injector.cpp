@@ -121,6 +121,8 @@ static bool is_anogs_thread(pid_t pid, pid_t tid) {
     if (n <= 0) return false;
     for (int i = 0; i < n; i++) if (comm[i] == '\n' || comm[i] == '\r') { comm[i] = '\0'; break; }
     return strncmp(comm, "ano",     3) == 0 ||
+           strncmp(comm, "mrpcs",   5) == 0 ||
+           strncmp(comm, "mvm_bk",  6) == 0 ||
            strstr( comm, "scan")       != nullptr ||
            strncmp(comm, "libanogs", 8) == 0 ||
            strncmp(comm, "kworker",  7) == 0;
