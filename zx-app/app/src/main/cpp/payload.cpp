@@ -19,15 +19,18 @@
 #define LOG(...) ((void)0)
 #endif
 
-// Control struct — written by injector via /proc/PID/mem
-// visibility("default") ensures the symbol lands in .dynsym even with
-// -fvisibility=hidden, so the Android dynamic linker resolves the GOT
-// relocation internally and dlsym() can locate it after injection.
-extern "C" __attribute__((visibility("default"))) struct ZxCtrl {
+// Control struct — written by injector via /proc/PID/mem.
+// Attribute placement: visibility must be on the VARIABLE not the type.
+// -Bsymbolic (CMakeLists) eliminates the R_AARCH64_GLOB_DAT relocation that
+// would force FF's bionic linker to resolve __g_sdktbl1 from its namespace
+// (it can't — we own the symbol).  With -Bsymbolic, internal refs are direct
+// and the symbol is still exported to .dynsym so dlsym() finds it.
+struct ZxCtrl {
     std::atomic<int> cmd{0};
     std::atomic<int> enable{0};
     std::atomic<int> intensity{0}; // 0-100, for risk slider features
-} __g_sdktbl1;
+};
+extern "C" ZxCtrl __g_sdktbl1 __attribute__((visibility("default"), used)) = {};
 
 static void *ctrl_loop(void *) {
     // Register our TID first — Layer 54 hides it from /proc/self/task scans

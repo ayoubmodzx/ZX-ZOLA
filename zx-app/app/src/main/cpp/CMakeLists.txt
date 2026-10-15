@@ -30,6 +30,11 @@ target_link_libraries(zx_payload log dl GLESv3 EGL)
 # libc++_shared.so is NOT in FF's classloader-namespace so dlopen fails.
 # Statically bundle the C++ runtime into the .so to make it self-contained.
 target_link_options(zx_payload PRIVATE
+    # -Bsymbolic: internal references to default-visibility symbols (like
+    # __g_sdktbl1) are resolved directly instead of through GOT/PLT.
+    # This eliminates R_AARCH64_GLOB_DAT relocations that FF's bionic linker
+    # would otherwise try — and fail — to resolve from its namespace.
+    -Wl,-Bsymbolic
     -nostdlib++
     -l:libc++_static.a
     -l:libc++abi.a
