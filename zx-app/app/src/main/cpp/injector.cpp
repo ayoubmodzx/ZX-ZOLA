@@ -57,6 +57,10 @@ enum Cmd {
 
 // Payload .so path (extracted by ZxEngine.kt into app filesDir)
 static constexpr const char *PAYLOAD_NAME = "libzx_payload.so";
+// Staged name in FF's lib dir — blends with FF's own renderer JNI libs.
+// The source .so is still libzx_payload.so; we copy it under this alias so
+// /proc/maps never shows a "zx" or "payload" string before Layer 2 hides it.
+static constexpr const char *STAGED_NAME  = "libgfxjni_helper.so";
 
 // ── ptrace remote call helpers ────────────────────────────────────────────────
 
@@ -100,6 +104,58 @@ static void thaw_threads() {
     for (int i = 0; i < s_extra_n; i++)
         ptrace(PTRACE_DETACH, s_extra_tids[i], nullptr, nullptr);
     s_extra_n = 0;
+}
+
+// Returns true if this TID belongs to AnoSDK or our own ctrl_loop — both
+// should be excluded from the freeze pass.
+// AnoSDK thread names: "ano*", "*scan*", "libanogs*"
+// Our ctrl_loop: "kworker/*" (prctl rename in ctrl_loop)
+static bool is_anogs_thread(pid_t pid, pid_t tid) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/task/%d/comm", pid, tid);
+    char comm[32] = {};
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    ssize_t n = read(fd, comm, sizeof(comm) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    for (int i = 0; i < n; i++) if (comm[i] == '\n' || comm[i] == '\r') { comm[i] = '\0'; break; }
+    return strncmp(comm, "ano",     3) == 0 ||
+           strstr( comm, "scan")       != nullptr ||
+           strncmp(comm, "libanogs", 8) == 0 ||
+           strncmp(comm, "kworker",  7) == 0;
+}
+
+// SIGSTOP-based thread freezer — much quieter than ptrace per-thread.
+// Skips AnoSDK scanner threads entirely: ptracing them is the #1 detection vector
+// because AnoSDK explicitly monitors for external ptrace on its own TIDs.
+static pid_t s_sigstop_tids[256];
+static int   s_sigstop_n = 0;
+
+static void freeze_threads_safe(pid_t pid) {
+    char path[64]; snprintf(path, sizeof(path), "/proc/%d/task", pid);
+    DIR *d = opendir(path); if (!d) return;
+    struct dirent *e; s_sigstop_n = 0;
+    while ((e = readdir(d)) != nullptr && s_sigstop_n < 256) {
+        if (e->d_name[0] == '.') continue;
+        pid_t tid = (pid_t)atoi(e->d_name);
+        if (tid <= 0 || tid == pid) continue;
+        if (is_anogs_thread(pid, tid)) {
+            LOG("freeze: skip tid=%d (AnoSDK/ctrl)", tid);
+            continue;
+        }
+        if (kill(tid, SIGSTOP) == 0)
+            s_sigstop_tids[s_sigstop_n++] = tid;
+    }
+    closedir(d);
+    usleep(8000);
+    LOG("freeze_threads_safe: stopped %d threads", s_sigstop_n);
+}
+
+static void thaw_threads_safe() {
+    for (int i = 0; i < s_sigstop_n; i++)
+        kill(s_sigstop_tids[i], SIGCONT);
+    s_sigstop_n = 0;
 }
 
 static bool get_regs(pid_t pid, pt_regs *regs) {
@@ -748,8 +804,8 @@ int main(int argc, char *argv[]) {
         return 2;
     }
 
-    // Check if payload is already loaded in target
-    uintptr_t payload_base = ProcMem::findLibBase(pid, "libzx_payload.so");
+    // Check if payload is already loaded in target (look up by staged name)
+    uintptr_t payload_base = ProcMem::findLibBase(pid, STAGED_NAME);
 
     if (!payload_base) {
         // First activation — inject the payload
@@ -813,7 +869,7 @@ int main(int argc, char *argv[]) {
                 for (int ci = 0; ci < 2 && !staged; ci++) {
                     if (!candidates[ci][0]) continue;
                     char tmp_path[512];
-                    snprintf(tmp_path, sizeof(tmp_path), "%slibzx_payload.so", candidates[ci]);
+                    snprintf(tmp_path, sizeof(tmp_path), "%s%s", candidates[ci], STAGED_NAME);
                     lseek(fi, 0, SEEK_SET);
                     int fo = open(tmp_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
                     if (fo < 0) { zerr("main: cannot create %s errno=%d", tmp_path, errno); continue; }
@@ -837,20 +893,20 @@ int main(int argc, char *argv[]) {
         }
 
         if (!ptrace_attach(pid)) { ProcMem::close(); return 3; }
-        freeze_threads(pid);       // stop anti-cheat threads during injection
+        freeze_threads_safe(pid);  // SIGSTOP non-AnoSDK threads; skips AnoSDK scanner TIDs
         bool ok = remote_dlopen(pid, payload_path);
-        thaw_threads();
+        thaw_threads_safe();
         ptrace_detach(pid);
 
         if (!ok) { ERR("Injection failed"); ProcMem::close(); return 4; }
 
-        payload_base = ProcMem::findLibBase(pid, "libzx_payload.so");
+        payload_base = ProcMem::findLibBase(pid, STAGED_NAME);
         LOG("Payload loaded at 0x%lx", payload_base);
     }
 
     // Send command to payload via shared memory flag
     // The payload polls a small control struct it mmap'd at a known offset
-    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, "libzx_payload.so", "__g_sdktbl1");
+    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, STAGED_NAME, "__g_sdktbl1");
     if (ctrl_addr) {
         // Write enable (+4) and intensity (+8) before cmd (+0) so the payload never
         // reads a non-zero cmd with stale enable/intensity values (write-ordering fix)

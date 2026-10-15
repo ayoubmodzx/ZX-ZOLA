@@ -185,8 +185,8 @@ static int hook_prctl(int opt, unsigned long a1, unsigned long a2,
 static int (*g_orig_dladdr)(const void*, Dl_info*) = nullptr;
 
 static const char *const k_hook_names[] = {
-    "zx_payload", "zx_inject", "libzx", "libdobby", "frida", "xposed",
-    "substrate", "androguard", "shadowhook", nullptr
+    "zx_payload", "zx_inject", "libzx", "gfxjni_helper", "libdobby",
+    "frida", "xposed", "substrate", "androguard", "shadowhook", nullptr
 };
 
 static bool is_hook_lib(const char *fname) {

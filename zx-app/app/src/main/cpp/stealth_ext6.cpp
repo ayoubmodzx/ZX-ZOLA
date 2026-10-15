@@ -102,12 +102,12 @@ static bool caller_is_anogs(uintptr_t lr) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Payload name XOR decode (same key 0x5A as stealth_ext5)
-// "libzx_payload.so"
+// Staged payload name XOR decode (same key 0x5A as stealth_ext5)
+// "libgfxjni_helper.so"
 // ─────────────────────────────────────────────────────────────────────────────
 static const uint8_t k_pay_xor[] = {
-    // l     i     b     z     x     _     p     a     y     l     o     a     d     .     s     o
-    0x36, 0x33, 0x38, 0x20, 0x22, 0x05, 0x2A, 0x3B, 0x23, 0x36, 0x35, 0x3B, 0x3E, 0x74, 0x29, 0x35, 0x00
+    // l     i     b     g     f     x     j     n     i     _     h     e     l     p     e     r     .     s     o
+    0x36, 0x33, 0x38, 0x3D, 0x3C, 0x22, 0x30, 0x34, 0x33, 0x05, 0x32, 0x3F, 0x36, 0x2A, 0x3F, 0x28, 0x74, 0x29, 0x35, 0x00
 };
 static char s_pay_name[32] = {};
 static void decode_pay() {
