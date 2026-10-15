@@ -758,6 +758,64 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                 zerr("remote_dlopen: insns@[PC-16]: %08x %08x %08x %08x | %08x %08x %08x %08x",
                      ci[0],ci[1],ci[2],ci[3],ci[4],ci[5],ci[6],ci[7]);
         }
+
+        // /proc/pid/maps scan — identify which library owns crash-related addresses.
+        // PAC bits are in the top byte; mask them off before comparing against maps ranges.
+        // ARMv8.3 PAC uses bits [63:55] or [63:48] depending on TBI/VA_BITS config.
+        // Safe mask: clear top 8 bits (handles both 39-bit and 48-bit VA configs).
+        {
+            constexpr uintptr_t PAC_MASK = 0x00FFFFFFFFFFFFFFull;
+            uintptr_t probe_addrs[] = {
+                sr.regs[16] & PAC_MASK,   // X16 — PAC-tagged function pointer that crashed
+                sr.regs[17] & PAC_MASK,   // X17 — PLT stub or trampoline
+                sr.regs[30] & PAC_MASK,   // X30 (LR) — return address into crash function
+                stk[0] & PAC_MASK,        // stack frame 0
+                stk[1] & PAC_MASK,        // stack frame 1
+                stk[7] & PAC_MASK,        // stack frame 7
+            };
+            zerr("remote_dlopen: maps scan probing X16=0x%lx X17=0x%lx X30=0x%lx stk0=0x%lx stk1=0x%lx stk7=0x%lx",
+                 (unsigned long)probe_addrs[0], (unsigned long)probe_addrs[1],
+                 (unsigned long)probe_addrs[2], (unsigned long)probe_addrs[3],
+                 (unsigned long)probe_addrs[4], (unsigned long)probe_addrs[5]);
+
+            char mpath[64];
+            snprintf(mpath, sizeof(mpath), "/proc/%d/maps", pid);
+            FILE *mf = fopen(mpath, "r");
+            if (mf) {
+                char line[512];
+                // Track last printed lib to avoid duplicate lines for contiguous regions
+                char last_name[256] = {};
+                uintptr_t last_start = 0;
+                while (fgets(line, sizeof(line), mf)) {
+                    uintptr_t start = 0, end = 0;
+                    char perms[8] = {}, name[256] = {};
+                    sscanf(line, "%lx-%lx %7s %*s %*s %*s %255s",
+                           &start, &end, perms, name);
+                    if (perms[2] != 'x') continue; // exec regions only
+                    bool relevant = false;
+                    for (auto a : probe_addrs)
+                        if (a && a >= start && a < end) { relevant = true; break; }
+                    if (relevant) {
+                        // Which probes hit this region
+                        const char *labels[] = {"X16","X17","X30","stk0","stk1","stk7"};
+                        char hit[64] = {};
+                        int hpos = 0;
+                        for (int k = 0; k < 6; k++) {
+                            if (probe_addrs[k] && probe_addrs[k] >= start && probe_addrs[k] < end) {
+                                hpos += snprintf(hit+hpos, sizeof(hit)-hpos, "%s+0x%lx ",
+                                                 labels[k], (unsigned long)(probe_addrs[k] - start));
+                            }
+                        }
+                        zerr("remote_dlopen: maps HIT %lx-%lx %s [%s] %s",
+                             (unsigned long)start, (unsigned long)end, perms,
+                             name[0] ? name : "[anon]", hit);
+                    }
+                }
+                fclose(mf);
+            } else {
+                zerr("remote_dlopen: maps open failed errno=%d", errno);
+            }
+        }
     }
 
     if (sr.pc != sc_addr + 12)
