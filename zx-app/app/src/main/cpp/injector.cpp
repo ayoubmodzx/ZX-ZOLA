@@ -631,28 +631,31 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     }
 
     uintptr_t sc_addr = remote_buf + path_aligned;
-    // Minimal 32-byte shellcode: dlerror() removed — PAC-protected path crashes under ptrace.
-    // LDR X8,#24 / NOP / BLR X8 / BRK #0 / NOP / NOP / fn_dlopen(8 bytes)
-    struct { uint32_t insns[6]; uint64_t fn_dlopen; } sc = {};
-    sc.insns[0] = 0x580000C8u; // LDR X8, #24  (imm19=6, fn_dlopen at offset +24)
+    // Minimal 32-byte shellcode: call do_dlopen directly (not __loader_dlopen).
+    // __loader_dlopen does PACIBSP then B do_dlopen (tail call) — do_dlopen also does
+    // PACIBSP → double-PAC on X30 → corrupted return address → SIGSEGV at RETAB.
+    // Bypass by calling do_dlopen directly with proper args: (path, flags, NULL, caller_addr).
+    // LDR X8,#24 / NOP / BLR X8 / BRK #0 / NOP / NOP / fn_do_dlopen(8 bytes)
+    struct { uint32_t insns[6]; uint64_t fn_do_dlopen; } sc = {};
+    sc.insns[0] = 0x580000C8u; // LDR X8, #24  (imm19=6, fn_do_dlopen at offset +24)
     sc.insns[1] = 0xD503201Fu; // NOP
-    sc.insns[2] = 0xD63F0100u; // BLR X8  (__loader_dlopen; X2 preserved as caller_addr)
+    sc.insns[2] = 0xD63F0100u; // BLR X8  (do_dlopen; X2=NULL extinfo, X3=caller_addr)
     sc.insns[3] = 0xD4200000u; // BRK #0   — stop; X0 = dlopen handle
     sc.insns[4] = 0xD503201Fu; // NOP      (pool align)
     sc.insns[5] = 0xD503201Fu; // NOP
-    // Call __loader_dlopen directly (not the libdl wrapper).
-    // Wrapper does MOV X2,X30 which discards our pre-set caller_addr (libmain.so+0x1000).
-    // __loader_dlopen preserves X2 as caller_addr → correct namespace resolution.
-    sc.fn_dlopen = (uint64_t)loader_dlopen_addr;
+    // do_dlopen(path, flags, extinfo=NULL, caller_addr) — skip __loader_dlopen to avoid
+    // double-PACIBSP corruption: __loader_dlopen signs LR then tail-calls do_dlopen which
+    // signs the already-signed LR again, producing a corrupted address that crashes RETAB.
+    sc.fn_do_dlopen = do_dlopen_target ? (uint64_t)do_dlopen_target : (uint64_t)loader_dlopen_addr;
 
     if (!ProcMem::write(sc_addr, &sc, sizeof(sc))) {
         zerr("remote_dlopen: write shellcode failed errno=%d", errno); return false;
     }
     // Readback: confirm shellcode landed correctly in remote memory
     {
-        struct { uint32_t insns[6]; uint64_t fn_dlopen; } rb = {};
+        struct { uint32_t insns[6]; uint64_t fn_do_dlopen; } rb = {};
         ProcMem::read(sc_addr, &rb, sizeof(rb));
-        zerr("remote_dlopen: sc_readback fn_dlopen=0x%lx", (unsigned long)rb.fn_dlopen);
+        zerr("remote_dlopen: sc_readback fn_do_dlopen=0x%lx", (unsigned long)rb.fn_do_dlopen);
         zerr("remote_dlopen: sc_readback insns: %08x %08x %08x %08x %08x %08x",
              rb.insns[0],rb.insns[1],rb.insns[2],rb.insns[3],rb.insns[4],rb.insns[5]);
         zerr("remote_dlopen: sc_addr=0x%lx brk_expected_at=0x%lx",
@@ -669,16 +672,16 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     get_regs(pid, &orig);
     memcpy(&regs, &orig, sizeof(regs));
     regs.pstate &= ~(uint64_t)(3u << 10); // clear PSTATE.BTYPE
-    regs.regs[0] = remote_buf;   // __loader_dlopen arg0: path
-    regs.regs[1] = RTLD_NOW;    // __loader_dlopen arg1: flags
-    // caller_addr: use libmain.so+0x1000 (game's namespace) so do_dlopen resolves
-    // the load request in FF's app namespace rather than an anonymous mapping.
-    // __loader_dlopen passes X2 → X3 (caller_addr arg) without clobbering it.
+    // do_dlopen(path, flags, extinfo, caller_addr)
+    regs.regs[0] = remote_buf;   // path
+    regs.regs[1] = RTLD_NOW;     // flags
+    regs.regs[2] = 0;            // extinfo = NULL
+    // caller_addr: libmain.so+0x1000 → do_dlopen resolves in FF's app namespace.
     {
         uintptr_t libmain_base = ProcMem::findLibBase(pid, "libmain.so");
-        regs.regs[2] = libmain_base ? libmain_base + 0x1000 : dlopen_addr;
+        regs.regs[3] = libmain_base ? libmain_base + 0x1000 : dlopen_addr;
         zerr("remote_dlopen: caller_addr=0x%lx (libmain_base=0x%lx)",
-             (unsigned long)regs.regs[2], (unsigned long)libmain_base);
+             (unsigned long)regs.regs[3], (unsigned long)libmain_base);
     }
     regs.pc = sc_addr;
 
