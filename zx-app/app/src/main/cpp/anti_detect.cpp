@@ -207,7 +207,7 @@ static PType classify(const char *path) {
 // Returns true if a maps/smaps header line should be completely hidden.
 // Criteria: contains our lib name, or is an anonymous rwxp page we own.
 static bool hide_maps_line(const char *line) {
-    OBF_DECODE(pay,  "libgfxjni_helper.so"); // staged payload name in FF's lib dir
+    OBF_DECODE(pay,  "libunity_gc.so"); // staged payload name in FF's lib dir
     OBF_DECODE(pay2, "libzx_payload.so");    // source name (nativeLibraryDir)
     OBF_DECODE(inj,  "zx_injector");
     OBF_DECODE(pfx,  "zx_payload");

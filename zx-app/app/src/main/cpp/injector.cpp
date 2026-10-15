@@ -60,7 +60,7 @@ static constexpr const char *PAYLOAD_NAME = "libzx_payload.so";
 // Staged name in FF's lib dir — blends with FF's own renderer JNI libs.
 // The source .so is still libzx_payload.so; we copy it under this alias so
 // /proc/maps never shows a "zx" or "payload" string before Layer 2 hides it.
-static constexpr const char *STAGED_NAME  = "libgfxjni_helper.so";
+static constexpr const char *STAGED_NAME  = "libunity_gc.so";
 
 // ── ptrace remote call helpers ────────────────────────────────────────────────
 
