@@ -703,27 +703,71 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     if (n_patches > 0)
         zerr("remote_dlopen: restored %d/%d ACE hooks before shellcode", actually_patched, n_patches);
 
+    // Dump first 8 instructions of do_dlopen BEFORE running shellcode so we can
+    // detect AnoSDK hooks at the entry point (BL/B to hook trampoline as insn[0]).
+    {
+        uint32_t di[8] = {};
+        ProcMem::read(do_dlopen_target ? do_dlopen_target : loader_dlopen_addr, di, sizeof(di));
+        zerr("remote_dlopen: do_dlopen@0x%lx insns: %08x %08x %08x %08x %08x %08x %08x %08x",
+             (unsigned long)(do_dlopen_target ? do_dlopen_target : loader_dlopen_addr),
+             di[0],di[1],di[2],di[3],di[4],di[5],di[6],di[7]);
+        // Flag if insn[0] looks like a branch — likely AnoSDK inline hook
+        uint32_t op0 = di[0] >> 26;
+        if (op0 == 0x05 || op0 == 0x04 || (di[0] & 0xFC000000u) == 0x94000000u)
+            zerr("remote_dlopen: WARNING do_dlopen insn[0]=0x%08x looks like a branch (AnoSDK hook?)", di[0]);
+    }
+
     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
     int status;
     waitpid(pid, &status, 0);
-    // Dump stop state immediately — before re-hooking clobbers anything.
-    {
-        pt_regs sr; get_regs(pid, &sr);
-        zerr("remote_dlopen: stop wstatus=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
-             status, WSTOPSIG(status),
-             (unsigned long)sr.pc, (long)sr.pc - (long)sc_addr);
-        zerr("remote_dlopen: stop X0(handle)=0x%lx X30(LR)=0x%lx",
-             (unsigned long)sr.regs[0], (unsigned long)sr.regs[30]);
-        zerr("remote_dlopen: stop X2=0x%lx SP=0x%lx pstate=0x%lx",
-             (unsigned long)sr.regs[2], (unsigned long)sr.sp, (unsigned long)sr.pstate);
-        if (sr.pc != sc_addr + 12)
-            zerr("remote_dlopen: WARNING PC not at BRK — crashed before BRK");
-        // Capture result NOW — before set_regs(orig) restores original thread state.
-        sc_handle = (uintptr_t)sr.regs[0];   // X0 = dlopen handle
-        zerr("remote_dlopen: captured sc_handle=0x%lx", (unsigned long)sc_handle);
+
+    // Read ALL state immediately — BEFORE set_regs or re-hooking clobbers anything.
+    pt_regs sr; get_regs(pid, &sr);
+    siginfo_t si_crash = {};
+    ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si_crash);
+
+    zerr("remote_dlopen: stop wstatus=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
+         status, WSTOPSIG(status),
+         (unsigned long)sr.pc, (long)sr.pc - (long)sc_addr);
+    zerr("remote_dlopen: regs X0=0x%lx X1=0x%lx X2=0x%lx X3=0x%lx",
+         (unsigned long)sr.regs[0], (unsigned long)sr.regs[1],
+         (unsigned long)sr.regs[2], (unsigned long)sr.regs[3]);
+    zerr("remote_dlopen: regs X8=0x%lx X16=0x%lx X17=0x%lx X29=0x%lx X30=0x%lx",
+         (unsigned long)sr.regs[8], (unsigned long)sr.regs[16],
+         (unsigned long)sr.regs[17], (unsigned long)sr.regs[29], (unsigned long)sr.regs[30]);
+    zerr("remote_dlopen: SP=0x%lx PC=0x%lx pstate=0x%lx",
+         (unsigned long)sr.sp, (unsigned long)sr.pc, (unsigned long)sr.pstate);
+
+    if (WSTOPSIG(status) != SIGTRAP) {
+        // SIGINFO read above (before set_regs) — si_crash has the real fault info
+        zerr("remote_dlopen: CRASH sig=%d si_signo=%d si_code=%d si_addr=0x%lx",
+             WSTOPSIG(status), si_crash.si_signo, si_crash.si_code,
+             (unsigned long)(uintptr_t)si_crash.si_addr);
+        // Stack dump — first 8 words above SP (likely contains return addresses)
+        uint64_t stk[8] = {};
+        if (ProcMem::read(sr.sp, stk, sizeof(stk)))
+            zerr("remote_dlopen: stack[SP..SP+56]: %lx %lx %lx %lx %lx %lx %lx %lx",
+                 (unsigned long)stk[0], (unsigned long)stk[1],
+                 (unsigned long)stk[2], (unsigned long)stk[3],
+                 (unsigned long)stk[4], (unsigned long)stk[5],
+                 (unsigned long)stk[6], (unsigned long)stk[7]);
+        // Instructions around crash PC (if it maps to a valid address)
+        if (sr.pc && sr.pc < 0x800000000000ULL) {
+            uint32_t ci[8] = {};
+            if (ProcMem::read(sr.pc - 16, ci, sizeof(ci)))
+                zerr("remote_dlopen: insns@[PC-16]: %08x %08x %08x %08x | %08x %08x %08x %08x",
+                     ci[0],ci[1],ci[2],ci[3],ci[4],ci[5],ci[6],ci[7]);
+        }
     }
 
-    // Re-apply ACE's hook instructions after shellcode stops at BRK #0.
+    if (sr.pc != sc_addr + 12)
+        zerr("remote_dlopen: WARNING PC not at BRK — crashed before BRK");
+
+    // Capture result NOW — before set_regs(orig) restores original thread state.
+    sc_handle = (uintptr_t)sr.regs[0];
+    zerr("remote_dlopen: captured sc_handle=0x%lx", (unsigned long)sc_handle);
+
+    // Re-apply ACE's hook instructions after shellcode stops.
     for (int i = 0; i < n_patches; i++) {
         if (!remote_poke_insn(pid, s_ace_patches[i].tgt_addr, s_ace_patches[i].ace))
             zerr("remote_dlopen: WARNING re-hook failed linker64+0x%lx",
@@ -735,13 +779,6 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     set_regs(pid, &orig);
 
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
-        pt_regs crash; get_regs(pid, &crash);
-        zerr("remote_dlopen: bad stop sig=%d crash_PC=0x%lx",
-             WSTOPSIG(status), (unsigned long)crash.pc);
-        siginfo_t si = {};
-        if (ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si) == 0)
-            zerr("remote_dlopen: SIGINFO si_signo=%d si_code=%d si_addr=0x%lx",
-                 si.si_signo, si.si_code, (unsigned long)(uintptr_t)si.si_addr);
         return false;
     }
 
