@@ -31,12 +31,18 @@ target_link_libraries(zx_payload log dl GLESv3 EGL)
 # Statically bundle the C++ runtime into the .so to make it self-contained.
 if(ANDROID_ABI STREQUAL "arm64-v8a")
     # PAC (Pointer Authentication Code) is AArch64-only — thumbv7 has no PAC.
-    # -mbranch-protection=standard signs function returns with PACIBSP.
-    # -z pac-plt emits BRAAZ X16 PLT stubs so bionic's PAC-signed GOT
-    # entries authenticate correctly on ARMv8.3 devices (BR X16 leaves PAC
-    # bits intact → SIGSEGV in our own constructor without this flag).
-    target_compile_options(zx_payload PRIVATE -mbranch-protection=standard)
-    target_link_options(zx_payload PRIVATE -Wl,-z,pac-plt)
+    #
+    # -z pac-plt  → PLT stubs use BRAA X16, X17 (authenticated branch) instead
+    #               of plain BR X16. Required because bionic on PAC-enabled
+    #               devices signs GOT entries with pacia(fn_addr, &got_entry).
+    #               BR X16 on a PAC-signed value → SIGSEGV.
+    #
+    # -z now      → Force immediate (non-lazy) symbol binding so bionic signs
+    #               ALL GOT entries during dlopen BEFORE our constructors run.
+    #               Without this, lazy-binding leaves GOT entries as unsigned
+    #               lazy-resolver stubs; the first BRAA on an unsigned stub
+    #               fails authentication → SIGSEGV in our own constructor.
+    target_link_options(zx_payload PRIVATE -Wl,-z,pac-plt -Wl,-z,now)
 endif()
 target_link_options(zx_payload PRIVATE
     # -Bsymbolic: internal references to default-visibility symbols (like
