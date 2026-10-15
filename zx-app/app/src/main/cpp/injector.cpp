@@ -689,6 +689,60 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: set_regs failed errno=%d", errno); return false;
     }
 
+    // ── Unity libunity.so PAC tail-call thunk patch ──────────────────────────────
+    // libunity.so (20MB) has 28 tail-call thunks: LDP X29,X30 / AUTIBSP / BR X16
+    // On PAC-capable devices, Unity's GOT entries are PAC-signed (PACIA + slot addr
+    // as modifier). BR X16 doesn't authenticate → X16 high bits remain → SIGSEGV.
+    // Fix: temporarily replace each BR X16 (0xD61F0200) with RET (0xD65F03C0).
+    // AUTIBSP already cleaned X30 → RET returns correctly to the thunk's caller.
+    // These thunks fire during our do_dlopen call via Unity's namespace resolver.
+    // Patches are restored immediately after shellcode stops (BRK #0 or crash).
+    static constexpr uint32_t kUnityThunkFileOffsets[] = {
+        0x01398354,0x013984e0,0x0139992c,0x0139f7e8,
+        0x0139f918,0x0139fa88,0x013a17b0,0x013a1de8,
+        0x013a1e00,0x013a33ec,0x013a34c8,0x013a35a8,
+        0x013a3670,0x013a3688,0x013a37a0,0x013a3b84,
+        0x013a3de0,0x013a4974,0x013a51ec,0x013a5904,
+        0x013a59ec,0x013a5c28,0x013a5f60,0x013a7134,
+        0x013a7a20,0x013a7cec,0x013a7e24,0x013a82d4,
+        0x013aabc0,0x013ab068,
+    };
+    // libunity.so TEXT segment: vaddr=0x413a00, file_offset=0x40fa00
+    // → runtime_addr = unity_base + file_offset + 0x4000
+    static constexpr uint32_t kUnityTextDelta = 0x4000;
+    static constexpr uint32_t kBrX16  = 0xD61F0200u;
+    static constexpr uint32_t kRet    = 0xD65F03C0u;
+
+    struct UnityPatch { uintptr_t addr; uint32_t orig; };
+    UnityPatch unity_patches[32];
+    int n_unity_patches = 0;
+
+    uintptr_t unity_base = ProcMem::findLibBase(pid, "libunity.so");
+    if (unity_base) {
+        zerr("remote_dlopen: libunity.so base=0x%lx — patching %zu BR_X16 tail-call thunks",
+             (unsigned long)unity_base, sizeof(kUnityThunkFileOffsets)/sizeof(kUnityThunkFileOffsets[0]));
+        for (auto fo : kUnityThunkFileOffsets) {
+            uintptr_t addr = unity_base + fo + kUnityTextDelta;
+            uint32_t cur = 0;
+            if (!ProcMem::read(addr, &cur, 4)) continue;
+            if (cur != kBrX16) {
+                zerr("remote_dlopen: unity thunk @0x%lx expected BR_X16 got 0x%08x — skip",
+                     (unsigned long)addr, cur);
+                continue;
+            }
+            if (!ProcMem::write(addr, &kRet, 4)) {
+                zerr("remote_dlopen: unity thunk @0x%lx write failed errno=%d",
+                     (unsigned long)addr, errno);
+                continue;
+            }
+            if (n_unity_patches < 32)
+                unity_patches[n_unity_patches++] = {addr, kBrX16};
+        }
+        zerr("remote_dlopen: patched %d unity thunks BR_X16→RET", n_unity_patches);
+    } else {
+        zerr("remote_dlopen: libunity.so not found — no thunk patches");
+    }
+
     // Restore all original instructions before shellcode runs.
     // All secondary threads are frozen — no race with ACE re-patching.
     int actually_patched = 0;
@@ -824,6 +878,15 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // Capture result NOW — before set_regs(orig) restores original thread state.
     sc_handle = (uintptr_t)sr.regs[0];
     zerr("remote_dlopen: captured sc_handle=0x%lx", (unsigned long)sc_handle);
+
+    // Restore Unity tail-call thunk patches (BR_X16 back) before resuming FF.
+    for (int i = 0; i < n_unity_patches; i++) {
+        if (!ProcMem::write(unity_patches[i].addr, &unity_patches[i].orig, 4))
+            zerr("remote_dlopen: unity restore failed @0x%lx errno=%d",
+                 (unsigned long)unity_patches[i].addr, errno);
+    }
+    if (n_unity_patches > 0)
+        zerr("remote_dlopen: restored %d unity thunk patches", n_unity_patches);
 
     // Re-apply ACE's hook instructions after shellcode stops.
     for (int i = 0; i < n_patches; i++) {
