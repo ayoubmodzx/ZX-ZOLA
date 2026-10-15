@@ -29,16 +29,21 @@ target_include_directories(zx_payload PRIVATE .)
 target_link_libraries(zx_payload log dl GLESv3 EGL)
 # libc++_shared.so is NOT in FF's classloader-namespace so dlopen fails.
 # Statically bundle the C++ runtime into the .so to make it self-contained.
-target_compile_options(zx_payload PRIVATE -mbranch-protection=standard)
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    # PAC (Pointer Authentication Code) is AArch64-only — thumbv7 has no PAC.
+    # -mbranch-protection=standard signs function returns with PACIBSP.
+    # -z pac-plt emits BRAAZ X16 PLT stubs so bionic's PAC-signed GOT
+    # entries authenticate correctly on ARMv8.3 devices (BR X16 leaves PAC
+    # bits intact → SIGSEGV in our own constructor without this flag).
+    target_compile_options(zx_payload PRIVATE -mbranch-protection=standard)
+    target_link_options(zx_payload PRIVATE -Wl,-z,pac-plt)
+endif()
 target_link_options(zx_payload PRIVATE
     # -Bsymbolic: internal references to default-visibility symbols (like
     # __g_sdktbl1) are resolved directly instead of through GOT/PLT.
     # This eliminates R_AARCH64_GLOB_DAT relocations that FF's bionic linker
     # would otherwise try — and fail — to resolve from its namespace.
     -Wl,-Bsymbolic
-    # pac-plt: emit BRAAZ X16 PLT stubs instead of BR X16 so bionic's
-    # PAC-signed GOT entries authenticate correctly on ARMv8.3 devices.
-    -Wl,-z,pac-plt
     -nostdlib++
     -l:libc++_static.a
     -l:libc++abi.a
