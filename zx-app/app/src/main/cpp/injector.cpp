@@ -256,6 +256,24 @@ static uintptr_t find_svc_gadget(pid_t pid) {
     return 0;
 }
 
+// PTRACE_SINGLESTEP + waitpid with SIGSTOP/SIGTSTP retry.
+// freeze_threads_safe() sends SIGSTOP to other threads which triggers a
+// group-stop on the whole process — the ptraced main thread sees sig=19 instead
+// of SIGTRAP. Suppress group-stops (sig=0) and re-issue SINGLESTEP up to 16×.
+static int singlestep_wait(pid_t pid) {
+    int wst = 0;
+    for (int i = 0; i < 16; i++) {
+        ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
+        waitpid(pid, &wst, 0);
+        if (!WIFSTOPPED(wst)) break;
+        int sig = WSTOPSIG(wst);
+        if (sig == SIGTRAP) break;
+        if (sig == SIGSTOP || sig == SIGTSTP) continue; // group-stop — suppress & retry
+        break; // any other signal — fall through to caller's error handler
+    }
+    return wst;
+}
+
 // Allocate RWX memory in target via a raw SVC #0 gadget + PTRACE_SINGLESTEP.
 // Bypasses the mmap() C wrapper whose BTI guard (ARMv8.5+) causes SIGSEGV when
 // we teleport PC there via PTRACE_SETREGSET instead of a real BL/BLR instruction.
@@ -304,9 +322,7 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
 
     // PTRACE_SINGLESTEP: executes exactly the SVC instruction, then stops with SIGTRAP.
     // The kernel handles the mmap syscall during the SVC, returns X0 = mapped address.
-    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-    int wst = 0;
-    waitpid(pid, &wst, 0);
+    int wst = singlestep_wait(pid);
 
     if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
         pt_regs crash; get_regs(pid, &crash);
@@ -603,8 +619,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         rr.regs[3] = 0;
         rr.pc = find_svc_gadget(pid);
         if (rr.pc && set_regs(pid, &rr)) {
-            ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-            int wst = 0; waitpid(pid, &wst, 0);
+            int wst = singlestep_wait(pid);
             pt_regs rp; get_regs(pid, &rp);
             int64_t fd_ret = (int64_t)rp.regs[0];
             zerr("remote_dlopen: openat test fd=%lld (neg=errno, >=0=ok)", (long long)fd_ret);
@@ -612,11 +627,10 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                 // close fd via syscall
                 rp.regs[8] = 57; rp.regs[0] = (uint64_t)fd_ret;
                 rp.pc = find_svc_gadget(pid);
-                if (rp.pc && set_regs(pid, &rp)) {
-                    ptrace(PTRACE_SINGLESTEP, pid, nullptr, nullptr);
-                    waitpid(pid, &wst, 0);
-                }
+                if (rp.pc && set_regs(pid, &rp))
+                    singlestep_wait(pid);
             }
+            (void)wst;
         }
         set_regs(pid, &ro);
     }
