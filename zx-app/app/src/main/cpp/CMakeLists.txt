@@ -54,7 +54,6 @@ if(ANDROID_ABI STREQUAL "arm64-v8a")
     # Without PAC property: bionic treats all JUMP_SLOT relocations as plain
     # pointer writes, BR X16 works on every device, PAC-capable or not.
     target_compile_options(zx_payload PRIVATE -mbranch-protection=none)
-    target_compile_options(zx_injector PRIVATE -mbranch-protection=none)
 endif()
 target_link_options(zx_payload PRIVATE
     # -Bsymbolic: internal references to default-visibility symbols (like
@@ -83,6 +82,9 @@ target_link_options(zx_injector PRIVATE
     -l:libc++_static.a
     -l:libc++abi.a
 )
+if(ANDROID_ABI STREQUAL "arm64-v8a")
+    target_compile_options(zx_injector PRIVATE -mbranch-protection=none)
+endif()
 
 # Package injector as libzx_injector.so in jniLibs so the system installs it
 # into nativeLibraryDir at install time — that directory is exec-allowed, unlike
