@@ -62,6 +62,20 @@
 #define LE(...) ((void)0)
 #endif
 
+static constexpr uint8_t STH4_XK = 0x5Au;
+template<size_t N> struct ObfS4 {
+    char data[N]{};
+    constexpr explicit ObfS4(const char (&s)[N]) {
+        for (size_t i = 0; i < N; i++) data[i] = (char)(s[i] ^ STH4_XK);
+    }
+    void decode(char (&out)[N]) const {
+        for (size_t i = 0; i < N; i++) out[i] = (char)(data[i] ^ STH4_XK);
+    }
+};
+#define OBF4(var, lit) \
+    char var[sizeof(lit)]; \
+    do { static constexpr ObfS4<sizeof(lit)> _o4(lit); _o4.decode(var); } while(0)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer 27 — clock_gettime CLOCK_BOOTTIME / CLOCK_MONOTONIC_RAW spoof
 // AnoSDK uses these (immune to gettimeofday spoofing) for timing anti-debug.
@@ -189,21 +203,6 @@ static int hook_prctl(int opt, unsigned long a1, unsigned long a2,
 // ─────────────────────────────────────────────────────────────────────────────
 
 static int (*g_orig_dladdr)(const void*, Dl_info*) = nullptr;
-
-// Compile-time XOR — hook library names never appear in .rodata
-static constexpr uint8_t STH4_XK = 0x5Au;
-template<size_t N> struct ObfS4 {
-    char data[N]{};
-    constexpr explicit ObfS4(const char (&s)[N]) {
-        for (size_t i = 0; i < N; i++) data[i] = (char)(s[i] ^ STH4_XK);
-    }
-    void decode(char (&out)[N]) const {
-        for (size_t i = 0; i < N; i++) out[i] = (char)(data[i] ^ STH4_XK);
-    }
-};
-#define OBF4(var, lit) \
-    char var[sizeof(lit)]; \
-    do { static constexpr ObfS4<sizeof(lit)> _o4(lit); _o4.decode(var); } while(0)
 
 static bool is_hook_lib(const char *fname) {
     if (!fname) return false;
