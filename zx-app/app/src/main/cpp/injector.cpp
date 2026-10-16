@@ -988,42 +988,60 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     }
 
     // ── PAC GOT strip ────────────────────────────────────────────────────────
-    // FF's bionic may PAC-sign our GLOB_DAT GOT entries with PACIA during dlopen
-    // relocation processing. Our PLT uses BR X16 (no auth), so signed entries
-    // crash. Strip PAC by clearing bits [63:56] from entries whose top byte is
-    // non-zero (valid user VA has bits [63:48] == 0).
+    // FF's bionic PAC-signs GLOB_DAT entries with PACIA during relocation.
+    // GLOB_DAT lands in the relro r--p PT_LOAD (separate from rw-p .got.plt).
+    // find_rw_segment() only finds rw-p and misses relro entirely.
+    // Fix: scan ALL non-exec segments of our payload from /proc/pid/maps.
+    // pwrite64 via /proc/pid/mem CAN write to relro pages when we're root.
     {
-        uint64_t got_vaddr = 0, got_size = 0;
-        if (find_rw_segment(so_path, &got_vaddr, &got_size)) {
-            uintptr_t elf_base = ProcMem::findLibBase(pid, STAGED_NAME);
-            uintptr_t got_addr = elf_base + (uintptr_t)got_vaddr;
-            size_t n = (size_t)(got_size / 8);
-            if (n > 8192) n = 8192;
-            static uint64_t got_buf[8192];
-            if (ProcMem::read(got_addr, got_buf, n * 8)) {
+        char mpath[64]; snprintf(mpath, sizeof(mpath), "/proc/%d/maps", pid);
+        FILE *mf = fopen(mpath, "r");
+        int total_stripped = 0;
+        zerr("remote_dlopen: PAC GOT strip — scanning all non-exec segments of %s", STAGED_NAME);
+        if (mf) {
+            char line[512];
+            while (fgets(line, sizeof(line), mf)) {
+                if (!strstr(line, STAGED_NAME)) continue;
+                uintptr_t seg_start = 0, seg_end = 0; char perms[8] = {};
+                sscanf(line, "%lx-%lx %7s", &seg_start, &seg_end, perms);
+                if (perms[2] == 'x') continue; // skip code segment — only data/relro
+                size_t seg_len = seg_end - seg_start;
+                size_t n = seg_len / 8;
+                if (n > 16384) n = 16384;
+                static uint64_t seg_buf[16384];
+                if (!ProcMem::read(seg_start, seg_buf, n * 8)) {
+                    zerr("remote_dlopen: PAC read failed [0x%lx-0x%lx] %s errno=%d",
+                         (unsigned long)seg_start, (unsigned long)seg_end, perms, errno);
+                    continue;
+                }
                 int stripped = 0;
                 for (size_t gi = 0; gi < n; gi++) {
-                    uint64_t v = got_buf[gi];
+                    uint64_t v = seg_buf[gi];
                     uint8_t top = (uint8_t)(v >> 56);
                     if (top != 0 && top != 0xFF &&
-                        (v & 0x00FFFFFFFFFFFFFFull) >= 0x10000ULL)
-                    { got_buf[gi] = v & 0x00FFFFFFFFFFFFFFull; stripped++; }
+                        (v & 0x00FFFFFFFFFFFFFFull) >= 0x10000ULL) {
+                        seg_buf[gi] = v & 0x00FFFFFFFFFFFFFFull;
+                        stripped++;
+                    }
                 }
                 if (stripped > 0) {
-                    if (ProcMem::write(got_addr, got_buf, n * 8))
-                        zerr("remote_dlopen: stripped PAC from %d/%zu GOT entries @0x%lx",
-                             stripped, n, (unsigned long)got_addr);
-                    else
-                        zerr("remote_dlopen: GOT write failed @0x%lx", (unsigned long)got_addr);
+                    if (ProcMem::write(seg_start, seg_buf, n * 8)) {
+                        total_stripped += stripped;
+                        zerr("remote_dlopen: PAC stripped %d entries [0x%lx-0x%lx] %s",
+                             stripped, (unsigned long)seg_start, (unsigned long)seg_end, perms);
+                    } else {
+                        zerr("remote_dlopen: PAC write FAILED [0x%lx-0x%lx] %s errno=%d",
+                             (unsigned long)seg_start, (unsigned long)seg_end, perms, errno);
+                    }
                 } else {
-                    zerr("remote_dlopen: GOT scan: 0 PAC-signed entries (n=%zu) — already clean or TBI mismatch", n);
+                    zerr("remote_dlopen: PAC scan 0 hits [0x%lx-0x%lx] %s (n=%zu) — clean",
+                         (unsigned long)seg_start, (unsigned long)seg_end, perms, n);
                 }
-            } else {
-                zerr("remote_dlopen: GOT read failed @0x%lx sz=%llu",
-                     (unsigned long)got_addr, (unsigned long long)got_size);
             }
+            fclose(mf);
+            zerr("remote_dlopen: PAC GOT strip done — total entries stripped: %d", total_stripped);
         } else {
-            zerr("remote_dlopen: find_rw_segment failed for %s", so_path);
+            zerr("remote_dlopen: PAC GOT strip maps open failed errno=%d", errno);
         }
     }
 
@@ -1051,11 +1069,78 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                 ptrace(PTRACE_CONT, pid, nullptr, nullptr);
                 int st2 = 0; waitpid(pid, &st2, 0);
                 pt_regs sr2; get_regs(pid, &sr2);
-                if (WIFSTOPPED(st2) && WSTOPSIG(st2) == SIGTRAP && sr2.pc == sc_addr + 8)
+                if (WIFSTOPPED(st2) && WSTOPSIG(st2) == SIGTRAP && sr2.pc == sc_addr + 8) {
                     zerr("remote_dlopen: zx_payload_start OK");
-                else
-                    zerr("remote_dlopen: zx_payload_start FAIL wst=0x%x sig=%d PC=0x%lx",
-                         st2, WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1, (unsigned long)sr2.pc);
+                } else {
+                    int sig2 = WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1;
+                    zerr("remote_dlopen: zx_payload_start FAIL wst=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
+                         st2, sig2, (unsigned long)sr2.pc, (long)sr2.pc - (long)sc_addr);
+                    zerr("remote_dlopen: start regs X0=0x%lx X1=0x%lx X8=0x%lx X16=0x%lx X17=0x%lx",
+                         (unsigned long)sr2.regs[0], (unsigned long)sr2.regs[1],
+                         (unsigned long)sr2.regs[8], (unsigned long)sr2.regs[16],
+                         (unsigned long)sr2.regs[17]);
+                    zerr("remote_dlopen: start regs X29=0x%lx X30=0x%lx SP=0x%lx pstate=0x%lx",
+                         (unsigned long)sr2.regs[29], (unsigned long)sr2.regs[30],
+                         (unsigned long)sr2.sp, (unsigned long)sr2.pstate);
+                    // siginfo gives the exact fault address + code
+                    siginfo_t si2 = {};
+                    ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si2);
+                    zerr("remote_dlopen: start siginfo signo=%d code=%d si_addr=0x%lx",
+                         si2.si_signo, si2.si_code, (unsigned long)(uintptr_t)si2.si_addr);
+                    // Stack dump — 8 words at SP
+                    uint64_t stk2[8] = {};
+                    if (ProcMem::read(sr2.sp, stk2, sizeof(stk2)))
+                        zerr("remote_dlopen: start stack[SP]: %lx %lx %lx %lx %lx %lx %lx %lx",
+                             (unsigned long)stk2[0], (unsigned long)stk2[1],
+                             (unsigned long)stk2[2], (unsigned long)stk2[3],
+                             (unsigned long)stk2[4], (unsigned long)stk2[5],
+                             (unsigned long)stk2[6], (unsigned long)stk2[7]);
+                    // Instructions at crash PC
+                    if (sr2.pc && sr2.pc < 0x800000000000ULL) {
+                        uint32_t ci2[8] = {};
+                        if (ProcMem::read(sr2.pc > 16 ? sr2.pc - 16 : sr2.pc, ci2, sizeof(ci2)))
+                            zerr("remote_dlopen: start insns@[PC-16]: %08x %08x %08x %08x | %08x %08x %08x %08x",
+                                 ci2[0],ci2[1],ci2[2],ci2[3],ci2[4],ci2[5],ci2[6],ci2[7]);
+                    }
+                    // Maps scan — which lib owns X16, X17, LR, stack frames
+                    {
+                        constexpr uintptr_t PAC_MASK = 0x00FFFFFFFFFFFFFFull;
+                        uintptr_t probes[] = {
+                            sr2.regs[16] & PAC_MASK,
+                            sr2.regs[17] & PAC_MASK,
+                            sr2.regs[30] & PAC_MASK,
+                            stk2[0] & PAC_MASK,
+                            stk2[1] & PAC_MASK,
+                        };
+                        const char *labels[] = {"X16","X17","X30","stk0","stk1"};
+                        zerr("remote_dlopen: start maps probe X16=0x%lx X17=0x%lx X30=0x%lx stk0=0x%lx stk1=0x%lx",
+                             (unsigned long)probes[0], (unsigned long)probes[1],
+                             (unsigned long)probes[2], (unsigned long)probes[3],
+                             (unsigned long)probes[4]);
+                        char mpath2[64]; snprintf(mpath2, sizeof(mpath2), "/proc/%d/maps", pid);
+                        FILE *mf2 = fopen(mpath2, "r");
+                        if (mf2) {
+                            char mline[512];
+                            while (fgets(mline, sizeof(mline), mf2)) {
+                                uintptr_t ms = 0, me = 0; char mp[8]={}, mn[256]={};
+                                sscanf(mline, "%lx-%lx %7s %*s %*s %*s %255s", &ms, &me, mp, mn);
+                                if (mp[2] != 'x') continue;
+                                bool hit = false;
+                                for (auto a : probes) if (a && a >= ms && a < me) { hit = true; break; }
+                                if (!hit) continue;
+                                char hbuf[128] = {}; int hp = 0;
+                                for (int k = 0; k < 5; k++)
+                                    if (probes[k] && probes[k] >= ms && probes[k] < me)
+                                        hp += snprintf(hbuf+hp, sizeof(hbuf)-hp, "%s+0x%lx ",
+                                                       labels[k], (unsigned long)(probes[k]-ms));
+                                zerr("remote_dlopen: start maps HIT %lx-%lx %s [%s] %s",
+                                     (unsigned long)ms, (unsigned long)me, mp,
+                                     mn[0] ? mn : "[anon]", hbuf);
+                            }
+                            fclose(mf2);
+                        }
+                    }
+                }
                 set_regs(pid, &orig);
             }
         } else {
