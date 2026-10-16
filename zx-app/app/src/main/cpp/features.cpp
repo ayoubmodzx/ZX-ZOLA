@@ -47,6 +47,7 @@ struct GameClasses {
     int32_t offHP          = -1;   // current health points
     int32_t offMaxHP       = -1;   // max health points
     int32_t offIsKnocked   = -1;   // knocked down bool
+    int32_t offDamage      = -1;   // bullet damage float (outgoing, per-shot)
     Il2CppClass *healthCls = nullptr;  // "CSCharacterHealth" or similar
 
     bool ready = false;
@@ -84,6 +85,9 @@ static std::atomic<float> g_rapidIntensity{0.02f}; // fire interval: lower = fas
 static std::atomic<bool>  g_noGrass{false};
 static std::atomic<bool>  g_antiDamage{false};
 static std::atomic<float> g_damageMult{1.f}; // 1.0=normal, 0.0=immune
+
+static std::atomic<bool>  g_bulletDmgEnabled{false};
+static std::atomic<float> g_bulletDmgMult{1.f};   // 1.0=normal, 10.0=one-tap
 
 static std::atomic<bool>  g_godMode{false};
 static std::atomic<bool>  g_infiniteAmmo{false};
@@ -188,6 +192,22 @@ static void discoverClasses() {
         if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_maxBulletNum"))  g_cls.offMaxAmmo    = Il2Cpp::fieldOffset(f);
         if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_reloadTime"))    g_cls.offReloadTime = Il2Cpp::fieldOffset(f);
     }
+    // Bullet damage field — walked from most common to least common FF naming
+    if (g_cls.weaponFire && g_cls.offDamage < 0) {
+        static const char *kDmg[] = {
+            "damage","m_damage","bulletDamage","m_bulletDamage","damagePerBullet",
+            "damageValue","m_damageValue","m_nDamage","m_fDamage","hitDamage",
+            "baseDamage","m_baseDamage","attackDamage","m_attackDamage",nullptr
+        };
+        for (const char **dn = kDmg; *dn; dn++) {
+            FieldInfo *f = Il2Cpp::getField(g_cls.weaponFire, *dn);
+            if (f && Il2Cpp::fieldTypeId(f) == IL2CPP_TYPE_R4) {
+                g_cls.offDamage = Il2Cpp::fieldOffset(f);
+                LOG("Damage field '%s' @ offset %d", *dn, g_cls.offDamage);
+                break;
+            }
+        }
+    }
     // Health fields
     g_cls.healthCls = Il2Cpp::cls("CSCharacterHealth");
     if (!g_cls.healthCls) g_cls.healthCls = Il2Cpp::cls("PlayerHealth");
@@ -244,8 +264,29 @@ static void hookFireWeapon(void *self, void *a, void *b) {
             g_rapidIntensity.load(std::memory_order_relaxed));
     else if (g_rapidFire && g_cls.offFireRate > 0)
         Il2Cpp::writeField<float>(self, g_cls.offFireRate, 0.02f);
-    if (!g_origFire) return;
+
+    // Bullet damage multiplier: inflate damage field before shot, restore after.
+    // Write-before / restore-after keeps the base value intact for game logic
+    // (kill feed, squad damage tallies) and avoids a detectable permanent field delta.
+    float origDmg = 0.f;
+    bool dmgPatched = false;
+    if (g_bulletDmgEnabled.load(std::memory_order_relaxed) && g_cls.offDamage > 0) {
+        origDmg = Il2Cpp::readField<float>(self, g_cls.offDamage);
+        if (origDmg > 0.f) {
+            float mult = g_bulletDmgMult.load(std::memory_order_relaxed);
+            Il2Cpp::writeField<float>(self, g_cls.offDamage, origDmg * mult);
+            dmgPatched = true;
+        }
+    }
+
+    if (!g_origFire) {
+        if (dmgPatched) Il2Cpp::writeField<float>(self, g_cls.offDamage, origDmg);
+        return;
+    }
     g_origFire(self, a, b);
+
+    if (dmgPatched)
+        Il2Cpp::writeField<float>(self, g_cls.offDamage, origDmg);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -938,6 +979,11 @@ void Features::apply(int cmd, bool enable) {
         case CMD_ANTI_AIM:        g_antiAim.store(enable);        break;
         case CMD_AUTO_REVIVE:     g_autoRevive.store(enable);     break;
         case CMD_WALL_SHOOT:      g_wallShoot.store(enable);      break;
+        case CMD_BULLET_DAMAGE:
+            g_bulletDmgEnabled.store(enable, std::memory_order_relaxed);
+            if (!enable) g_bulletDmgMult.store(1.f, std::memory_order_relaxed);
+            LOG("BulletDamage %s", enable ? "ON" : "OFF");
+            break;
         default: LOG("Unknown cmd: %d", cmd);
     }
 }
@@ -983,6 +1029,11 @@ void Features::applyIntensity(int cmd, int intensity) {
             // LE-2: add slider handling; sliderMin=60,sliderMax=150 → range=90°.
             // Map: fov = 60 + intensity * 90 / 100. 0%→60°, 100%→150°.
             g_fovOverride.store(60.f + (float)intensity * 90.f / 100.f, std::memory_order_relaxed);
+            break;
+        case CMD_BULLET_DAMAGE:
+            // 0% = 1x (normal), 50% = 5x, 100% = 10x (one-tap at full slider)
+            // Floor at 1.0 — multiplier below 1 would reduce damage (nonsensical for this cmd)
+            g_bulletDmgMult.store(std::max(1.f + t * 9.f, 1.f), std::memory_order_relaxed);
             break;
         default: break;
     }

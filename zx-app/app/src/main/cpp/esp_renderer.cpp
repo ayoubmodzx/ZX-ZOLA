@@ -150,6 +150,7 @@ struct EnemyData {
     Vec3 lfoot, rfoot;
     Vec3 center; // mid-body
     float dist;
+    float hpPct; // 0.0 (dead) – 1.0 (full health); -1 = unknown
     bool valid;
 };
 
@@ -288,6 +289,45 @@ static void draw_head_dot(Vec2 center, float radius, Color col) {
     draw_line_neon({center.x, center.y - radius}, {center.x, center.y + radius}, col);
 }
 
+// Draw a vertical health bar to the left of the bounding box.
+// tl/br are the box corners in screen space (y increases downward).
+// hpPct = 0.0 (empty) to 1.0 (full), -1 = skip.
+static void draw_health_bar(Vec2 tl, Vec2 br, float hpPct) {
+    if (hpPct < 0.f) return;                  // unknown HP — skip entirely
+    if (hpPct > 1.f) hpPct = 1.f;
+    if (hpPct < 0.f) hpPct = 0.f;
+
+    // Bar sits 6 px to the left of the box, 3 px wide
+    static const float kBarOffset = 6.f;
+    static const float kBarW      = 3.f;
+    float x0 = tl.x - kBarOffset - kBarW;
+    float x1 = tl.x - kBarOffset;
+    float top = tl.y, bot = br.y;
+    float barH = bot - top;
+    if (barH <= 0.f) return;
+
+    // Background: dark translucent rail
+    Color bg = { 0.08f, 0.08f, 0.08f, 0.75f };
+    draw_line_neon({x0, top}, {x0, bot}, bg);
+    draw_line_neon({x0+1.f, top}, {x0+1.f, bot}, bg);
+    draw_line_neon({x1, top}, {x1, bot}, bg);
+
+    // Filled portion rises from the bottom (feet) up
+    float filledTop = bot - hpPct * barH;
+
+    // HP colour: green → yellow → red
+    Color hp;
+    if      (hpPct > 0.66f) hp = { 0.10f, 0.95f, 0.20f, 1.0f }; // bright green
+    else if (hpPct > 0.33f) hp = { 1.00f, 0.80f, 0.00f, 1.0f }; // amber
+    else                    hp = { 1.00f, 0.10f, 0.10f, 1.0f }; // red
+
+    if (filledTop < bot) {
+        draw_line_neon({x0,      filledTop}, {x0,      bot}, hp);
+        draw_line_neon({x0+1.f,  filledTop}, {x0+1.f,  bot}, hp);
+        draw_line_neon({x1,      filledTop}, {x1,      bot}, hp);
+    }
+}
+
 // Skeleton lines (bones connecting joints) — ZOLAM style
 static void draw_skeleton(void *cam, const EnemyData &e) {
     // Cyan neon for skeleton
@@ -409,12 +449,13 @@ static void hook_OnPostRender(void *cam) {
             else if (e.dist < 80.f)  box_col = { 1.0f, 0.55f, 0.0f,  1.0f }; // orange
             else                     box_col = { 0.0f, 0.95f, 1.0f,  1.0f }; // cyan
 
-            // Full outline box around body (ZOLAM style — solid rectangle with neon glow)
+            // Full outline box around body + health bar (ZOLAM style — solid rectangle with neon glow)
             if (has_head && has_feet) {
                 float box_w = fabsf(feet_s.y - head_s.y) * 0.38f;
                 Vec2 tl = { head_s.x - box_w, head_s.y - 4.f };
                 Vec2 br = { head_s.x + box_w, feet_s.y + 4.f };
                 draw_box_neon(tl, br, box_col);
+                draw_health_bar(tl, br, e.hpPct);
             }
 
             // Skeleton
@@ -492,6 +533,64 @@ static Vec3 get_local_pos() {
     return get_position(tr);
 }
 
+// ── Per-player health state (discovered once, read every cycle) ────────────────
+struct HealthMeta {
+    Il2CppClass *cls      = nullptr;
+    int32_t      offHP    = -1;
+    int32_t      offMaxHP = -1;
+    FieldInfo   *refField = nullptr; // CSPlayerState field pointing to health component
+    bool         tried    = false;
+};
+static HealthMeta s_hm;
+
+static void discover_health(Il2CppClass *playerCls) {
+    if (s_hm.tried) return;
+    s_hm.tried = true;
+
+    // Find health component class
+    static const char *kHCls[] = {"CSCharacterHealth","PlayerHealth","HealthSystem","CharacterHealth",nullptr};
+    for (const char **cn = kHCls; *cn && !s_hm.cls; cn++)
+        s_hm.cls = Il2Cpp::cls(*cn);
+    if (!s_hm.cls) { LE("HP: health class not found"); return; }
+
+    // Resolve HP / maxHP field offsets on the health class
+    static const char *kHP[]    = {"m_curHp","curHP","hp","m_hp","currentHP","m_currentHP",nullptr};
+    static const char *kMaxHP[] = {"m_maxHp","maxHP","m_maxHP","maximumHP","m_maximumHP",nullptr};
+    for (const char **fn = kHP; *fn; fn++) {
+        FieldInfo *f = Il2Cpp::getField(s_hm.cls, *fn);
+        if (f && Il2Cpp::fieldTypeId(f) == IL2CPP_TYPE_R4) { s_hm.offHP = Il2Cpp::fieldOffset(f); break; }
+    }
+    for (const char **fn = kMaxHP; *fn; fn++) {
+        FieldInfo *f = Il2Cpp::getField(s_hm.cls, *fn);
+        if (f && Il2Cpp::fieldTypeId(f) == IL2CPP_TYPE_R4) { s_hm.offMaxHP = Il2Cpp::fieldOffset(f); break; }
+    }
+
+    // Find the reference field on CSPlayerState that points to the health component
+    static const char *kRef[] = {"m_health","health","m_healthComp","healthComponent",
+                                  "m_characterHealth","characterHealth","m_hp","hpComponent",nullptr};
+    for (const char **fn = kRef; *fn && !s_hm.refField; fn++)
+        s_hm.refField = Il2Cpp::getField(playerCls, *fn);
+
+    LI("HP meta: cls=%p offHP=%d offMaxHP=%d refField=%p",
+       s_hm.cls, s_hm.offHP, s_hm.offMaxHP, s_hm.refField);
+}
+
+// Read the HP percentage [0,1] for a player instance.  Returns -1 on failure.
+static float read_hp_pct(Il2CppObject *p) {
+    if (!s_hm.refField || s_hm.offHP < 0) return -1.f;
+    void *healthObj = Il2Cpp::readField<void*>(p, Il2Cpp::fieldOffset(s_hm.refField));
+    if (!healthObj) return -1.f;
+    float hp = Il2Cpp::readField<float>(healthObj, s_hm.offHP);
+    float mx = (s_hm.offMaxHP >= 0)
+        ? Il2Cpp::readField<float>(healthObj, s_hm.offMaxHP)
+        : 100.f;
+    if (mx <= 0.f || hp < 0.f) return -1.f;
+    float pct = hp / mx;
+    if (pct < 0.f) pct = 0.f;
+    if (pct > 1.f) pct = 1.f;
+    return pct;
+}
+
 static void *position_updater(void *) {
     // Wait for il2cpp full init
     sleep(4);
@@ -501,6 +600,8 @@ static void *position_updater(void *) {
         LE("CSPlayerState not found in position_updater");
         return nullptr;
     }
+
+    discover_health(playerCls);
 
     MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component", "UnityEngine"), "get_transform", 0);
 
@@ -566,6 +667,7 @@ static void *position_updater(void *) {
             ed.rfoot     = rft_b   ? get_position(rft_b)   : Vec3{root_pos.x + 0.15f, root_pos.y, root_pos.z};
             ed.center    = root_pos;
             ed.dist      = dist3(local_pos, root_pos);
+            ed.hpPct     = read_hp_pct(p);
             ed.valid     = true;
 
             new_cache[nc++] = ed;

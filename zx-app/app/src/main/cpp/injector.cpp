@@ -53,6 +53,7 @@ enum Cmd {
     ANTI_DAMAGE     = 11,
     AIM_ENABLE      = 12, AIM_BONE        = 13,
     AIM_FOV         = 14, AIM_SMOOTH      = 15,
+    BULLET_DAMAGE   = 28,  // multiply outgoing bullet damage per shot
 };
 
 // Payload .so path (extracted by ZxEngine.kt into app filesDir)
