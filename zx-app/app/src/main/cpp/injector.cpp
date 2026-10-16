@@ -517,6 +517,89 @@ static uintptr_t find_real_loader_dlopen(int target_pid,
     return result;
 }
 
+// Find a named symbol in an ELF .so file on disk.
+// Returns the symbol's value (VMA relative to load base for PIC), or 0 if not found.
+static uintptr_t find_sym_in_file(const char *so_path, const char *sym_name) {
+    int fd = open(so_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    Elf64_Ehdr ehdr = {};
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != (ssize_t)sizeof(ehdr) ||
+        ehdr.e_ident[0] != 0x7f) { close(fd); return 0; }
+    // Find .dynamic to locate DT_SYMTAB, DT_STRTAB, DT_SYMENT
+    uint64_t dyn_off = 0, dyn_size = 0;
+    for (int i = 0; i < (int)ehdr.e_phnum; i++) {
+        Elf64_Phdr ph = {};
+        if (pread(fd, &ph, sizeof(ph),
+                  (off_t)(ehdr.e_phoff + (uint64_t)i * ehdr.e_phentsize)) != (ssize_t)sizeof(ph))
+            continue;
+        if (ph.p_type == PT_DYNAMIC) { dyn_off = ph.p_offset; dyn_size = ph.p_filesz; break; }
+    }
+    if (!dyn_off) { close(fd); return 0; }
+    // Find first PT_LOAD vaddr to convert VMA→file_offset
+    uint64_t load_vaddr = 0, load_off = 0;
+    for (int i = 0; i < (int)ehdr.e_phnum; i++) {
+        Elf64_Phdr ph = {};
+        if (pread(fd, &ph, sizeof(ph),
+                  (off_t)(ehdr.e_phoff + (uint64_t)i * ehdr.e_phentsize)) != (ssize_t)sizeof(ph))
+            continue;
+        if (ph.p_type == PT_LOAD && !(ph.p_flags & PF_W)) {
+            load_vaddr = ph.p_vaddr; load_off = ph.p_offset; break;
+        }
+    }
+    // Read .dynamic entries to get DT_SYMTAB + DT_STRTAB
+    uint64_t sym_vma = 0, str_vma = 0;
+    size_t n_dyn = (size_t)(dyn_size / sizeof(Elf64_Dyn));
+    for (size_t i = 0; i < n_dyn; i++) {
+        Elf64_Dyn dyn = {};
+        if (pread(fd, &dyn, sizeof(dyn), (off_t)(dyn_off + i * sizeof(dyn))) != (ssize_t)sizeof(dyn))
+            break;
+        if (dyn.d_tag == DT_SYMTAB) sym_vma = (uint64_t)dyn.d_un.d_ptr;
+        if (dyn.d_tag == DT_STRTAB) str_vma = (uint64_t)dyn.d_un.d_ptr;
+        if (dyn.d_tag == DT_NULL) break;
+    }
+    if (!sym_vma || !str_vma) { close(fd); return 0; }
+    // Convert VMA→file offset: file_off = vma - load_vaddr + load_off
+    auto vma2off = [&](uint64_t vma) -> uint64_t { return vma - load_vaddr + load_off; };
+    uint64_t sym_off = vma2off(sym_vma);
+    uint64_t str_off = vma2off(str_vma);
+    // Scan dynsym (fixed entry size = sizeof(Elf64_Sym))
+    for (size_t i = 0; ; i++) {
+        Elf64_Sym sym = {};
+        if (pread(fd, &sym, sizeof(sym), (off_t)(sym_off + i * sizeof(sym))) != (ssize_t)sizeof(sym))
+            break;
+        if (sym.st_name == 0 && i > 0 && sym.st_value == 0) break; // likely past end
+        char name[256] = {};
+        pread(fd, name, sizeof(name) - 1, (off_t)(str_off + sym.st_name));
+        if (strcmp(name, sym_name) == 0) { close(fd); return (uintptr_t)sym.st_value; }
+        if (i > 65536) break; // safety
+    }
+    close(fd);
+    return 0;
+}
+
+// Parse staged .so ELF to find the writable PT_LOAD segment (contains GOT/data).
+static bool find_rw_segment(const char *so_path, uint64_t *out_vaddr, uint64_t *out_size) {
+    int fd = open(so_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    Elf64_Ehdr ehdr = {};
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != (ssize_t)sizeof(ehdr) ||
+        ehdr.e_ident[0] != 0x7f) { close(fd); return false; }
+    *out_vaddr = 0; *out_size = 0;
+    for (int i = 0; i < (int)ehdr.e_phnum; i++) {
+        Elf64_Phdr ph = {};
+        if (pread(fd, &ph, sizeof(ph),
+                  (off_t)(ehdr.e_phoff + (uint64_t)i * ehdr.e_phentsize)) != (ssize_t)sizeof(ph))
+            continue;
+        if (ph.p_type != PT_LOAD) continue;
+        if ((ph.p_flags & PF_W) == 0) continue;
+        *out_vaddr = ph.p_vaddr;
+        *out_size  = ph.p_filesz;
+        break;
+    }
+    close(fd);
+    return *out_size > 0;
+}
+
 // Call dlopen+dlerror via a single shellcode run to both open the .so and
 // capture the error message if it fails — all in one PTRACE_CONT window.
 //
@@ -902,6 +985,82 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
 
     if (!WIFSTOPPED(status) || WSTOPSIG(status) != SIGTRAP) {
         return false;
+    }
+
+    // ── PAC GOT strip ────────────────────────────────────────────────────────
+    // FF's bionic may PAC-sign our GLOB_DAT GOT entries with PACIA during dlopen
+    // relocation processing. Our PLT uses BR X16 (no auth), so signed entries
+    // crash. Strip PAC by clearing bits [63:56] from entries whose top byte is
+    // non-zero (valid user VA has bits [63:48] == 0).
+    {
+        uint64_t got_vaddr = 0, got_size = 0;
+        if (find_rw_segment(so_path, &got_vaddr, &got_size)) {
+            uintptr_t elf_base = ProcMem::findLibBase(pid, STAGED_NAME);
+            uintptr_t got_addr = elf_base + (uintptr_t)got_vaddr;
+            size_t n = (size_t)(got_size / 8);
+            if (n > 8192) n = 8192;
+            static uint64_t got_buf[8192];
+            if (ProcMem::read(got_addr, got_buf, n * 8)) {
+                int stripped = 0;
+                for (size_t gi = 0; gi < n; gi++) {
+                    uint64_t v = got_buf[gi];
+                    uint8_t top = (uint8_t)(v >> 56);
+                    if (top != 0 && top != 0xFF &&
+                        (v & 0x00FFFFFFFFFFFFFFull) >= 0x10000ULL)
+                    { got_buf[gi] = v & 0x00FFFFFFFFFFFFFFull; stripped++; }
+                }
+                if (stripped > 0) {
+                    if (ProcMem::write(got_addr, got_buf, n * 8))
+                        zerr("remote_dlopen: stripped PAC from %d/%zu GOT entries @0x%lx",
+                             stripped, n, (unsigned long)got_addr);
+                    else
+                        zerr("remote_dlopen: GOT write failed @0x%lx", (unsigned long)got_addr);
+                } else {
+                    zerr("remote_dlopen: GOT scan: 0 PAC-signed entries (n=%zu) — already clean or TBI mismatch", n);
+                }
+            } else {
+                zerr("remote_dlopen: GOT read failed @0x%lx sz=%llu",
+                     (unsigned long)got_addr, (unsigned long long)got_size);
+            }
+        } else {
+            zerr("remote_dlopen: find_rw_segment failed for %s", so_path);
+        }
+    }
+
+    // ── Call zx_payload_start() ──────────────────────────────────────────────
+    // Constructor was a no-op to avoid PAC PLT crash during dlopen.
+    // Now that GOT is patched, call the real init symbol.
+    {
+        uintptr_t sym_off  = find_sym_in_file(so_path, "zx_payload_start");
+        uintptr_t elf_base2 = ProcMem::findLibBase(pid, STAGED_NAME);
+        uintptr_t fn_start = sym_off ? (elf_base2 + sym_off) : 0;
+        zerr("remote_dlopen: zx_payload_start sym_off=0x%lx elf_base=0x%lx fn=0x%lx",
+             (unsigned long)sym_off, (unsigned long)elf_base2, (unsigned long)fn_start);
+        if (fn_start) {
+            struct { uint32_t i[4]; uint64_t fn; } sc2 = {};
+            sc2.i[0] = 0x58000088u; // LDR X8, #16  (fn at +16)
+            sc2.i[1] = 0xD63F0100u; // BLR X8
+            sc2.i[2] = 0xD4200000u; // BRK #0
+            sc2.i[3] = 0xD503201Fu; // NOP (align)
+            sc2.fn   = (uint64_t)fn_start;
+            if (ProcMem::write(sc_addr, &sc2, sizeof(sc2))) {
+                pt_regs r2; get_regs(pid, &r2);
+                r2.pstate &= ~(uint64_t)(3u << 10);
+                r2.pc = sc_addr;
+                set_regs(pid, &r2);
+                ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+                int st2 = 0; waitpid(pid, &st2, 0);
+                pt_regs sr2; get_regs(pid, &sr2);
+                if (WIFSTOPPED(st2) && WSTOPSIG(st2) == SIGTRAP && sr2.pc == sc_addr + 8)
+                    zerr("remote_dlopen: zx_payload_start OK");
+                else
+                    zerr("remote_dlopen: zx_payload_start FAIL wst=0x%x sig=%d PC=0x%lx",
+                         st2, WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1, (unsigned long)sr2.pc);
+                set_regs(pid, &orig);
+            }
+        } else {
+            zerr("remote_dlopen: zx_payload_start not found — payload will not run");
+        }
     }
 
     // Use BRK-state registers captured in the diagnostic block above.

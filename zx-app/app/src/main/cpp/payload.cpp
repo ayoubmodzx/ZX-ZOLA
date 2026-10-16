@@ -83,13 +83,23 @@ static void *ctrl_loop(void *) {
     return nullptr;
 }
 
-// Called when payload is dlopen'd into FF
-__attribute__((constructor(102)))
-static void payload_init() {
-    LOG("ZX-ZOLA payload injected");
-    // Anti-detection runs first — before any IL2CPP or feature work
+// Called explicitly by injector after GOT PAC-stripping — NOT a constructor.
+// On PAC-capable devices FF's bionic signs our GLOB_DAT GOT entries with PACIA,
+// so any PLT call in a constructor crashes with BR X16 on the signed pointer.
+// The injector: (1) dlopen with no-op constructor, (2) strips GOT PAC entries,
+// (3) calls this symbol directly via a second shellcode run.
+extern "C" __attribute__((visibility("default"), used))
+void zx_payload_start() {
+    LOG("ZX-ZOLA payload start");
     AntiDetect::install();
     pthread_t t;
     pthread_create(&t, nullptr, ctrl_loop, nullptr);
     pthread_detach(t);
+}
+
+// Constructor is intentionally a no-op so dlopen completes without touching PLT.
+// All real init is in zx_payload_start() above, called by the injector.
+__attribute__((constructor(102)))
+static void payload_init() {
+    (void)0;
 }
