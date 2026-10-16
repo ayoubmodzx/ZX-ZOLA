@@ -63,6 +63,20 @@ typedef int (*phdr_cb_t)(struct dl_phdr_info *, size_t, void *);
 #define LE(...) ((void)0)
 #endif
 
+static constexpr uint8_t STX5_XK = 0x5Au;
+template<size_t N> struct ObfS5 {
+    char data[N]{};
+    constexpr explicit ObfS5(const char (&s)[N]) {
+        for (size_t i = 0; i < N; i++) data[i] = (char)(s[i] ^ STX5_XK);
+    }
+    void decode(char (&out)[N]) const {
+        for (size_t i = 0; i < N; i++) out[i] = (char)(data[i] ^ STX5_XK);
+    }
+};
+#define OBF5(var, lit) \
+    char var[sizeof(lit)]; \
+    do { static constexpr ObfS5<sizeof(lit)> _o5(lit); _o5.decode(var); } while(0)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Staged payload name (compile-time XOR so it never appears in .rodata)
 // XOR key 0x5A. Decode: each byte ^ 0x5A
@@ -87,7 +101,13 @@ static uintptr_t s_ano_base5 = 0;
 static uintptr_t s_ano_end5  = 0;
 
 static int phdr_find_anogs5(dl_phdr_info *info, size_t /*sz*/, void * /*d*/) {
-    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    if (!info->dlpi_name) return 0;
+    static char ano5n[16]; static bool once5 = false;
+    if (__builtin_expect(!once5, 0)) {
+        once5 = true;
+        static constexpr ObfS5<12> o("libanogs.so"); o.decode(*(char(*)[12])ano5n);
+    }
+    if (!strstr(info->dlpi_name, ano5n)) return 0;
     uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         const ElfW(Phdr) &ph = info->dlpi_phdr[i];
@@ -252,10 +272,13 @@ void install_stealth_ext5() {
 
     // Layers 45 & 46 — AnoSDK server-receive hooks
     {
-        void *ano = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
+        OBF5(ano5lib, "libanogs.so");
+        OBF5(s_rcv,   "AnoSDKOnRecvData");
+        OBF5(s_sig,   "AnoSDKOnRecvSignature");
+        void *ano = dlopen(ano5lib, RTLD_LAZY | RTLD_NOLOAD);
         if (ano) {
-            void *fn_recv = dlsym(ano, "AnoSDKOnRecvData");
-            void *fn_sig  = dlsym(ano, "AnoSDKOnRecvSignature");
+            void *fn_recv = dlsym(ano, s_rcv);
+            void *fn_sig  = dlsym(ano, s_sig);
 
             if (fn_recv) {
                 DobbyHook(fn_recv, (void*)hook_AnoOnRecvData,

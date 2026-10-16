@@ -66,6 +66,9 @@
 #define LE(...) ((void)0)
 #endif
 
+// Forward declaration — installed from anosdk_bypass.cpp
+void install_ano_bypass();
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Layer 6 — Compile-time XOR string obfuscation
 // Library names are never stored as plain ASCII in .rodata.
@@ -395,27 +398,31 @@ static void install_anosdk_extended(void *h) {
         return false;
     };
 
-    try_hk("AnoSDKInit",       (void*)hook_AnoInit,     (void**)&orig_AnoInit);
-    try_hk("AnoSDKOnPause",    (void*)hook_AnoOnPause,  (void**)&orig_AnoOnPause);
-    try_hk("AnoSDKOnResume",   (void*)hook_AnoOnResume, (void**)&orig_AnoOnResume);
-    try_hk("AnoSDKSetUserInfo",(void*)hook_AnoSetUser,  (void**)&orig_AnoSetUser);
-    try_hk("AnoSDKIoctl", (void*)hook_AnoIoctl, (void**)&orig_AnoIoctl);
+    OBF_DECODE(s_ini, "AnoSDKInit");
+    OBF_DECODE(s_pau, "AnoSDKOnPause");
+    OBF_DECODE(s_res, "AnoSDKOnResume");
+    OBF_DECODE(s_usr, "AnoSDKSetUserInfo");
+    OBF_DECODE(s_ict, "AnoSDKIoctl");
+    OBF_DECODE(s_scp, "set_check_period");
+    OBF_DECODE(s_acp, "ano_set_check_period");
+    try_hk(s_ini, (void*)hook_AnoInit,     (void**)&orig_AnoInit);
+    try_hk(s_pau, (void*)hook_AnoOnPause,  (void**)&orig_AnoOnPause);
+    try_hk(s_res, (void*)hook_AnoOnResume, (void**)&orig_AnoOnResume);
+    try_hk(s_usr, (void*)hook_AnoSetUser,  (void**)&orig_AnoSetUser);
+    try_hk(s_ict, (void*)hook_AnoIoctl,    (void**)&orig_AnoIoctl);
+    try_hk(s_scp, (void*)hook_SetPeriod,   (void**)&orig_SetPeriod);
+    try_hk(s_acp, (void*)hook_SetPeriod,   nullptr);
 
-    try_hk("set_check_period",     (void*)hook_SetPeriod, (void**)&orig_SetPeriod);
-    try_hk("ano_set_check_period", (void*)hook_SetPeriod, nullptr);
-
-    static const char *k_internal[] = {
-        "inline_hook_opcode_dismatch",
-        "set_inline_hook_error",
-        "ms_scan_start",
-        "scan_memory_region",
-        "check_module_integrity",
-        "scan_for_hooks",
-        "verify_code_section",
-        "ptimer_start",
-        "ptimer_create",
-        nullptr
-    };
+    OBF_DECODE(si0, "inline_hook_opcode_dismatch");
+    OBF_DECODE(si1, "set_inline_hook_error");
+    OBF_DECODE(si2, "ms_scan_start");
+    OBF_DECODE(si3, "scan_memory_region");
+    OBF_DECODE(si4, "check_module_integrity");
+    OBF_DECODE(si5, "scan_for_hooks");
+    OBF_DECODE(si6, "verify_code_section");
+    OBF_DECODE(si7, "ptimer_start");
+    OBF_DECODE(si8, "ptimer_create");
+    const char *k_internal[] = {si0,si1,si2,si3,si4,si5,si6,si7,si8,nullptr};
     int found = 0;
     for (int i = 0; k_internal[i]; i++) {
         void *a = DobbySymbolResolver(lib, k_internal[i]);
@@ -467,6 +474,7 @@ void AntiDetect::install() {
 
     install_ffutil_bypass();    // Layer 1
     install_proc_hider();       // Layer 2
+    install_ano_bypass();       // AnoSDK bypass (proc hider active, race window closed)
     install_anosdk_extended(ano); // Layer 3
     // Layer 5 (RWX tracker) is passive — populated by dobby_impl.cpp
     // Layer 6 (string obfuscation) is passive — compile-time only

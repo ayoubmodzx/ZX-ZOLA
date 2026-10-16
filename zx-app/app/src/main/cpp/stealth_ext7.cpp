@@ -53,6 +53,20 @@
 #define LE(...) ((void)0)
 #endif
 
+static constexpr uint8_t STX7_XK = 0x5Au;
+template<size_t N> struct ObfS7 {
+    char data[N]{};
+    constexpr explicit ObfS7(const char (&s)[N]) {
+        for (size_t i = 0; i < N; i++) data[i] = (char)(s[i] ^ STX7_XK);
+    }
+    void decode(char (&out)[N]) const {
+        for (size_t i = 0; i < N; i++) out[i] = (char)(data[i] ^ STX7_XK);
+    }
+};
+#define OBF7(var, lit) \
+    char var[sizeof(lit)]; \
+    do { static constexpr ObfS7<sizeof(lit)> _o7(lit); _o7.decode(var); } while(0)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer 54 — TID registry + getdents64 thread hider
 // ─────────────────────────────────────────────────────────────────────────────
@@ -228,7 +242,10 @@ void install_stealth_ext7() {
 
     // Layer 55 — DelReportData nullifiers
     {
-        void *h = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
+        OBF7(ano7n, "libanogs.so");
+        OBF7(s_del1, "AnoSDKDelReportData");
+        OBF7(s_del2, "AnoSDKDelReportData2");
+        void *h = dlopen(ano7n, RTLD_LAZY | RTLD_NOLOAD);
         if (h) {
             auto hk = [&](const char *sym, void *rep, void **orig) {
                 void *a = dlsym(h, sym);
@@ -236,11 +253,11 @@ void install_stealth_ext7() {
                     char buf[128]; snprintf(buf, sizeof(buf), "%s@@ANO", sym);
                     a = dlsym(h, buf);
                 }
-                if (!a) a = DobbySymbolResolver("libanogs.so", sym);
+                if (!a) a = DobbySymbolResolver(ano7n, sym);
                 if (a) DobbyHook(a, rep, orig);
             };
-            hk("AnoSDKDelReportData",  (void*)hook_DelData,  (void**)&orig_DelData);
-            hk("AnoSDKDelReportData2", (void*)hook_DelData2, (void**)&orig_DelData2);
+            hk(s_del1, (void*)hook_DelData,  (void**)&orig_DelData);
+            hk(s_del2, (void*)hook_DelData2, (void**)&orig_DelData2);
             LI("L55 DelReportData nullifiers installed");
         }
     }

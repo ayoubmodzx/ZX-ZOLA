@@ -363,7 +363,13 @@ static int hook_tgkill(pid_t tgid, pid_t tid, int sig) {
 }
 
 static int phdr_find_ano_stx2(struct dl_phdr_info *info, size_t, void*) {
-    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    if (!info->dlpi_name) return 0;
+    static char ano2n[16]; static bool once2 = false;
+    if (__builtin_expect(!once2, 0)) {
+        once2 = true;
+        static constexpr Obf2<12> o("libanogs.so"); o.decode(*(char(*)[12])ano2n);
+    }
+    if (!strstr(info->dlpi_name, ano2n)) return 0;
     uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         if (info->dlpi_phdr[i].p_type == PT_LOAD) {

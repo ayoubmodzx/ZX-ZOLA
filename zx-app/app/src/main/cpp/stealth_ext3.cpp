@@ -78,6 +78,20 @@
 #define LE(...) ((void)0)
 #endif
 
+static constexpr uint8_t STX3_XK = 0x5Au;
+template<size_t N> struct ObfS3 {
+    char data[N]{};
+    constexpr explicit ObfS3(const char (&s)[N]) {
+        for (size_t i = 0; i < N; i++) data[i] = (char)(s[i] ^ STX3_XK);
+    }
+    void decode(char (&out)[N]) const {
+        for (size_t i = 0; i < N; i++) out[i] = (char)(data[i] ^ STX3_XK);
+    }
+};
+#define OBF3(var, lit) \
+    char var[sizeof(lit)]; \
+    do { static constexpr ObfS3<sizeof(lit)> _o3(lit); _o3.decode(var); } while(0)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers — resolve libanogs/libanort load range (shared with stx2 logic)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -127,8 +141,10 @@ static void ensure_ranges3() {
     if (g_range3_ready.load(std::memory_order_acquire)) return;
     pthread_mutex_lock(&g_range3_mu);
     if (!g_range3_ready.load(std::memory_order_relaxed)) {
-        populate_range3("libanogs.so", g_ano_r3);
-        populate_range3("libanort.so", g_anort_r3);
+        OBF3(anog, "libanogs.so");
+        OBF3(anrt, "libanort.so");
+        populate_range3(anog, g_ano_r3);
+        populate_range3(anrt, g_anort_r3);
         g_range3_ready.store(true, std::memory_order_release);
     }
     pthread_mutex_unlock(&g_range3_mu);
@@ -496,8 +512,9 @@ static constexpr uint32_t ARM64_RET       = 0xD65F03C0u;
 //  3. Walking back from each ADRP to find the STP X29,X30,[SP] function entry
 static int find_scanner_offsets(uintptr_t lib_base, size_t lib_sz,
                                  uintptr_t *out, int max_out) {
-    static const char k_marker[] = "inline_hook_opcode_dismatch";
-    static const size_t k_mlen   = sizeof(k_marker) - 1;
+    // Encoded marker — "inline_hook_opcode_dismatch" never appears in .rodata
+    OBF3(k_marker, "inline_hook_opcode_dismatch");
+    static constexpr size_t k_mlen = sizeof("inline_hook_opcode_dismatch") - 1;
 
     // 1. Find marker string
     size_t scan_cap = (lib_sz < 16 * 1024 * 1024) ? lib_sz : 16 * 1024 * 1024;
@@ -556,7 +573,8 @@ static void *scanner_patch_thread(void*) {
     uintptr_t ano_base = 0;
     size_t    lib_sz   = 0;
     for (int tries = 0; tries < 2000 && ano_base == 0; ++tries) {
-        PhdrSearchCtx ctx{"libanogs.so", 0, 0};
+        OBF3(ctx_lib, "libanogs.so");
+        PhdrSearchCtx ctx{ctx_lib, 0, 0};
         dl_iterate_phdr(phdr_find_lib, &ctx);
         if (ctx.base) { ano_base = ctx.base; lib_sz = ctx.total_sz; }
         if (!ano_base) { struct timespec ts{0, 5000000}; nanosleep(&ts, nullptr); }

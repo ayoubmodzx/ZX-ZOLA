@@ -110,7 +110,13 @@ static pid_t (*g_orig_setsid)(void) = nullptr;
 
 static uintptr_t s_ano4_base = 0, s_ano4_end = 0;
 static int phdr_find_ano4(dl_phdr_info *info, size_t, void*) {
-    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    if (!info->dlpi_name) return 0;
+    static char ano4n[16]; static bool once4 = false;
+    if (__builtin_expect(!once4, 0)) {
+        once4 = true;
+        static constexpr ObfS4<12> o("libanogs.so"); o.decode(*(char(*)[12])ano4n);
+    }
+    if (!strstr(info->dlpi_name, ano4n)) return 0;
     uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         const ElfW(Phdr) &ph = info->dlpi_phdr[i];
@@ -184,15 +190,41 @@ static int hook_prctl(int opt, unsigned long a1, unsigned long a2,
 
 static int (*g_orig_dladdr)(const void*, Dl_info*) = nullptr;
 
-static const char *const k_hook_names[] = {
-    "zx_payload", "zx_inject", "libzx", "gfxjni_helper", "libdobby",
-    "frida", "xposed", "substrate", "androguard", "shadowhook", nullptr
+// Compile-time XOR — hook library names never appear in .rodata
+static constexpr uint8_t STH4_XK = 0x5Au;
+template<size_t N> struct ObfS4 {
+    char data[N]{};
+    constexpr explicit ObfS4(const char (&s)[N]) {
+        for (size_t i = 0; i < N; i++) data[i] = (char)(s[i] ^ STH4_XK);
+    }
+    void decode(char (&out)[N]) const {
+        for (size_t i = 0; i < N; i++) out[i] = (char)(data[i] ^ STH4_XK);
+    }
 };
+#define OBF4(var, lit) \
+    char var[sizeof(lit)]; \
+    do { static constexpr ObfS4<sizeof(lit)> _o4(lit); _o4.decode(var); } while(0)
 
 static bool is_hook_lib(const char *fname) {
     if (!fname) return false;
-    for (const char *const *n = k_hook_names; *n; ++n)
-        if (strstr(fname, *n)) return true;
+    // Decoded on first call, cached in static storage
+    static bool rdy = false;
+    static char nm[10][20];
+    if (__builtin_expect(!rdy, 0)) {
+        rdy = true;
+        { static constexpr ObfS4<11> o("zx_payload");    o.decode(*(char(*)[11])nm[0]); }
+        { static constexpr ObfS4<10> o("zx_inject");     o.decode(*(char(*)[10])nm[1]); }
+        { static constexpr ObfS4<6>  o("libzx");         o.decode(*(char(*)[6]) nm[2]); }
+        { static constexpr ObfS4<14> o("gfxjni_helper"); o.decode(*(char(*)[14])nm[3]); }
+        { static constexpr ObfS4<9>  o("libdobby");      o.decode(*(char(*)[9]) nm[4]); }
+        { static constexpr ObfS4<6>  o("frida");         o.decode(*(char(*)[6]) nm[5]); }
+        { static constexpr ObfS4<7>  o("xposed");        o.decode(*(char(*)[7]) nm[6]); }
+        { static constexpr ObfS4<10> o("substrate");     o.decode(*(char(*)[10])nm[7]); }
+        { static constexpr ObfS4<11> o("androguard");    o.decode(*(char(*)[11])nm[8]); }
+        { static constexpr ObfS4<11> o("shadowhook");    o.decode(*(char(*)[11])nm[9]); }
+    }
+    for (int i = 0; i < 10; i++)
+        if (nm[i][0] && strstr(fname, nm[i])) return true;
     return false;
 }
 
@@ -303,19 +335,28 @@ static int hook_fcntl(int fd, int cmd, long arg) {
 
 static int (*g_orig_access)(const char*, int) = nullptr;
 
-static const char *const k_blocked_access[] = {
-    "/su", "/magisk", "/frida", "/xposed", "/saurik",
-    "/data/local/tmp/",
-    "/system/bin/su", "/system/xbin/su", "/sbin/su",
-    "/sbin/.magisk", "/.magisk",
-    "frida-server", "frida-gadget", nullptr
-};
-
 static int hook_access(const char *path, int mode) {
     if (path) {
-        for (const char *const *b = k_blocked_access; *b; ++b) {
-            if (strstr(path, *b)) { errno = ENOENT; return -1; }
+        static bool rdy = false;
+        static char bk[13][32];
+        if (__builtin_expect(!rdy, 0)) {
+            rdy = true;
+            { static constexpr ObfS4<4>  o("/su");             o.decode(*(char(*)[4]) bk[0]);  }
+            { static constexpr ObfS4<8>  o("/magisk");         o.decode(*(char(*)[8]) bk[1]);  }
+            { static constexpr ObfS4<7>  o("/frida");          o.decode(*(char(*)[7]) bk[2]);  }
+            { static constexpr ObfS4<8>  o("/xposed");         o.decode(*(char(*)[8]) bk[3]);  }
+            { static constexpr ObfS4<8>  o("/saurik");         o.decode(*(char(*)[8]) bk[4]);  }
+            { static constexpr ObfS4<17> o("/data/local/tmp/");o.decode(*(char(*)[17])bk[5]);  }
+            { static constexpr ObfS4<15> o("/system/bin/su");  o.decode(*(char(*)[15])bk[6]);  }
+            { static constexpr ObfS4<16> o("/system/xbin/su"); o.decode(*(char(*)[16])bk[7]);  }
+            { static constexpr ObfS4<9>  o("/sbin/su");        o.decode(*(char(*)[9]) bk[8]);  }
+            { static constexpr ObfS4<14> o("/sbin/.magisk");   o.decode(*(char(*)[14])bk[9]);  }
+            { static constexpr ObfS4<9>  o("/.magisk");        o.decode(*(char(*)[9]) bk[10]); }
+            { static constexpr ObfS4<13> o("frida-server");    o.decode(*(char(*)[13])bk[11]); }
+            { static constexpr ObfS4<13> o("frida-gadget");    o.decode(*(char(*)[13])bk[12]); }
         }
+        for (int i = 0; i < 13; i++)
+            if (bk[i][0] && strstr(path, bk[i])) { errno = ENOENT; return -1; }
     }
     if (!g_orig_access) { errno = ENOENT; return -1; }
     return g_orig_access(path, mode);
@@ -447,13 +488,18 @@ static int (*g_orig_getaddrinfo)(const char*, const char*,
                                   const struct addrinfo*, struct addrinfo**) = nullptr;
 static int hook_getaddrinfo(const char *node, const char *service,
                              const struct addrinfo *hints, struct addrinfo **res) {
-    // Known Tencent/AnoSDK report server TLDs
-    static const char *const k_c2[] = {
-        "tencent.com", "qq.com", "anti-cheat", "anods", nullptr
-    };
+    static bool c2_rdy = false;
+    static char gc2[4][20];
+    if (__builtin_expect(!c2_rdy, 0)) {
+        c2_rdy = true;
+        { static constexpr ObfS4<12> o("tencent.com"); o.decode(*(char(*)[12])gc2[0]); }
+        { static constexpr ObfS4<7>  o("qq.com");      o.decode(*(char(*)[7]) gc2[1]); }
+        { static constexpr ObfS4<11> o("anti-cheat");  o.decode(*(char(*)[11])gc2[2]); }
+        { static constexpr ObfS4<6>  o("anods");       o.decode(*(char(*)[6]) gc2[3]); }
+    }
     if (node) {
-        for (const char *const *h = k_c2; *h; ++h) {
-            if (strstr(node, *h)) {
+        for (int i = 0; i < 4; i++) {
+            if (gc2[i][0] && strstr(node, gc2[i])) {
                 LI("Layer42: C2 DNS blocked: %s", node);
                 return EAI_NONAME;
             }
@@ -493,7 +539,14 @@ static void *hook_unwind_info_nullify() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static int phdr_find_ano(struct dl_phdr_info *info, size_t, void*) {
-    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs")) return 0;
+    if (!info->dlpi_name) return 0;
+    static char ano4n[16]; static bool once4 = false;
+    if (__builtin_expect(!once4, 0)) {
+        once4 = true;
+        // "libanogs" (no .so — matches any libanogs variant)
+        static constexpr ObfS4<9> o("libanogs"); o.decode(*(char(*)[9])ano4n);
+    }
+    if (!strstr(info->dlpi_name, ano4n)) return 0;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         if (info->dlpi_phdr[i].p_type == PT_LOAD &&
             (info->dlpi_phdr[i].p_flags & 1)) { // PF_X

@@ -121,7 +121,13 @@ static uintptr_t s_stx_ano_base = 0;
 static uintptr_t s_stx_ano_end  = 0;
 
 static int phdr_find_anogs_stx(dl_phdr_info *info, size_t /*sz*/, void * /*d*/) {
-    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    if (!info->dlpi_name) return 0;
+    static char anostx_n[16]; static bool once_stx = false;
+    if (__builtin_expect(!once_stx, 0)) {
+        once_stx = true;
+        static constexpr Obf<12> o("libanogs.so"); o.decode(*(char(*)[12])anostx_n);
+    }
+    if (!strstr(info->dlpi_name, anostx_n)) return 0;
     uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
     for (int i = 0; i < info->dlpi_phnum; i++) {
         const ElfW(Phdr) &ph = info->dlpi_phdr[i];

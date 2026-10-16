@@ -68,6 +68,20 @@
 #define LE(...) ((void)0)
 #endif
 
+static constexpr uint8_t STX6_XK = 0x5Au;
+template<size_t N> struct ObfS6 {
+    char data[N]{};
+    constexpr explicit ObfS6(const char (&s)[N]) {
+        for (size_t i = 0; i < N; i++) data[i] = (char)(s[i] ^ STX6_XK);
+    }
+    void decode(char (&out)[N]) const {
+        for (size_t i = 0; i < N; i++) out[i] = (char)(data[i] ^ STX6_XK);
+    }
+};
+#define OBF6(var, lit) \
+    char var[sizeof(lit)]; \
+    do { static constexpr ObfS6<sizeof(lit)> _o6(lit); _o6.decode(var); } while(0)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // libanogs.so address range — populated at install time
 // Used for caller-aware checks: only intercept calls FROM libanogs.
@@ -77,7 +91,13 @@ static uintptr_t s_ano_base = 0;
 static uintptr_t s_ano_end  = 0;
 
 static int phdr_find_anogs(dl_phdr_info *info, size_t /*size*/, void * /*data*/) {
-    if (!info->dlpi_name || !strstr(info->dlpi_name, "libanogs.so")) return 0;
+    if (!info->dlpi_name) return 0;
+    static char ano6n[16]; static bool once6 = false;
+    if (__builtin_expect(!once6, 0)) {
+        once6 = true;
+        static constexpr ObfS6<12> o("libanogs.so"); o.decode(*(char(*)[12])ano6n);
+    }
+    if (!strstr(info->dlpi_name, ano6n)) return 0;
     uintptr_t base = (uintptr_t)info->dlpi_addr;
     uintptr_t end  = base;
     for (int i = 0; i < info->dlpi_phnum; i++) {
