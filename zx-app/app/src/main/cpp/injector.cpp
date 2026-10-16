@@ -600,6 +600,98 @@ static bool find_rw_segment(const char *so_path, uint64_t *out_vaddr, uint64_t *
     return *out_size > 0;
 }
 
+// Android NDK elf.h may not define these — guard to avoid redefinition.
+#ifndef R_AARCH64_GLOB_DAT
+#define R_AARCH64_GLOB_DAT  1025u
+#endif
+#ifndef R_AARCH64_JUMP_SLOT
+#define R_AARCH64_JUMP_SLOT 1026u
+#endif
+
+// Surgical PAC strip: parse RELA table from the .so file on disk,
+// find only R_AARCH64_GLOB_DAT + R_AARCH64_JUMP_SLOT relocation slots,
+// and strip PAC from those specific GOT entries in the target process.
+// This avoids corrupting legitimate 64-bit data (vtables, constants, etc.)
+// that a broad scan of the whole relro segment would clobber.
+static void strip_pac_via_rela(pid_t pid, const char *so_path) {
+    int fd = open(so_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { zerr("pac_strip: open %s errno=%d", so_path, errno); return; }
+
+    Elf64_Ehdr ehdr = {};
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != (ssize_t)sizeof(ehdr) ||
+        ehdr.e_ident[0] != 0x7f) { close(fd); zerr("pac_strip: bad ELF"); return; }
+
+    uint64_t load_vaddr = 0, load_off = 0;
+    uint64_t dyn_off = 0, dyn_sz = 0;
+    for (int i = 0; i < (int)ehdr.e_phnum; i++) {
+        Elf64_Phdr ph = {};
+        pread(fd, &ph, sizeof(ph),
+              (off_t)(ehdr.e_phoff + (uint64_t)i * ehdr.e_phentsize));
+        if (ph.p_type == PT_LOAD && ph.p_offset == 0 && !load_off) {
+            load_vaddr = ph.p_vaddr; load_off = ph.p_offset;
+        }
+        if (ph.p_type == PT_DYNAMIC) { dyn_off = ph.p_offset; dyn_sz = ph.p_filesz; }
+    }
+    if (!dyn_sz) { close(fd); zerr("pac_strip: no PT_DYNAMIC"); return; }
+
+    uint64_t rela_vma = 0, rela_sz = 0, jmprel_vma = 0, jmprel_sz = 0;
+    size_t ndyn = dyn_sz / sizeof(Elf64_Dyn);
+    for (size_t i = 0; i < ndyn; i++) {
+        Elf64_Dyn dyn = {};
+        pread(fd, &dyn, sizeof(dyn), (off_t)(dyn_off + i * sizeof(dyn)));
+        if      (dyn.d_tag == DT_RELA)     rela_vma   = dyn.d_un.d_ptr;
+        else if (dyn.d_tag == DT_RELASZ)   rela_sz    = dyn.d_un.d_val;
+        else if (dyn.d_tag == DT_JMPREL)   jmprel_vma = dyn.d_un.d_ptr;
+        else if (dyn.d_tag == DT_PLTRELSZ) jmprel_sz  = dyn.d_un.d_val;
+        else if (dyn.d_tag == DT_NULL)     break;
+    }
+
+    auto vma2off = [&](uint64_t vma) -> uint64_t { return vma - load_vaddr + load_off; };
+    uintptr_t elf_base = ProcMem::findLibBase(pid, STAGED_NAME);
+    zerr("pac_strip: elf_base=0x%lx rela@0x%llx sz=%llu jmprel@0x%llx sz=%llu",
+         (unsigned long)elf_base,
+         (unsigned long long)rela_vma, (unsigned long long)rela_sz,
+         (unsigned long long)jmprel_vma, (unsigned long long)jmprel_sz);
+
+    int total_stripped = 0, total_scanned = 0;
+
+    auto do_strip = [&](uint64_t vma, uint64_t sz, const char *label) {
+        if (!vma || !sz || !elf_base) return;
+        uint64_t off = vma2off(vma);
+        size_t n = sz / sizeof(Elf64_Rela);
+        for (size_t i = 0; i < n; i++) {
+            Elf64_Rela r = {};
+            if (pread(fd, &r, sizeof(r),
+                      (off_t)(off + i * sizeof(r))) != (ssize_t)sizeof(r)) break;
+            uint32_t type = (uint32_t)(r.r_info & 0xffffffffull);
+            if (type != R_AARCH64_GLOB_DAT && type != R_AARCH64_JUMP_SLOT) continue;
+            total_scanned++;
+            uintptr_t slot = elf_base + (uintptr_t)r.r_offset;
+            uint64_t val = 0;
+            if (!ProcMem::read(slot, &val, 8)) continue;
+            uint8_t top = (uint8_t)(val >> 56);
+            if (top == 0 || top == 0xFF) continue;
+            if ((val & 0x00FFFFFFFFFFFFFFull) < 0x10000ULL) continue;
+            uint64_t clean = val & 0x00FFFFFFFFFFFFFFull;
+            if (ProcMem::write(slot, &clean, 8)) {
+                total_stripped++;
+                zerr("pac_strip: %s[%zu] slot@0x%lx 0x%llx→0x%llx",
+                     label, i, (unsigned long)slot,
+                     (unsigned long long)val, (unsigned long long)clean);
+            } else {
+                zerr("pac_strip: write FAIL %s[%zu] slot@0x%lx errno=%d",
+                     label, i, (unsigned long)slot, errno);
+            }
+        }
+    };
+
+    do_strip(rela_vma,   rela_sz,   "RELA");
+    do_strip(jmprel_vma, jmprel_sz, "JMPREL");
+
+    close(fd);
+    zerr("pac_strip: done — %d/%d slots stripped", total_stripped, total_scanned);
+}
+
 // Call dlopen+dlerror via a single shellcode run to both open the .so and
 // capture the error message if it fails — all in one PTRACE_CONT window.
 //
@@ -988,62 +1080,11 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     }
 
     // ── PAC GOT strip ────────────────────────────────────────────────────────
-    // FF's bionic PAC-signs GLOB_DAT entries with PACIA during relocation.
-    // GLOB_DAT lands in the relro r--p PT_LOAD (separate from rw-p .got.plt).
-    // find_rw_segment() only finds rw-p and misses relro entirely.
-    // Fix: scan ALL non-exec segments of our payload from /proc/pid/maps.
-    // pwrite64 via /proc/pid/mem CAN write to relro pages when we're root.
-    {
-        char mpath[64]; snprintf(mpath, sizeof(mpath), "/proc/%d/maps", pid);
-        FILE *mf = fopen(mpath, "r");
-        int total_stripped = 0;
-        zerr("remote_dlopen: PAC GOT strip — scanning all non-exec segments of %s", STAGED_NAME);
-        if (mf) {
-            char line[512];
-            while (fgets(line, sizeof(line), mf)) {
-                if (!strstr(line, STAGED_NAME)) continue;
-                uintptr_t seg_start = 0, seg_end = 0; char perms[8] = {};
-                sscanf(line, "%lx-%lx %7s", &seg_start, &seg_end, perms);
-                if (perms[2] == 'x') continue; // skip code segment — only data/relro
-                size_t seg_len = seg_end - seg_start;
-                size_t n = seg_len / 8;
-                if (n > 16384) n = 16384;
-                static uint64_t seg_buf[16384];
-                if (!ProcMem::read(seg_start, seg_buf, n * 8)) {
-                    zerr("remote_dlopen: PAC read failed [0x%lx-0x%lx] %s errno=%d",
-                         (unsigned long)seg_start, (unsigned long)seg_end, perms, errno);
-                    continue;
-                }
-                int stripped = 0;
-                for (size_t gi = 0; gi < n; gi++) {
-                    uint64_t v = seg_buf[gi];
-                    uint8_t top = (uint8_t)(v >> 56);
-                    if (top != 0 && top != 0xFF &&
-                        (v & 0x00FFFFFFFFFFFFFFull) >= 0x10000ULL) {
-                        seg_buf[gi] = v & 0x00FFFFFFFFFFFFFFull;
-                        stripped++;
-                    }
-                }
-                if (stripped > 0) {
-                    if (ProcMem::write(seg_start, seg_buf, n * 8)) {
-                        total_stripped += stripped;
-                        zerr("remote_dlopen: PAC stripped %d entries [0x%lx-0x%lx] %s",
-                             stripped, (unsigned long)seg_start, (unsigned long)seg_end, perms);
-                    } else {
-                        zerr("remote_dlopen: PAC write FAILED [0x%lx-0x%lx] %s errno=%d",
-                             (unsigned long)seg_start, (unsigned long)seg_end, perms, errno);
-                    }
-                } else {
-                    zerr("remote_dlopen: PAC scan 0 hits [0x%lx-0x%lx] %s (n=%zu) — clean",
-                         (unsigned long)seg_start, (unsigned long)seg_end, perms, n);
-                }
-            }
-            fclose(mf);
-            zerr("remote_dlopen: PAC GOT strip done — total entries stripped: %d", total_stripped);
-        } else {
-            zerr("remote_dlopen: PAC GOT strip maps open failed errno=%d", errno);
-        }
-    }
+    // Surgical: parse RELA table from the .so file, touch only GLOB_DAT +
+    // JUMP_SLOT slots. The old broad-scan approach cleared the top byte from
+    // every 64-bit value in the relro segment (vtables, constants, offsets)
+    // which corrupted the payload and caused SIGBUS in zx_payload_start.
+    strip_pac_via_rela(pid, so_path);
 
     // ── Call zx_payload_start() ──────────────────────────────────────────────
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
