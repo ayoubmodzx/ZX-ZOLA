@@ -261,6 +261,11 @@ using FnFireWeapon = void(*)(void*, void*, void*);
 static FnFireWeapon g_origFire = nullptr;
 static void hookFireWeapon(void *self, void *a, void *b) {
     if (!s_cls_ready.load(std::memory_order_acquire)) {
+        // Class offsets not ready — fire passes through but features are inactive.
+        // This log fires once per shot until discovery completes.
+        static std::atomic<int> s_warn{0};
+        if (s_warn.fetch_add(1, std::memory_order_relaxed) < 5)
+            ERR("[DIAG] hookFireWeapon: cls NOT ready yet — features inactive this shot");
         if (g_origFire) g_origFire(self, a, b);
         return;
     }
@@ -965,77 +970,197 @@ static void widePov(bool on) {
 // Dispatch
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Diagnostic macro — always prints in debug builds; shows hook/class/offset state
+// so logcat immediately reveals WHY a feature has no effect when enabled.
+#define DIAG_FIRE(feat, en) \
+    LOG("[DIAG] " feat " %s | fire_hook=%d cls=%p offRH=%d offRV=%d offFR=%d offSpread=%d", \
+        (en)?"ON":"OFF", (int)s_fire_hook_done.load(), \
+        (void*)g_cls.weaponFire, g_cls.offRecoilH, g_cls.offRecoilV, \
+        g_cls.offFireRate, g_cls.offSpread)
+
+#define DIAG_MOVE(feat, en) \
+    LOG("[DIAG] " feat " %s | move_hook=%d cls=%p offMS=%d offJF=%d", \
+        (en)?"ON":"OFF", (int)s_risk_hook_done.load(), \
+        (void*)g_risk.playerMove, g_risk.offMoveSpeed, g_risk.offJumpForce)
+
+#define DIAG_AIM(feat, en) \
+    LOG("[DIAG] " feat " %s | aim_hook=%d cls=%p offAngle=%d offSmooth=%d offBone=%d", \
+        (en)?"ON":"OFF", (int)s_aim_hook_done.load(), \
+        (void*)g_aim.aimCtrl, g_aim.offAimAngle, g_aim.offAimSmooth, g_aim.offBoneIndex)
+
+#define DIAG_DMG(feat, en) \
+    LOG("[DIAG] " feat " %s | dmg_hook=%d healthCls=%p offHP=%d offIsKnocked=%d", \
+        (en)?"ON":"OFF", (int)s_damage_hook_done.load(), \
+        (void*)g_cls.healthCls, g_cls.offHP, g_cls.offIsKnocked)
+
+#define DIAG_AMMO(feat, en) \
+    LOG("[DIAG] " feat " %s | ammo_hook=%d cls=%p offAmmo=%d offMaxAmmo=%d offReload=%d", \
+        (en)?"ON":"OFF", (int)s_ammo_hook_done.load(), \
+        (void*)g_cls.weaponFire, g_cls.offAmmo, g_cls.offMaxAmmo, g_cls.offReloadTime)
+
 void Features::apply(int cmd, bool enable) {
-    // init() is called once by ctrl_loop before any apply(); no lazy-init here
     switch (cmd) {
-        case CMD_ANTI_RECOIL:     antiRecoil(enable);              break;
-        case CMD_NO_SPREAD:       noSpread(enable);                break;
-        case CMD_RAPID_FIRE:      rapidFire(enable);               break;
-        case CMD_WIDE_POV:        widePov(enable);                 break;
-        case CMD_ESP:             ESP::setEnabled(enable);         break;
+        case CMD_ANTI_RECOIL:
+            antiRecoil(enable);
+            DIAG_FIRE("ANTI_RECOIL", enable);
+            if (enable && !s_fire_hook_done.load())
+                ERR("[DIAG] ANTI_RECOIL WARN: fire hook NOT installed — feature has no effect");
+            break;
+        case CMD_NO_SPREAD:
+            noSpread(enable);
+            DIAG_FIRE("NO_SPREAD", enable);
+            if (enable && g_cls.offSpread < 0)
+                ERR("[DIAG] NO_SPREAD WARN: spread offset not found — field name mismatch?");
+            break;
+        case CMD_RAPID_FIRE:
+            rapidFire(enable);
+            DIAG_FIRE("RAPID_FIRE", enable);
+            if (enable && g_cls.offFireRate < 0)
+                ERR("[DIAG] RAPID_FIRE WARN: fireRate offset not found");
+            break;
+        case CMD_WIDE_POV:
+            widePov(enable);
+            LOG("[DIAG] WIDE_POV %s | origSetFOV=%p fovOverride=%.1f",
+                enable?"ON":"OFF", (void*)g_origSetFOV,
+                g_fovOverride.load(std::memory_order_relaxed));
+            if (enable && !g_origSetFOV)
+                ERR("[DIAG] WIDE_POV WARN: Camera.set_fieldOfView hook missing");
+            break;
+        case CMD_ESP:
+            ESP::setEnabled(enable);
+            LOG("[DIAG] ESP %s", enable ? "ON" : "OFF");
+            break;
         case CMD_SPEED_HACK:
             g_speedHack = enable;
             if (!enable) g_speedMult.store(1.f, std::memory_order_relaxed);
-            LOG("SpeedHack %s", enable ? "ON" : "OFF");
+            DIAG_MOVE("SPEED_HACK", enable);
+            if (enable && !s_risk_hook_done.load())
+                ERR("[DIAG] SPEED_HACK WARN: move hook NOT installed");
             break;
         case CMD_HIGH_JUMP:
             g_highJump = enable;
             if (!enable) g_jumpMult.store(1.f, std::memory_order_relaxed);
-            LOG("HighJump %s", enable ? "ON" : "OFF");
+            DIAG_MOVE("HIGH_JUMP", enable);
+            if (enable && g_risk.offJumpForce < 0)
+                ERR("[DIAG] HIGH_JUMP WARN: jumpForce offset not found");
             break;
         case CMD_VEHICLE_SPEED:
             g_vehicleSpeed = enable;
             if (!enable) g_vehicleMult.store(1.f, std::memory_order_relaxed);
-            LOG("VehicleSpeed %s", enable ? "ON" : "OFF");
+            LOG("[DIAG] VEHICLE_SPEED %s | risk_hook=%d vehCls=%p offVS=%d",
+                enable?"ON":"OFF", (int)s_risk_hook_done.load(),
+                (void*)g_risk.vehicleCls, g_risk.offVehicleSpeed);
             break;
         case CMD_RAPID_FIRE_RISK:
             g_rapidFireRisk = enable;
             if (!enable) g_rapidIntensity.store(0.02f, std::memory_order_relaxed);
-            LOG("RapidFireRisk %s", enable ? "ON" : "OFF");
+            DIAG_FIRE("RAPID_FIRE_RISK", enable);
             break;
         case CMD_NO_GRASS:
             g_noGrass = enable;
-            LOG("NoGrass %s", enable ? "ON" : "OFF");
+            LOG("[DIAG] NO_GRASS %s | origGrassDraw=%p",
+                enable?"ON":"OFF", (void*)g_origGrassDraw);
+            if (enable && !g_origGrassDraw)
+                ERR("[DIAG] NO_GRASS WARN: grass draw hook missing — no grass class found?");
             break;
         case CMD_ANTI_DAMAGE:
             g_antiDamage = enable;
             if (!enable) g_damageMult.store(1.f, std::memory_order_relaxed);
-            LOG("AntiDamage %s", enable ? "ON" : "OFF");
+            DIAG_DMG("ANTI_DAMAGE", enable);
+            if (enable && !s_damage_hook_done.load())
+                ERR("[DIAG] ANTI_DAMAGE WARN: TakeDamage hook NOT installed");
             break;
         case CMD_AIM_ENABLE:
-            aimAssist(enable); // NW-5: route through aimAssist() which sets g_aimEnabled
+            aimAssist(enable);
+            DIAG_AIM("AIM_ENABLE", enable);
+            if (enable && !s_aim_hook_done.load())
+                ERR("[DIAG] AIM_ENABLE WARN: aim hook NOT installed — no aim class found?");
             break;
         case CMD_AIM_BONE:
         case CMD_AIM_FOV:
         case CMD_AIM_SMOOTH:
-            break; // these are intensity-only, handled by applyIntensity
-        case CMD_GOD_MODE:        g_godMode.store(enable);        break;
-        case CMD_INFINITE_AMMO:   g_infiniteAmmo.store(enable);   break;
-        case CMD_NO_RELOAD:       g_noReload.store(enable);       break;
-        case CMD_NOCLIP:          g_noclip.store(enable);         break;
+            break; // intensity-only, handled by applyIntensity
+        case CMD_GOD_MODE:
+            g_godMode.store(enable);
+            DIAG_DMG("GOD_MODE", enable);
+            if (enable && !s_damage_hook_done.load())
+                ERR("[DIAG] GOD_MODE WARN: TakeDamage hook NOT installed — god mode has no effect");
+            break;
+        case CMD_INFINITE_AMMO:
+            g_infiniteAmmo.store(enable);
+            DIAG_AMMO("INFINITE_AMMO", enable);
+            if (enable && !s_ammo_hook_done.load())
+                ERR("[DIAG] INFINITE_AMMO WARN: ammo hook NOT installed");
+            break;
+        case CMD_NO_RELOAD:
+            g_noReload.store(enable);
+            DIAG_AMMO("NO_RELOAD", enable);
+            if (enable && g_cls.offReloadTime < 0)
+                ERR("[DIAG] NO_RELOAD WARN: reloadTime offset not found");
+            break;
+        case CMD_NOCLIP:
+            g_noclip.store(enable);
+            LOG("[DIAG] NOCLIP %s | origCCMove=%p", enable?"ON":"OFF", (void*)g_origCCMove);
+            if (enable && !g_origCCMove)
+                ERR("[DIAG] NOCLIP WARN: CharacterController.Move hook missing");
+            break;
         case CMD_TELEPORT:
             g_teleport.store(enable);
             if (enable) g_teleportPending.store(true);
+            LOG("[DIAG] TELEPORT %s | origSetPos=%p target=%.1f,%.1f,%.1f",
+                enable?"ON":"OFF", (void*)g_origSetPos,
+                g_teleportX.load(), g_teleportY.load(), g_teleportZ.load());
             break;
         case CMD_TELEPORT_SAVE:
-            // NW-4: request position capture on next hookTransformSetPos call
             if (enable) g_savePosRequest.store(true, std::memory_order_release);
+            LOG("[DIAG] TELEPORT_SAVE requested | origSetPos=%p", (void*)g_origSetPos);
             break;
-        case CMD_SILENT_AIM:      g_silentAim.store(enable);      break;
+        case CMD_SILENT_AIM:
+            g_silentAim.store(enable);
+            LOG("[DIAG] SILENT_AIM %s | origGetFireDir=%p",
+                enable?"ON":"OFF", (void*)g_origGetFireDir);
+            if (enable && !g_origGetFireDir)
+                ERR("[DIAG] SILENT_AIM WARN: GetFireDirection hook missing");
+            break;
         case CMD_AUTO_HEADSHOT:
             g_autoHeadshot.store(enable);
-            ESP::setHeadshotAssist(enable); // SP-1: wire ESP headshot assist rendering
+            ESP::setHeadshotAssist(enable);
+            DIAG_AIM("AUTO_HEADSHOT", enable);
             break;
-        case CMD_FULL_AIMBOT:     g_fullAimbot.store(enable);     break;
-        case CMD_ANTI_AIM:        g_antiAim.store(enable);        break;
-        case CMD_AUTO_REVIVE:     g_autoRevive.store(enable);     break;
-        case CMD_WALL_SHOOT:      g_wallShoot.store(enable);      break;
+        case CMD_FULL_AIMBOT:
+            g_fullAimbot.store(enable);
+            DIAG_AIM("FULL_AIMBOT", enable);
+            break;
+        case CMD_ANTI_AIM:
+            g_antiAim.store(enable);
+            LOG("[DIAG] ANTI_AIM %s | origGetLookDir=%p",
+                enable?"ON":"OFF", (void*)g_origGetLookDir);
+            break;
+        case CMD_AUTO_REVIVE:
+            g_autoRevive.store(enable);
+            LOG("[DIAG] AUTO_REVIVE %s | origStartRevive=%p offIsKnocked=%d",
+                enable?"ON":"OFF", (void*)g_origStartRevive, g_cls.offIsKnocked);
+            if (enable && !g_origStartRevive)
+                ERR("[DIAG] AUTO_REVIVE WARN: StartRevive method not found");
+            break;
+        case CMD_WALL_SHOOT:
+            g_wallShoot.store(enable);
+            LOG("[DIAG] WALL_SHOOT %s | origHasLOS=%p",
+                enable?"ON":"OFF", (void*)g_origHasLOS);
+            if (enable && !g_origHasLOS)
+                ERR("[DIAG] WALL_SHOOT WARN: HasLineOfSight hook missing");
+            break;
         case CMD_BULLET_DAMAGE:
             g_bulletDmgEnabled.store(enable, std::memory_order_relaxed);
             if (!enable) g_bulletDmgMult.store(1.f, std::memory_order_relaxed);
-            LOG("BulletDamage %s", enable ? "ON" : "OFF");
+            LOG("[DIAG] BULLET_DAMAGE %s | fire_hook=%d offDamage=%d mult=%.1f",
+                enable?"ON":"OFF", (int)s_fire_hook_done.load(),
+                g_cls.offDamage, g_bulletDmgMult.load());
+            if (enable && g_cls.offDamage < 0)
+                ERR("[DIAG] BULLET_DAMAGE WARN: damage offset not found — no field match");
             break;
-        default: LOG("Unknown cmd: %d", cmd);
+        default:
+            ERR("[DIAG] Unknown cmd: %d", cmd);
     }
 }
 

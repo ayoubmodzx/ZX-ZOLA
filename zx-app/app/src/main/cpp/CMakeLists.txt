@@ -26,31 +26,19 @@ add_library(zx_payload SHARED
     stealth_ext8.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
-    no_pac.s
 )
 target_include_directories(zx_payload PRIVATE .)
 target_link_libraries(zx_payload log dl)
 # libc++_shared.so is NOT in FF's classloader-namespace so dlopen fails.
 # Statically bundle the C++ runtime into the .so to make it self-contained.
 if(ANDROID_ABI STREQUAL "arm64-v8a")
-    # Opt out of PAC entirely for the payload .so — two-part fix.
-    #
-    # Part 1 — no_pac.s (see that file for full explanation):
-    #   Explicitly emits GNU_PROPERTY_AARCH64_FEATURE_1_AND = 0 so lld generates
-    #   plain BR X16 PLT stubs instead of BRAA stubs.
-    #   WHY this is needed: -mbranch-protection=none makes the compiler emit NO
-    #   property note (not PAC=0). lld treats an absent note as "all features" in
-    #   the AND. libc++_static.a has PAC=1 → AND keeps PAC=1 → BRAA stubs anyway
-    #   → PAC auth fail in FF's linker namespace → PC=0xd67faa90c6ffc → SIGSEGV.
-    #   no_pac.s contributes AND=0 → clears PAC from the AND → plain BR X16.
-    #
-    # Part 2 — -mbranch-protection=none (this line):
-    #   Prevents PACIA/AUTIA in our compiled code. Belt-and-suspenders in case
-    #   the GNU property were re-enabled by a toolchain change.
-    #
-    # Result: bionic treats all JUMP_SLOT relocations as plain pointer writes,
-    # BR X16 works on every device (PAC-capable or not), FF's linker cannot
-    # mis-sign our GOT entries.
+    # no_pac.s is AArch64-ONLY. Including it on armeabi-v7a causes:
+    #   ld.lld: error: .note.gnu.property: program property is too short
+    # because the ARM32 linker does not understand AArch64 GNU_PROPERTY types.
+    # PAC does not exist on 32-bit ARM — the file is irrelevant there anyway.
+    target_sources(zx_payload PRIVATE no_pac.s)
+    # -mbranch-protection=none: prevents PACIA/AUTIA in compiled code.
+    # Together with no_pac.s (AND=0), ensures plain BR X16 PLT stubs throughout.
     target_compile_options(zx_payload PRIVATE -mbranch-protection=none)
 endif()
 target_link_options(zx_payload PRIVATE
