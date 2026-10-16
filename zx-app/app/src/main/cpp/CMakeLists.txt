@@ -25,34 +25,31 @@ add_library(zx_payload SHARED
     stealth_ext8.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
+    no_pac.s
 )
 target_include_directories(zx_payload PRIVATE .)
 target_link_libraries(zx_payload log dl)
 # libc++_shared.so is NOT in FF's classloader-namespace so dlopen fails.
 # Statically bundle the C++ runtime into the .so to make it self-contained.
 if(ANDROID_ABI STREQUAL "arm64-v8a")
-    # Opt out of PAC entirely for the payload .so.
+    # Opt out of PAC entirely for the payload .so — two-part fix.
     #
-    # -mbranch-protection=none prevents the compiler from emitting PACIA/AUTIA
-    # instructions AND suppresses the GNU_PROPERTY_AARCH64_FEATURE_1_PAC note in
-    # our object files. Without that note, lld does NOT emit BRAA pac-plt stubs,
-    # and bionic does NOT apply pacia() to our GOT entries during dlopen.
-    # The result is plain BR X16 PLT stubs on raw unsigned GOT addresses — no PAC
-    # authentication anywhere in our library's PLT path.
+    # Part 1 — no_pac.s (see that file for full explanation):
+    #   Explicitly emits GNU_PROPERTY_AARCH64_FEATURE_1_AND = 0 so lld generates
+    #   plain BR X16 PLT stubs instead of BRAA stubs.
+    #   WHY this is needed: -mbranch-protection=none makes the compiler emit NO
+    #   property note (not PAC=0). lld treats an absent note as "all features" in
+    #   the AND. libc++_static.a has PAC=1 → AND keeps PAC=1 → BRAA stubs anyway
+    #   → PAC auth fail in FF's linker namespace → PC=0xd67faa90c6ffc → SIGSEGV.
+    #   no_pac.s contributes AND=0 → clears PAC from the AND → plain BR X16.
     #
-    # Why not use -z,pac-plt + -z,now (our previous approach):
-    #   With -z,pac-plt the linker emits BRAA stubs and sets the GNU property.
-    #   Bionic then calls pacia(fn_addr, &GOT[n]) for each slot. BRAA X16,X17
-    #   authenticates using X17=&GOT[n] as modifier. This works when bionic's own
-    #   linker runs the library. BUT our injector calls do_dlopen() inside FF's
-    #   linker (a different bionic instance, different namespace). FF's linker's
-    #   PAC signing path leaves early GOT entries (slots ~10 to ~250 depending on
-    #   build) with an incorrect or absent signature → BRAA auth failure →
-    #   PC=0xd67faa90c6ffc (corrupted by auth fail bit) → SIGSEGV. The crash
-    #   shifted each build cycle as PLT layout changed but never went away.
+    # Part 2 — -mbranch-protection=none (this line):
+    #   Prevents PACIA/AUTIA in our compiled code. Belt-and-suspenders in case
+    #   the GNU property were re-enabled by a toolchain change.
     #
-    # Without PAC property: bionic treats all JUMP_SLOT relocations as plain
-    # pointer writes, BR X16 works on every device, PAC-capable or not.
+    # Result: bionic treats all JUMP_SLOT relocations as plain pointer writes,
+    # BR X16 works on every device (PAC-capable or not), FF's linker cannot
+    # mis-sign our GOT entries.
     target_compile_options(zx_payload PRIVATE -mbranch-protection=none)
 endif()
 target_link_options(zx_payload PRIVATE
