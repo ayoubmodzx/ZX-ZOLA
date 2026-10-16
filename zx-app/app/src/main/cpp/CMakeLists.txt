@@ -27,7 +27,7 @@ add_library(zx_payload SHARED
     dobby_impl.cpp
 )
 target_include_directories(zx_payload PRIVATE .)
-target_link_libraries(zx_payload log dl GLESv3 EGL)
+target_link_libraries(zx_payload log dl)
 # libc++_shared.so is NOT in FF's classloader-namespace so dlopen fails.
 # Statically bundle the C++ runtime into the .so to make it self-contained.
 if(ANDROID_ABI STREQUAL "arm64-v8a")

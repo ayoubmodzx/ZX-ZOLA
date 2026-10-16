@@ -22,7 +22,6 @@
 #include "il2cpp_scanner.hpp"
 #include "dobby_stub.hpp"
 
-#include <GLES3/gl3.h>
 #include <android/log.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -31,6 +30,60 @@
 #include <atomic>
 #include <cstdlib>
 #include <dlfcn.h>
+
+// ── GL types / constants — no link-time dep on libGLESv3 ──────────────────────
+// All of these are resolved at runtime via dlopen(libGLESv2.so, RTLD_NOLOAD)
+// because FF already has it loaded in the process. Linking against GLESv3/EGL
+// creates PLT stubs that are early in the table (entries ~10-13) and can't be
+// resolved in FF's restricted linker namespace under -z,now → BRAA on an
+// unsigned GOT → SIGSEGV at dlopen time.
+typedef unsigned int  GLenum;
+typedef int           GLint;
+typedef unsigned char GLboolean;
+typedef float         GLfloat;
+
+#define GL_DEPTH_TEST             0x0B71u
+#define GL_BLEND                  0x0BE2u
+#define GL_LINE_WIDTH             0x0B21u
+#define GL_BLEND_SRC_RGB          0x80C9u
+#define GL_BLEND_DST_RGB          0x80CAu
+#define GL_VERTEX_ARRAY_BINDING   0x85B5u
+#define GL_CURRENT_PROGRAM        0x8B8Du
+#define GL_SRC_ALPHA              0x0302u
+#define GL_ONE                    1u
+
+typedef void      (*pfn_glGetIntegerv)(GLenum, GLint*);
+typedef void      (*pfn_glGetFloatv)(GLenum, GLfloat*);
+typedef GLboolean (*pfn_glIsEnabled)(GLenum);
+typedef void      (*pfn_glEnable)(GLenum);
+typedef void      (*pfn_glDisable)(GLenum);
+typedef void      (*pfn_glBlendFunc)(GLenum, GLenum);
+typedef void      (*pfn_glLineWidth)(GLfloat);
+
+static pfn_glGetIntegerv  p_glGetIntegerv;
+static pfn_glGetFloatv    p_glGetFloatv;
+static pfn_glIsEnabled    p_glIsEnabled;
+static pfn_glEnable       p_glEnable;
+static pfn_glDisable      p_glDisable;
+static pfn_glBlendFunc    p_glBlendFunc;
+static pfn_glLineWidth    p_glLineWidth;
+
+static void gl_load_fns() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+    void *h = dlopen("libGLESv2.so", RTLD_LAZY | RTLD_NOLOAD);
+    if (!h) h = dlopen("libGLESv3.so", RTLD_LAZY | RTLD_NOLOAD);
+#define GL_LOAD(fn) p_##fn = (pfn_##fn)(h ? dlsym(h, #fn) : dlsym(RTLD_DEFAULT, #fn))
+    GL_LOAD(glGetIntegerv);
+    GL_LOAD(glGetFloatv);
+    GL_LOAD(glIsEnabled);
+    GL_LOAD(glEnable);
+    GL_LOAD(glDisable);
+    GL_LOAD(glBlendFunc);
+    GL_LOAD(glLineWidth);
+#undef GL_LOAD
+}
 
 #define TAG "ZX-ESP"
 #define LI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -270,20 +323,22 @@ struct GlSave {
 };
 
 static void gl_save(GlSave &s) {
-    glGetIntegerv(GL_BLEND_SRC_RGB,   &s.blend_src);
-    glGetIntegerv(GL_BLEND_DST_RGB,   &s.blend_dst);
-    glGetFloatv(GL_LINE_WIDTH,         &s.line_width);
-    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
-    glGetIntegerv(GL_CURRENT_PROGRAM,  &s.program);
-    s.depth_test = glIsEnabled(GL_DEPTH_TEST);
-    s.blend      = glIsEnabled(GL_BLEND);
+    if (p_glGetIntegerv) {
+        p_glGetIntegerv(GL_BLEND_SRC_RGB,        &s.blend_src);
+        p_glGetIntegerv(GL_BLEND_DST_RGB,        &s.blend_dst);
+        p_glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &s.vao);
+        p_glGetIntegerv(GL_CURRENT_PROGRAM,      &s.program);
+    }
+    if (p_glGetFloatv)  p_glGetFloatv(GL_LINE_WIDTH, &s.line_width);
+    s.depth_test = p_glIsEnabled ? p_glIsEnabled(GL_DEPTH_TEST) : 0;
+    s.blend      = p_glIsEnabled ? p_glIsEnabled(GL_BLEND)      : 0;
 }
 
 static void gl_restore(const GlSave &s) {
-    if (s.depth_test) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
-    if (s.blend)      glEnable(GL_BLEND);      else glDisable(GL_BLEND);
-    glBlendFunc((GLenum)s.blend_src, (GLenum)s.blend_dst);
-    glLineWidth(s.line_width);
+    if (!p_glEnable || !p_glDisable || !p_glBlendFunc) return;
+    if (s.depth_test) p_glEnable(GL_DEPTH_TEST); else p_glDisable(GL_DEPTH_TEST);
+    if (s.blend)      p_glEnable(GL_BLEND);      else p_glDisable(GL_BLEND);
+    p_glBlendFunc((GLenum)s.blend_src, (GLenum)s.blend_dst);
     // Do NOT restore VAO/program with raw GL — Unity manages these through its own
     // state machine; bypassing it corrupts the renderer on the next draw call.
 }
@@ -306,6 +361,9 @@ static void hook_OnPostRender(void *cam) {
     if (g_getW) { int w = g_getW(); if (w > 0) g_sw = w; }
     if (g_getH) { int h = g_getH(); if (h > 0) g_sh = h; }
 
+    // Ensure runtime GL pointers are loaded (FF has the lib in process already)
+    gl_load_fns();
+
     // Save GL state
     GlSave saved;
     gl_save(saved);
@@ -314,8 +372,8 @@ static void hook_OnPostRender(void *cam) {
     if (!g_glPush || !g_glOrtho || !g_glPop) goto skip_draw;
 
     // Setup for transparent overdraw
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE);  // additive = real neon glow look
+    if (p_glEnable)    p_glEnable(GL_BLEND);
+    if (p_glBlendFunc) p_glBlendFunc(GL_SRC_ALPHA, GL_ONE);  // additive = real neon glow look
 
     // Enter Unity 2D ortho space — Push BEFORE disabling depth test so Unity
     // shadow state stays consistent with raw GL state we are about to change.
@@ -323,7 +381,7 @@ static void hook_OnPostRender(void *cam) {
     g_glOrtho();
 
     // Disable depth test AFTER Unity's PushMatrix so Unity can see the state change
-    glDisable(GL_DEPTH_TEST);
+    if (p_glDisable) p_glDisable(GL_DEPTH_TEST);
 
     {
         // Read cached enemies
