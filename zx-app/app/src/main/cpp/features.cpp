@@ -62,6 +62,14 @@ static std::atomic<bool>  s_cls_ready{false};
 static std::atomic<bool>  s_risk_ready{false};
 static std::atomic<bool>  s_aim_ready{false};
 
+// Per-subsystem hook installation flags — prevent double-DobbyHook on retry
+static std::atomic<bool>  s_fire_hook_done{false};
+static std::atomic<bool>  s_risk_hook_done{false};
+static std::atomic<bool>  s_aim_hook_done{false};
+static std::atomic<bool>  s_damage_hook_done{false};
+static std::atomic<bool>  s_ammo_hook_done{false};
+static std::atomic<bool>  s_misc_hooks_done{false};
+
 static std::atomic<bool>  g_noRecoil{false};
 static std::atomic<bool>  g_noSpread{false};
 static std::atomic<bool>  g_rapidFire{false};
@@ -217,9 +225,12 @@ static void discoverClasses() {
         if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_isKnocked")) g_cls.offIsKnocked = Il2Cpp::fieldOffset(f);
     }
 
-    g_cls.ready = true;
-    s_cls_ready.store(true, std::memory_order_release);
-    LOG("Discovery done. playerState=%p weaponFire=%p", g_cls.playerState, g_cls.weaponFire);
+    // Only mark ready if weapon fire class was found — without it, all fire hooks
+    // would immediately return from the guard check and features stay dead.
+    g_cls.ready = (g_cls.weaponFire != nullptr);
+    if (g_cls.ready) s_cls_ready.store(true, std::memory_order_release);
+    LOG("Discovery done. playerState=%p weaponFire=%p ready=%d",
+        g_cls.playerState, g_cls.weaponFire, (int)g_cls.ready);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -495,6 +506,7 @@ static void hookAimUpdate(void *self) {
 }
 
 static void hookAimSystem() {
+    if (s_aim_hook_done.load(std::memory_order_relaxed)) return;
     discoverAimClasses();
     if (!g_aim.aimCtrl) {
         ERR("hookAimSystem: no aim class found — aim assist disabled");
@@ -512,6 +524,7 @@ static void hookAimSystem() {
             return;
         }
         g_origAimUpdate = (FnAimUpdate)orig;
+        s_aim_hook_done.store(true, std::memory_order_release);
         LOG("Hooked aim: %s @ %p", *mn, m->methodPointer);
         break;
     }
@@ -532,6 +545,7 @@ static void hookGrassDraw(void *self) {
 }
 
 static void hookNoGrass() {
+    if (g_origGrassDraw) return; // already hooked
     static const char *kGrass[] = {
         "GrassRenderer","GrassSystem","TerrainGrass","GrassBatch","GrassManager",nullptr
     };
@@ -573,6 +587,7 @@ static void hookTakeDamage(void *self, float dmg, void *info) {
 }
 
 static void hookAntiDamage() {
+    if (s_damage_hook_done.load(std::memory_order_relaxed)) return;
     static const char *kCls[] = {
         "CSPlayerState","PlayerHealth","HealthSystem","PlayerHP","CharacterHealth",nullptr
     };
@@ -588,6 +603,7 @@ static void hookAntiDamage() {
                 void *orig = nullptr;
                 DobbyHook(m->methodPointer, (void*)hookTakeDamage, &orig);
                 g_origTakeDamage = (FnTakeDamage)orig;
+                s_damage_hook_done.store(true, std::memory_order_release);
                 LOG("Hooked damage: %s::%s @ %p", *cn, *mn, m->methodPointer);
                 return;
             }
@@ -596,6 +612,7 @@ static void hookAntiDamage() {
 }
 
 static void hookRiskFeatures() {
+    if (s_risk_hook_done.load(std::memory_order_relaxed)) return;
     discoverRiskClasses();
     if (g_risk.playerMove) {
         static const char *kUpd[] = {"Update","FixedUpdate","Move","OnMove",nullptr};
@@ -623,20 +640,29 @@ static void hookRiskFeatures() {
             }
         }
     }
+    s_risk_hook_done.store(true, std::memory_order_release);
 }
 
 static void hookWeaponFire() {
     if (!g_cls.weaponFire) return;
+    if (s_fire_hook_done.load(std::memory_order_relaxed)) return;
     static const char *kM[] = {
         "Fire","OnFire","Shoot","OnShoot","DoFire","StartFire","FireBullet","SpawnBullet",nullptr};
     for (const char **mn = kM; *mn; mn++) {
         MethodInfo *m = Il2Cpp::getMethod(g_cls.weaponFire, *mn, -1);
-        if (m && m->methodPointer && !g_origFireMethod) {
-            DobbyHook(m->methodPointer, (void*)hookFireWeapon, &g_origFireMethod);
-            g_origFire = (FnFireWeapon)g_origFireMethod;
-            LOG("Hooked weapon: %s @ %p", *mn, m->methodPointer);
-            break;
+        if (!m || !m->methodPointer || g_origFireMethod) continue;
+        // ABI safety: our hook is void(*)(void*, void*, void*) — 3 native args.
+        // Safe if method has <= 2 C# params (ARM64 callee ignores extra regs).
+        // Dangerous if method has > 2 params: callee reads x3+ which we never set.
+        if (m->parameters_count > 2) {
+            LOG("Skip %s: params_count=%u > 2, ABI mismatch", *mn, (unsigned)m->parameters_count);
+            continue;
         }
+        DobbyHook(m->methodPointer, (void*)hookFireWeapon, &g_origFireMethod);
+        g_origFire = (FnFireWeapon)g_origFireMethod;
+        s_fire_hook_done.store(true, std::memory_order_release);
+        LOG("Hooked weapon: %s @ %p (params=%u)", *mn, m->methodPointer, (unsigned)m->parameters_count);
+        break;
     }
 }
 
@@ -766,111 +792,136 @@ static bool hookHasLOS(void *self, void *from, void *to) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void Features::init() {
-    discoverClasses();
-    hookUnityIcalls();
-    hookWeaponFire();
-    hookRiskFeatures();
-    hookAimSystem();
-    hookNoGrass();
-    hookAntiDamage();
-    // CR-1: God Mode is merged into hookTakeDamage — no separate hook here.
+    // Re-run discovery if weapon class not yet found (il2cpp may not have been
+    // ready on the previous call — this is the key retry path)
+    if (!g_cls.ready) discoverClasses();
 
-    // Infinite Ammo + No Reload — hook post-fire callback
-    {
+    hookUnityIcalls(); // idempotent: g_origSetFOV null-checks internally
+
+    if (!s_fire_hook_done.load(std::memory_order_relaxed))   hookWeaponFire();
+    if (!s_risk_hook_done.load(std::memory_order_relaxed))   hookRiskFeatures();
+    if (!s_aim_hook_done.load(std::memory_order_relaxed))    hookAimSystem();
+    if (!s_damage_hook_done.load(std::memory_order_relaxed)) hookAntiDamage();
+    hookNoGrass(); // idempotent: skips if g_origGrassDraw already set
+
+    // Remaining hooks — run once only
+    if (!s_ammo_hook_done.load(std::memory_order_relaxed)) {
+        bool any = false;
+        // Infinite Ammo + No Reload — hook post-fire callback
         if (g_cls.weaponFire) {
             MethodInfo *m = Il2Cpp::getMethod(g_cls.weaponFire, "OnAfterFire", 1);
             if (!m) m = Il2Cpp::getMethod(g_cls.weaponFire, "AfterShoot", -1);
             if (m && m->methodPointer) {
                 DobbyHook((void*)m->methodPointer, (void*)hookAfterFire, (void**)&g_origAfterFire);
+                any = true;
             }
         }
+        if (any) s_ammo_hook_done.store(true, std::memory_order_release);
     }
-    // Wall Shoot — hook HasLineOfSight
-    {
-        Il2CppClass *shootCls = Il2Cpp::cls("CSShooterComponent");
-        if (!shootCls) shootCls = Il2Cpp::cls("BulletComponent");
-        if (shootCls) {
-            MethodInfo *m = Il2Cpp::getMethod(shootCls, "HasLineOfSight", -1);
-            if (!m) m = Il2Cpp::getMethod(shootCls, "CheckLOS", -1);
-            if (m && m->methodPointer) {
-                DobbyHook((void*)m->methodPointer, (void*)hookHasLOS, (void**)&g_origHasLOS);
+
+    if (!s_misc_hooks_done.load(std::memory_order_relaxed)) {
+        bool any = false;
+        // Wall Shoot — hook HasLineOfSight
+        {
+            Il2CppClass *shootCls = Il2Cpp::cls("CSShooterComponent");
+            if (!shootCls) shootCls = Il2Cpp::cls("BulletComponent");
+            if (shootCls) {
+                MethodInfo *m = Il2Cpp::getMethod(shootCls, "HasLineOfSight", -1);
+                if (!m) m = Il2Cpp::getMethod(shootCls, "CheckLOS", -1);
+                if (m && m->methodPointer && !g_origHasLOS) {
+                    DobbyHook((void*)m->methodPointer, (void*)hookHasLOS, (void**)&g_origHasLOS);
+                    any = true;
+                }
             }
         }
-    }
-    // Anti-Aim — hook GetLookDirection
-    {
-        Il2CppClass *aimCls = g_aim.aimCtrl ? g_aim.aimCtrl : Il2Cpp::cls("AimController");
-        if (aimCls) {
-            MethodInfo *m = Il2Cpp::getMethod(aimCls, "GetLookDirection", -1);
-            if (!m) m = Il2Cpp::getMethod(aimCls, "get_lookDirection", -1);
-            if (m && m->methodPointer) {
-                DobbyHook((void*)m->methodPointer, (void*)hookGetLookDir, (void**)&g_origGetLookDir);
+        // Anti-Aim — hook GetLookDirection
+        {
+            Il2CppClass *aimCls = g_aim.aimCtrl ? g_aim.aimCtrl : Il2Cpp::cls("AimController");
+            if (aimCls) {
+                MethodInfo *m = Il2Cpp::getMethod(aimCls, "GetLookDirection", -1);
+                if (!m) m = Il2Cpp::getMethod(aimCls, "get_lookDirection", -1);
+                if (m && m->methodPointer && !g_origGetLookDir) {
+                    DobbyHook((void*)m->methodPointer, (void*)hookGetLookDir, (void**)&g_origGetLookDir);
+                    any = true;
+                }
             }
         }
-    }
-    // No-Clip — hook CharacterController.Move
-    {
-        Il2CppClass *cc = Il2Cpp::cls("CharacterController", "UnityEngine");
-        if (cc) {
-            MethodInfo *m = Il2Cpp::getMethod(cc, "Move", 1);
-            if (m && m->methodPointer) {
-                DobbyHook((void*)m->methodPointer, (void*)hookCCMove, (void**)&g_origCCMove);
+        // No-Clip — hook CharacterController.Move
+        {
+            Il2CppClass *cc = Il2Cpp::cls("CharacterController", "UnityEngine");
+            if (cc) {
+                MethodInfo *m = Il2Cpp::getMethod(cc, "Move", 1);
+                if (m && m->methodPointer && !g_origCCMove) {
+                    DobbyHook((void*)m->methodPointer, (void*)hookCCMove, (void**)&g_origCCMove);
+                    any = true;
+                }
             }
         }
-    }
-    // Teleport — hook Transform.set_position
-    {
-        Il2CppClass *tr = Il2Cpp::cls("Transform", "UnityEngine");
-        if (tr) {
-            MethodInfo *m = Il2Cpp::getMethod(tr, "set_position", 1);
-            if (m && m->methodPointer) {
-                DobbyHook((void*)m->methodPointer, (void*)hookTransformSetPos, (void**)&g_origSetPos);
+        // Teleport — hook Transform.set_position
+        {
+            Il2CppClass *tr = Il2Cpp::cls("Transform", "UnityEngine");
+            if (tr) {
+                MethodInfo *m = Il2Cpp::getMethod(tr, "set_position", 1);
+                if (m && m->methodPointer && !g_origSetPos) {
+                    DobbyHook((void*)m->methodPointer, (void*)hookTransformSetPos, (void**)&g_origSetPos);
+                    any = true;
+                }
             }
         }
-    }
-    // NW-1: Silent Aim — hook GetFireDirection (must be here; not hooked anywhere else)
-    {
-        static const char *kSACls[] = {
-            "FireComponent","ShooterComponent","WeaponShooter","PlayerShooter",
-            "BulletShooter","GunComponent","WeaponFire",nullptr
-        };
-        for (const char **cn = kSACls; *cn; cn++) {
-            Il2CppClass *c = Il2Cpp::cls(*cn);
-            if (!c) continue;
-            static const char *kDir[] = {
-                "GetFireDirection","GetShootDir","CalculateFireDir",
-                "GetBulletDir","GetFireDir","FireDirection",nullptr
+        // Silent Aim — hook GetFireDirection
+        if (!g_origGetFireDir) {
+            static const char *kSACls[] = {
+                "FireComponent","ShooterComponent","WeaponShooter","PlayerShooter",
+                "BulletShooter","GunComponent","WeaponFire",nullptr
             };
-            for (const char **mn = kDir; *mn; mn++) {
-                MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
-                if (m && m->methodPointer) {
-                    DobbyHook((void*)m->methodPointer, (void*)hookGetFireDir,
-                              (void**)&g_origGetFireDir);
-                    LOG("Silent Aim hooked: %s::%s @ %p", *cn, *mn, m->methodPointer);
-                    goto sa_done;
+            for (const char **cn = kSACls; *cn; cn++) {
+                Il2CppClass *c = Il2Cpp::cls(*cn);
+                if (!c) continue;
+                static const char *kDir[] = {
+                    "GetFireDirection","GetShootDir","CalculateFireDir",
+                    "GetBulletDir","GetFireDir","FireDirection",nullptr
+                };
+                for (const char **mn = kDir; *mn; mn++) {
+                    MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
+                    if (m && m->methodPointer) {
+                        DobbyHook((void*)m->methodPointer, (void*)hookGetFireDir,
+                                  (void**)&g_origGetFireDir);
+                        LOG("Silent Aim hooked: %s::%s @ %p", *cn, *mn, m->methodPointer);
+                        any = true;
+                        goto sa_done;
+                    }
                 }
             }
+            sa_done:;
         }
-        sa_done:;
-    }
-    // NW-2: Auto Revive — find StartRevive method pointer without double-hooking
-    {
-        static const char *kRevCls[] = {"CSPlayerState","PlayerController","CharacterRevive",nullptr};
-        for (const char **cn = kRevCls; *cn; cn++) {
-            Il2CppClass *c = Il2Cpp::cls(*cn);
-            if (!c) continue;
-            static const char *kRev[] = {"StartRevive","DoRevive","ReviveMate","RevivePlayer","TryRevive",nullptr};
-            for (const char **mn = kRev; *mn; mn++) {
-                MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
-                if (m && m->methodPointer) {
-                    g_origStartRevive = (StartReviveFn)m->methodPointer;
-                    LOG("StartRevive found: %s::%s @ %p", *cn, *mn, m->methodPointer);
-                    goto rev_done;
+        // Auto Revive — resolve StartRevive pointer (no hook needed — called directly)
+        if (!g_origStartRevive) {
+            static const char *kRevCls[] = {"CSPlayerState","PlayerController","CharacterRevive",nullptr};
+            for (const char **cn = kRevCls; *cn; cn++) {
+                Il2CppClass *c = Il2Cpp::cls(*cn);
+                if (!c) continue;
+                static const char *kRev[] = {"StartRevive","DoRevive","ReviveMate","RevivePlayer","TryRevive",nullptr};
+                for (const char **mn = kRev; *mn; mn++) {
+                    MethodInfo *m = Il2Cpp::getMethod(c, *mn, -1);
+                    if (m && m->methodPointer) {
+                        g_origStartRevive = (StartReviveFn)m->methodPointer;
+                        LOG("StartRevive found: %s::%s @ %p", *cn, *mn, m->methodPointer);
+                        any = true;
+                        goto rev_done;
+                    }
                 }
             }
+            rev_done:;
         }
-        rev_done:;
+        if (any) s_misc_hooks_done.store(true, std::memory_order_release);
     }
+}
+
+bool Features::isReady() {
+    // Minimum signal: fire hook OR move hook installed.
+    // Either means class discovery succeeded and at least one feature is active.
+    return s_fire_hook_done.load(std::memory_order_relaxed) ||
+           s_risk_hook_done.load(std::memory_order_relaxed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

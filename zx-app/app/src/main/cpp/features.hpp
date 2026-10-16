@@ -28,6 +28,7 @@ enum FeatureCmd {
 
 namespace Features {
     void init();
+    bool isReady();   // true once at least one game hook is installed
     void apply(int cmd, bool enable);
     void applyIntensity(int cmd, int intensity); // 0-100 percent
 }

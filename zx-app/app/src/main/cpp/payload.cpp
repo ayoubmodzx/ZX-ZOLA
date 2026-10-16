@@ -33,17 +33,23 @@ struct ZxCtrl {
 extern "C" ZxCtrl __g_sdktbl1 __attribute__((visibility("default"), used)) = {};
 
 static void *ctrl_loop(void *) {
-    // Register our TID first — Layer 54 hides it from /proc/self/task scans
     zx_register_tid(gettid());
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
-    sleep(3);
 
-    if (!Il2Cpp::init()) {
-        LOG("Il2Cpp init failed");
-        return nullptr;
+    // il2cpp loads asynchronously — Unity domain + assemblies may not be ready for
+    // several seconds after injection. We retry il2cpp init + feature discovery
+    // every 1s for up to 60s so Features::init() always runs with a live image.
+    // Il2Cpp::init() is idempotent; Features::init() skips already-installed hooks.
+    for (int i = 0; i < 60; i++) {
+        usleep(1000000); // 1s
+        Il2Cpp::init();
+        Features::init();
+        if (Features::isReady()) {
+            LOG("Features ready after %ds", i + 1);
+            break;
+        }
+        if (i == 59) LOG("Feature discovery timed out (60s) — running degraded");
     }
-    LOG("Il2Cpp ready — starting class discovery + engine hooks");
-    Features::init();
     ESP::init();
     LOG("Payload ready");
 
