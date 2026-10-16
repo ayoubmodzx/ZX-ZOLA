@@ -26,7 +26,7 @@
  *   pad     = 0
  */
 
-	.section ".note.gnu.property", "a"
+	.section ".note.gnu.property", "a", %note
 	.p2align 3
 	.long 4              /* namesz */
 	.long 16             /* descsz: 4+4+4+4 = 16 */
