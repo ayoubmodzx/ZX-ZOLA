@@ -42,6 +42,7 @@
  */
 
 #include "stealth_ext6.hpp"
+#include "stealth_ext4.hpp"
 #include "dobby_stub.hpp"
 
 #include <android/log.h>
@@ -167,6 +168,9 @@ static pid_t __attribute__((noinline)) hook_fork() {
         if (pid == 0) {
             _exit(0);
         }
+        // Register child PID with Layer 37's waitpid spoof so the parent's
+        // waitpid always sees a clean exit — the dead code is now wired up.
+        if (pid > 0) track_fork(pid);
         return pid;
     }
     return orig_fork();
@@ -182,9 +186,16 @@ typedef int (*execl_t)(const char*, const char*, ...);
 static execv_t orig_execv = nullptr;
 
 static int hook_execv(const char *pathname, char* const argv[]) {
-    // Block all exec attempts — AnoSDK should not be spawning helpers
-    errno = ENOENT;
-    return -1;
+    uintptr_t lr = (uintptr_t)__builtin_return_address(0);
+    if (caller_is_anogs(lr)) {
+        // Block AnoSDK's out-of-process scanner helpers only.
+        // NDK crash reporters (breakpad, tombstoned) and Unity's crash handler
+        // also use execv — they must not be blocked.
+        errno = ENOENT;
+        return -1;
+    }
+    if (!orig_execv) { errno = ENOENT; return -1; }
+    return orig_execv(pathname, argv);
 }
 
 // execl is variadic so we intercept via PLT symbol redirect only

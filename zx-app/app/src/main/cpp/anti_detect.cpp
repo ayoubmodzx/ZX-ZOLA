@@ -460,6 +460,9 @@ void zx_scrub_trampolines() {
         mprotect((void*)pg, ps, PROT_READ | PROT_WRITE | PROT_EXEC);
         memcpy(p, k_clean_hdr, 8);
         __builtin___clear_cache((char*)p, (char*)p + 8);
+        // Restore RX — permanent RWX pages are a detectable signature visible
+        // in /proc/kpageflags and via hardware PMU dirty-tracking.
+        mprotect((void*)pg, ps, PROT_READ | PROT_EXEC);
     }
     LI("L4 scrubbed %d trampoline headers", k_scrub_n);
 }

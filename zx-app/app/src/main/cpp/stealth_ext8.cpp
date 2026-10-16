@@ -43,6 +43,7 @@
 
 #include <android/log.h>
 #include <dlfcn.h>
+#include <link.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/sendfile.h>
@@ -181,6 +182,34 @@ static ssize_t hook_pvm_writev(pid_t pid, const struct iovec *lvec,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// libanogs.so range for ext8 caller-aware checks
+// ─────────────────────────────────────────────────────────────────────────────
+
+static uintptr_t s_ano_base8 = 0;
+static uintptr_t s_ano_end8  = 0;
+
+static int phdr_find_anogs8(dl_phdr_info *info, size_t, void*) {
+    if (!info->dlpi_name) return 0;
+    // "libanogs.so" XOR 0x5A
+    static const uint8_t k[] = {0x36,0x33,0x38,0x34,0x34,0x35,0x3D,0x29,0x08,0x29,0x35,0x00};
+    static char nm[12]; static bool rdy = false;
+    if (__builtin_expect(!rdy, 0)) { rdy = true; for (int i = 0; i < 11; i++) nm[i] = (char)(k[i]^0x5A); nm[11]=0; }
+    if (!strstr(info->dlpi_name, nm)) return 0;
+    uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_LOAD) { uintptr_t e = base+ph.p_vaddr+ph.p_memsz; if(e>end)end=e; }
+    }
+    s_ano_base8 = base; s_ano_end8 = end; return 1;
+}
+
+static inline bool caller_is_anogs8() {
+    if (!s_ano_base8) dl_iterate_phdr(phdr_find_anogs8, nullptr);
+    uintptr_t lr = (uintptr_t)__builtin_return_address(1);
+    return s_ano_base8 && lr >= s_ano_base8 && lr < s_ano_end8;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Layer 59 — io_uring / pidfd syscall() intercept (extends Layer 34)
 // Layer 61 — pidfd_open / pidfd_send_signal / pidfd_getfd
 // These are injected into the existing libc syscall() hook via a chain.
@@ -192,12 +221,17 @@ static syscall_t orig_syscall8 = nullptr;
 static long hook_syscall8(long nr, long a1, long a2, long a3,
                           long a4, long a5, long a6) {
     switch ((int)nr) {
-    // Layer 59 — io_uring: deny ring creation; any in-flight ring setup dies
+    // Layer 59 — io_uring: deny ring creation only for ano callers.
+    // Unity 2023+ uses io_uring for async asset loading — blocking it
+    // unconditionally causes asset load failures and game freezes.
     case __NR_io_uring_setup:
     case __NR_io_uring_enter:
     case __NR_io_uring_register:
-        errno = ENOSYS;
-        return -1L;
+        if (caller_is_anogs8()) {
+            errno = ENOSYS;
+            return -1L;
+        }
+        break;
 
     // Layer 61 — pidfd: deny all pidfd-based process handle creation/signaling
     case __NR_pidfd_open:

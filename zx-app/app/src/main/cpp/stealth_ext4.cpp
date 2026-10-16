@@ -89,6 +89,23 @@ static constexpr uint64_t FAKE_DELTA_NS = 2'500'000ULL; // 2.5ms per call
 
 static int hook_clock_gettime(clockid_t clk, struct timespec *tp) {
     if ((clk == 7 /*CLOCK_BOOTTIME*/ || clk == 4 /*CLOCK_MONOTONIC_RAW*/) && tp) {
+        // Base on real CLOCK_MONOTONIC so rate matches real time regardless of
+        // how many threads call concurrently, then add a constant fingerprint-clean
+        // offset so AnoSDK delta checks never see a suspiciously frozen clock.
+        if (g_orig_clock_gettime) {
+            int r = g_orig_clock_gettime(CLOCK_MONOTONIC, tp);
+            if (r == 0) {
+                // Subtract 3s then add the seeded start offset to avoid t=0 anomaly
+                uint64_t real_ns = (uint64_t)tp->tv_sec * 1'000'000'000ULL + (uint64_t)tp->tv_nsec;
+                uint64_t base    = g_fake_ns.load(std::memory_order_relaxed);
+                uint64_t offset  = (real_ns > 3'000'000'000ULL) ? (real_ns - 3'000'000'000ULL) : real_ns;
+                uint64_t out_ns  = base + offset;
+                tp->tv_sec  = (time_t)(out_ns / 1'000'000'000ULL);
+                tp->tv_nsec = (long)  (out_ns % 1'000'000'000ULL);
+                return 0;
+            }
+        }
+        // Fallback: pure fake counter
         uint64_t ns = g_fake_ns.fetch_add(FAKE_DELTA_NS, std::memory_order_relaxed);
         tp->tv_sec  = (time_t)(ns / 1'000'000'000ULL);
         tp->tv_nsec = (long)  (ns % 1'000'000'000ULL);
@@ -250,12 +267,19 @@ static void noop_sighandler(int) {}
 
 static int hook_sigaction(int sig, const struct sigaction *act, struct sigaction *old) {
     if (!g_orig_sigaction) { errno = ENOSYS; return -1; }
-    if (sig == SIGTRAP || sig == SIGILL) {
-        struct sigaction noop_act{};
-        noop_act.sa_handler = noop_sighandler;
-        sigemptyset(&noop_act.sa_mask);
-        noop_act.sa_flags = 0;
-        return g_orig_sigaction(sig, &noop_act, old);
+    // Only intercept SIGILL/SIGTRAP registrations originating from libanogs.
+    // IL2CPP unconditionally registers a SIGILL handler for NullReferenceException
+    // and Unity's profiler uses SIGTRAP; letting those pass through is mandatory.
+    if ((sig == SIGTRAP || sig == SIGILL) && act) {
+        if (!s_ano4_base) dl_iterate_phdr(phdr_find_ano4, nullptr);
+        uintptr_t lr = (uintptr_t)__builtin_return_address(0);
+        if (s_ano4_base && lr >= s_ano4_base && lr < s_ano4_end) {
+            struct sigaction noop_act{};
+            noop_act.sa_handler = noop_sighandler;
+            sigemptyset(&noop_act.sa_mask);
+            noop_act.sa_flags = 0;
+            return g_orig_sigaction(sig, &noop_act, old);
+        }
     }
     return g_orig_sigaction(sig, act, old);
 }

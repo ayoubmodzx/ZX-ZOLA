@@ -644,14 +644,13 @@ void install_stealth_ext3() {
     if (sym_execve)
         DobbyHook(sym_execve, (void*)hook_execve, (void**)&g_orig_execve);
 
-    // Hook execl via execve chain (execl internally calls execve on most impls)
-    // Additionally hook execvpe/execvp for full coverage
+    // execvp shares the same caller-aware noinline hook as execve.
+    // DobbyHook on a distinct PLT slot closes the gap where AnoSDK calls
+    // execvp directly without going through execve.
     void *sym_execvp = dlsym(RTLD_DEFAULT, "execvp");
     if (sym_execvp && sym_execvp != sym_execve) {
-        // execvp calls execve, but hook redundantly for safety
         static FnExecve _orig_execvp = nullptr;
-        // execvp(path, argv) — wrap via execve hook already installed
-        (void)sym_execvp;
+        DobbyHook(sym_execvp, (void*)hook_execve, (void**)&_orig_execvp);
     }
 
     // ── Layer 21: getenv ──────────────────────────────────────────────────────
