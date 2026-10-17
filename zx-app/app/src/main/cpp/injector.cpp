@@ -1194,14 +1194,10 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // stubs expect pacia-signed values → auth fail → poison → SIGSEGV.
     patch_plt_braa(pid);
 
-    // ── Cleanup anonymous shellcode buffer NOW — before init_fn can crash ────
-    // remote_munmap needs the process alive (PTRACE_GETREGSET). init_fn SIGSEGV
-    // kills the process before we can munmap if we wait until after init_fn runs.
-    remote_munmap(pid, remote_buf, alloc);
-
     // ── Call zx_payload_start() ──────────────────────────────────────────────
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
     // Now that GOT is patched, call the real init symbol.
+    // NOTE: sc_addr = remote_buf+path_aligned is still valid here — munmap happens AFTER.
     {
         uintptr_t sym_off  = find_sym_in_file(so_path, "unity_render_thread_init");
         uintptr_t elf_base2 = ProcMem::findLibBase(pid, STAGED_NAME);
@@ -1301,6 +1297,9 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
             zerr("remote_dlopen: init_fn not found — payload will not run");
         }
     }
+
+    // ── Cleanup anonymous shellcode buffer (path + sc2 both live here) ───────
+    remote_munmap(pid, remote_buf, alloc);
 
     // Use BRK-state registers captured in the diagnostic block above.
     uintptr_t handle = sc_handle;
