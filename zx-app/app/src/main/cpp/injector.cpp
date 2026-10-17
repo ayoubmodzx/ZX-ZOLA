@@ -669,10 +669,15 @@ static void strip_pac_via_rela(pid_t pid, const char *so_path) {
             uintptr_t slot = elf_base + (uintptr_t)r.r_offset;
             uint64_t val = 0;
             if (!ProcMem::read(slot, &val, 8)) continue;
-            uint8_t top = (uint8_t)(val >> 56);
-            if (top == 0 || top == 0xFF) continue;
-            if ((val & 0x00FFFFFFFFFFFFFFull) < 0x10000ULL) continue;
-            uint64_t clean = val & 0x00FFFFFFFFFFFFFFull;
+            // PAC on arm64 uses top 16 bits ([63:48]) for the signature.
+            // Valid user-space pointers have bits[63:48]==0; kernel ones 0xFFFF.
+            // Use a 2-byte check so we catch PAC tags that span both top bytes
+            // (e.g. 0xa90d... where top byte=0xa9 BUT lower PAC byte=0x0d also set).
+            uint16_t top16 = (uint16_t)(val >> 48);
+            if (top16 == 0 || top16 == 0xFFFFu) continue;
+            if ((val & 0x0000FFFFFFFFFFFFull) < 0x10000ULL) continue;
+            // Clear full 16-bit PAC region, not just top byte.
+            uint64_t clean = val & 0x0000FFFFFFFFFFFFull;
             if (ProcMem::write(slot, &clean, 8)) {
                 total_stripped++;
                 zerr("pac_strip: %s[%zu] slot@0x%lx 0x%llx→0x%llx",
@@ -990,11 +995,10 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         }
 
         // /proc/pid/maps scan — identify which library owns crash-related addresses.
-        // PAC bits are in the top byte; mask them off before comparing against maps ranges.
-        // ARMv8.3 PAC uses bits [63:55] or [63:48] depending on TBI/VA_BITS config.
-        // Safe mask: clear top 8 bits (handles both 39-bit and 48-bit VA configs).
+        // PAC occupies bits [63:48] (top 16 bits) on all realistic arm64 configs.
+        // Clear those 16 bits before range-checking so we find the right library.
         {
-            constexpr uintptr_t PAC_MASK = 0x00FFFFFFFFFFFFFFull;
+            constexpr uintptr_t PAC_MASK = 0x0000FFFFFFFFFFFFull;
             uintptr_t probe_addrs[] = {
                 sr.regs[16] & PAC_MASK,   // X16 — PAC-tagged function pointer that crashed
                 sr.regs[17] & PAC_MASK,   // X17 — PLT stub or trampoline
@@ -1145,7 +1149,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                     }
                     // Maps scan — which lib owns X16, X17, LR, stack frames
                     {
-                        constexpr uintptr_t PAC_MASK = 0x00FFFFFFFFFFFFFFull;
+                        constexpr uintptr_t PAC_MASK = 0x0000FFFFFFFFFFFFull;
                         uintptr_t probes[] = {
                             sr2.regs[16] & PAC_MASK,
                             sr2.regs[17] & PAC_MASK,

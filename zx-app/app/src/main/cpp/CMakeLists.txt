@@ -47,6 +47,13 @@ target_link_options(zx_payload PRIVATE
     # This eliminates R_AARCH64_GLOB_DAT relocations that FF's bionic linker
     # would otherwise try — and fail — to resolve from its namespace.
     -Wl,-Bsymbolic
+    # -z,now (BIND_NOW): force bionic to resolve ALL symbols at dlopen time,
+    # not lazily on first call. Without this, GOT entries hold PLT-resolver
+    # stub addresses at dlopen BRK time, so pac_strip sees 0 PAC-tagged slots.
+    # First call then triggers lazy resolution which writes back PAC-signed
+    # addresses, causing BR X16 crashes. With BIND_NOW, GOT is fully resolved
+    # before our BRK fires, and pac_strip cleans every PAC-tagged entry.
+    -Wl,-z,now
     -nostdlib++
     -l:libc++_static.a
     -l:libc++abi.a
