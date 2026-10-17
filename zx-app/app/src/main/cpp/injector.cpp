@@ -697,6 +697,65 @@ static void strip_pac_via_rela(pid_t pid, const char *so_path) {
     zerr("pac_strip: done — %d/%d slots stripped", total_stripped, total_scanned);
 }
 
+// Patch all BRAA Xn,Xm PLT stubs in the payload's r-xp segment to plain BR Xn.
+//
+// Root cause: bionic (FF's linker) resolves GOT slots as UNSIGNED plain pointers.
+// lld-generated PLT stubs use BRAA Xn,Xm which REQUIRES the GOT slot to be
+// pacia-signed with Xm (the GOT slot address) as modifier. Since bionic writes
+// unsigned pointers, authentication ALWAYS fails → the branch target register is
+// poisoned with an invalid PAC-tagged address → SIGSEGV at zx_payload_start.
+//
+// Fix: replace every BRAA Xn,Xm instruction in the r-xp segment with BR Xn
+// (same destination register, no authentication). The kernel handles D/I-cache
+// coherency for PTRACE_POKETEXT writes automatically.
+//
+// BRAA Xn,Xm encoding: (insn & 0xFFFFFC00) == 0xD71F0800, Rn in bits [4:0].
+// BR Xn encoding:       0xD61F0000 | (Rn << 5).
+static void patch_plt_braa(pid_t pid) {
+    char mpath[64]; snprintf(mpath, sizeof(mpath), "/proc/%d/maps", pid);
+    FILE *mf = fopen(mpath, "r");
+    if (!mf) { zerr("patch_plt: cannot open /proc/%d/maps errno=%d", pid, errno); return; }
+
+    uintptr_t rx_start = 0, rx_end = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), mf)) {
+        uintptr_t s = 0, e = 0; char p[8] = {};
+        sscanf(line, "%lx-%lx %7s", &s, &e, p);
+        if (p[0]=='r' && p[1]=='-' && p[2]=='x' && strstr(line, STAGED_NAME)) {
+            if (!rx_start || s < rx_start) rx_start = s;
+            if (e > rx_end) rx_end = e;
+        }
+    }
+    fclose(mf);
+
+    if (!rx_start) { zerr("patch_plt: no r-xp segment for %s", STAGED_NAME); return; }
+    zerr("patch_plt: r-xp [0x%lx-0x%lx] %zuKB",
+         (unsigned long)rx_start, (unsigned long)rx_end, (size_t)(rx_end-rx_start)/1024);
+
+    static uint8_t s_pbuf[65536];
+    int total_found = 0, total_patched = 0;
+
+    for (uintptr_t pos = rx_start; pos < rx_end; pos += sizeof(s_pbuf)) {
+        size_t chunk = (rx_end - pos < sizeof(s_pbuf)) ? (size_t)(rx_end - pos) : sizeof(s_pbuf);
+        if (!ProcMem::read(pos, s_pbuf, chunk)) continue;
+
+        for (size_t i = 0; i + 4 <= chunk; i += 4) {
+            uint32_t insn; memcpy(&insn, s_pbuf + i, 4);
+            // BRAA Xn,Xm: bits [31:10] fixed = 0xD71F08 (key A, Z=0)
+            // BRAB Xn,Xm also covered since both use same upper bits with different internal key bit
+            if ((insn & 0xFFFFFC00u) != 0xD71F0800u) continue;
+            total_found++;
+            uint32_t rn   = insn & 0x1Fu;                    // branch target register
+            uint32_t repl = 0xD61F0000u | (rn << 5u);        // BR Xn
+            uintptr_t addr = pos + i;
+            zerr("patch_plt: BRAA(0x%08x) @0x%lx X%u → BR_X%u(0x%08x)",
+                 insn, (unsigned long)addr, rn, rn, repl);
+            if (remote_poke_insn(pid, addr, repl)) total_patched++;
+        }
+    }
+    zerr("patch_plt: done — %d stubs patched / %d found", total_patched, total_found);
+}
+
 // Call dlopen+dlerror via a single shellcode run to both open the .so and
 // capture the error message if it fails — all in one PTRACE_CONT window.
 //
@@ -1089,6 +1148,13 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // every 64-bit value in the relro segment (vtables, constants, offsets)
     // which corrupted the payload and caused SIGBUS in zx_payload_start.
     strip_pac_via_rela(pid, so_path);
+
+    // ── PLT BRAA → BR patch ──────────────────────────────────────────────────
+    // MUST run AFTER dlopen (so the .so is mapped) and BEFORE zx_payload_start.
+    // Replaces PAC-authenticated PLT stubs with plain unconditional branches.
+    // Required because bionic (FF's linker) writes unsigned GOT entries; BRAA
+    // stubs expect pacia-signed values → auth fail → poison → SIGSEGV.
+    patch_plt_braa(pid);
 
     // ── Call zx_payload_start() ──────────────────────────────────────────────
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
