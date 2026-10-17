@@ -166,6 +166,8 @@ class ZxOverlayService : Service() {
     // Status polling
     private var isConnected = false
     private val uiHandler = Handler(Looper.getMainLooper())
+    private var ffWasRunning = false
+
     private val pollTask = object : Runnable {
         override fun run() {
             Thread {
@@ -175,10 +177,16 @@ class ZxOverlayService : Service() {
                     if (running && !isConnected) {
                         isConnected = true
                         setConnected(pid)
+                        // Auto-hide overlay while FF is in foreground — TYPE_APPLICATION_OVERLAY
+                        // windows from other packages are detectable by anti-cheat scanners.
+                        if (fabVisible) toggleFabVisibility()
                     } else if (!running && isConnected) {
                         isConnected = false
                         setDisconnected()
+                        // Restore overlay when user returns to our app
+                        if (!fabVisible) toggleFabVisibility()
                     }
+                    ffWasRunning = running
                 }
             }.start()
             uiHandler.postDelayed(this, 3000L)

@@ -360,6 +360,40 @@ static uintptr_t remote_mmap(pid_t pid, size_t size) {
     return (result < (uintptr_t)-4096ULL) ? result : 0;
 }
 
+// Free an anonymous mapping we created in the target process.
+// Mirrors remote_mmap: SVC #0 gadget + PTRACE_SINGLESTEP for __NR_munmap (215).
+// Called after injection to eliminate the rwxp anonymous mapping from /proc/maps
+// before AnoSDK's memory scanner sees it.
+static bool remote_munmap(pid_t pid, uintptr_t addr, size_t size) {
+    if (!addr || !size) return false;
+    pt_regs orig, regs;
+    if (!get_regs(pid, &orig)) { zerr("remote_munmap: get_regs failed errno=%d", errno); return false; }
+
+    uintptr_t svc_addr = find_svc_gadget(pid);
+    if (!svc_addr) { zerr("remote_munmap: no SVC gadget"); return false; }
+
+    memcpy(&regs, &orig, sizeof(regs));
+    regs.pstate    &= ~(uint64_t)(3u << 10);
+    regs.regs[8]    = 215;   // __NR_munmap
+    regs.regs[0]    = addr;
+    regs.regs[1]    = (uint64_t)size;
+    regs.pc         = svc_addr;
+
+    if (!set_regs(pid, &regs)) { zerr("remote_munmap: set_regs failed errno=%d", errno); return false; }
+
+    int wst = singlestep_wait(pid);
+    pt_regs after; get_regs(pid, &after);
+    set_regs(pid, &orig);
+
+    if (!WIFSTOPPED(wst) || WSTOPSIG(wst) != SIGTRAP) {
+        zerr("remote_munmap: bad stop wst=0x%x", wst);
+        return false;
+    }
+    long rc = (long)after.regs[0];
+    zerr("remote_munmap: munmap(0x%lx, %zu) rc=%ld", (unsigned long)addr, size, rc);
+    return rc == 0;
+}
+
 // One hook record: target address + original instruction + ACE's replacement.
 struct AcePatch {
     uintptr_t tgt_addr;
@@ -1291,6 +1325,12 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     bool ok = (handle != 0 && handle <= 0xFFFFFFFFULL) || in_maps;
     if (!ok)
         zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d", (unsigned long)handle, in_maps);
+
+    // ── Cleanup: unmap shellcode/path buffer ─────────────────────────────────
+    // The anonymous rwxp mapping is the #1 AnoSDK injection indicator.
+    // Unmap it before detaching so it never appears in a scanner pass.
+    remote_munmap(pid, remote_buf, alloc);
+
     return ok;
 }
 
@@ -1410,6 +1450,12 @@ int main(int argc, char *argv[]) {
         ptrace_detach(pid);
 
         if (!ok) { ERR("Injection failed"); ProcMem::close(); return 4; }
+
+        // Delete staged file from disk — once dlopen has mapped it into memory
+        // the on-disk copy is no longer needed. Leaving it is detectable: AnoSDK
+        // scans FF's lib directory for files not in the original APK manifest.
+        unlink(payload_path);
+        zerr("main: staged file unlinked: %s", payload_path);
 
         payload_base = ProcMem::findLibBase(pid, STAGED_NAME);
         LOG("Payload loaded at 0x%lx", payload_base);
