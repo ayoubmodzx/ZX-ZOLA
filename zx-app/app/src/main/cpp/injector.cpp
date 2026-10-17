@@ -62,6 +62,10 @@ static constexpr const char *PAYLOAD_NAME = "libunity_render.so";
 // The source .so is still libzx_payload.so; we copy it under this alias so
 // /proc/maps never shows a "zx" or "payload" string before Layer 2 hides it.
 static constexpr const char *STAGED_NAME  = "libunity_gc.so";
+// Bump whenever ZxCtrl struct layout or payload ABI changes so the injector
+// knows to force re-inject rather than re-using a stale in-memory payload.
+#define PAYLOAD_VERSION 2
+static constexpr const char *VER_FILE     = "/data/local/tmp/.zxver";
 
 // ── ptrace remote call helpers ────────────────────────────────────────────────
 
@@ -1358,6 +1362,22 @@ int main(int argc, char *argv[]) {
     // Check if payload is already loaded in target (look up by staged name)
     uintptr_t payload_base = ProcMem::findLibBase(pid, STAGED_NAME);
 
+    // Version file written after every successful inject. If it doesn't match
+    // PAYLOAD_VERSION the loaded payload is stale (old build left in memory).
+    // Force re-injection so the new payload is loaded alongside the old one.
+    // Old ctrl_loop keeps running but commands go to the new payload's struct.
+    if (payload_base) {
+        int file_ver = 0;
+        FILE *vf = fopen(VER_FILE, "r");
+        if (vf) { fscanf(vf, "%d", &file_ver); fclose(vf); }
+        if (file_ver != PAYLOAD_VERSION) {
+            zerr("version_check: stale payload (v%d, need v%d) — forcing re-inject", file_ver, PAYLOAD_VERSION);
+            payload_base = 0;
+        } else {
+            zerr("version_check: payload v%d OK", file_ver);
+        }
+    }
+
     if (!payload_base) {
         // First activation — inject the payload
         char payload_path[512];
@@ -1457,6 +1477,10 @@ int main(int argc, char *argv[]) {
         unlink(payload_path);
         zerr("main: staged file unlinked: %s", payload_path);
 
+        // Write version file so subsequent calls know this payload is current
+        FILE *vf = fopen(VER_FILE, "w");
+        if (vf) { fprintf(vf, "%d\n", PAYLOAD_VERSION); fclose(vf); }
+
         payload_base = ProcMem::findLibBase(pid, STAGED_NAME);
         LOG("Payload loaded at 0x%lx", payload_base);
     }
@@ -1504,21 +1528,23 @@ int main(int argc, char *argv[]) {
         ProcMem::write(ctrl_addr,     &cmd,           sizeof(int)); // cmd last as trigger
         zerr("ctrl_write: cmd=%d en=%d intensity=%d @ 0x%lx", cmd, enable_val, intensity_val, (unsigned long)ctrl_addr);
 
-        // Poll for ACK from ctrl_loop (cmd cleared = processed); up to 600ms
-        // During the 60s init phase the loop won't process — report that explicitly
-        bool acked = false;
-        for (int i = 0; i < 12; i++) {
-            usleep(50000); // 50ms
-            int rb = 0;
-            if (ProcMem::read(ctrl_addr, &rb, sizeof(int)) && rb == 0) { acked = true; break; }
+        // Poll for ACK from ctrl_loop (cmd cleared = processed); up to 600ms.
+        // Skip ACK poll for cmd=0 — we wrote 0 so readback is trivially 0, not an ACK.
+        if (cmd != 0) {
+            bool acked = false;
+            for (int i = 0; i < 12; i++) {
+                usleep(50000); // 50ms
+                int rb = -1;
+                if (ProcMem::read(ctrl_addr, &rb, sizeof(int)) && rb == 0) { acked = true; break; }
+            }
+            int post_ack = 0, post_live = 0;
+            ProcMem::read(ctrl_addr + 12, &post_ack,  sizeof(int));
+            ProcMem::read(ctrl_addr + 16, &post_live, sizeof(int));
+            if (acked)
+                zerr("ctrl_ack: PROCESSED (ack=%d live=0x%x)", post_ack, post_live);
+            else
+                zerr("ctrl_ack: NOT processed within 600ms — loop in 60s init or crashed (live=0x%x ack=%d)", post_live, post_ack);
         }
-        int post_ack = 0, post_live = 0;
-        ProcMem::read(ctrl_addr + 12, &post_ack,  sizeof(int));
-        ProcMem::read(ctrl_addr + 16, &post_live, sizeof(int));
-        if (acked)
-            zerr("ctrl_ack: PROCESSED by ctrl_loop (ack=%d live=0x%x)", post_ack, post_live);
-        else
-            zerr("ctrl_ack: NOT processed within 600ms — loop in 60s init or crashed (live=0x%x)", post_live);
 
         LOG("Command sent: cmd=%d enable=%d intensity=%d", cmd, enable_val, intensity_val);
     } else {
