@@ -1461,9 +1461,25 @@ int main(int argc, char *argv[]) {
         LOG("Payload loaded at 0x%lx", payload_base);
     }
 
-    // Send command to payload via shared memory flag
-    // The payload polls a small control struct it mmap'd at a known offset
-    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, STAGED_NAME, "_unity_gfx_params");
+    // Send command to payload via shared memory flag.
+    // ProcMem::findSymbol uses dlopen(STAGED_NAME) locally — but the staged file
+    // is unlinked right after first injection (line ~1457). On every subsequent
+    // call dlopen fails silently → ctrl_addr=0 → write never happens → no features.
+    // Fix: resolve symbol offset from the ORIGINAL payload file (argv[4],
+    // libunity_render.so — never unlinked) and apply it to the remote base found
+    // via /proc/pid/maps (which still shows "libunity_gc.so (deleted)").
+    uintptr_t ctrl_addr = 0;
+    {
+        uintptr_t cb = ProcMem::findLibBase(pid, STAGED_NAME);
+        const char *orig = (argc >= 5 && argv[4][0] != '\0') ? argv[4] : nullptr;
+        if (cb && orig) {
+            uintptr_t off = find_sym_in_file(orig, "_unity_gfx_params");
+            if (off) ctrl_addr = cb + off;
+        }
+        if (!ctrl_addr)
+            zerr("ctrl_addr lookup failed: staged_base=0x%lx orig=%s",
+                 (unsigned long)cb, orig ? orig : "(null)");
+    }
     if (ctrl_addr) {
         // Write enable (+4) and intensity (+8) before cmd (+0) so the payload never
         // reads a non-zero cmd with stale enable/intensity values (write-ordering fix)
