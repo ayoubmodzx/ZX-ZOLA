@@ -651,7 +651,7 @@ static bool find_rw_segment(const char *so_path, uint64_t *out_vaddr, uint64_t *
 // and strip PAC from those specific GOT entries in the target process.
 // This avoids corrupting legitimate 64-bit data (vtables, constants, etc.)
 // that a broad scan of the whole relro segment would clobber.
-static void strip_pac_via_rela(pid_t pid, const char *so_path) {
+static void strip_pac_via_rela(pid_t pid, const char *so_path, uintptr_t elf_base_hint = 0) {
     int fd = open(so_path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) { zerr("pac_strip: open %s errno=%d", so_path, errno); return; }
 
@@ -685,7 +685,7 @@ static void strip_pac_via_rela(pid_t pid, const char *so_path) {
     }
 
     auto vma2off = [&](uint64_t vma) -> uint64_t { return vma - load_vaddr + load_off; };
-    uintptr_t elf_base = ProcMem::findLibBase(pid, STAGED_NAME);
+    uintptr_t elf_base = elf_base_hint ? elf_base_hint : ProcMem::findLibBase(pid, STAGED_NAME);
     zerr("pac_strip: elf_base=0x%lx rela@0x%llx sz=%llu jmprel@0x%llx sz=%llu",
          (unsigned long)elf_base,
          (unsigned long long)rela_vma, (unsigned long long)rela_sz,
@@ -1180,14 +1180,10 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         return false;
     }
 
-    // ── PAC GOT strip ────────────────────────────────────────────────────────
-    // Surgical: parse RELA table from the .so file, touch only GLOB_DAT +
-    // JUMP_SLOT slots. The old broad-scan approach cleared the top byte from
-    // every 64-bit value in the relro segment (vtables, constants, offsets)
-    // which corrupted the payload and caused SIGBUS in zx_payload_start.
-    strip_pac_via_rela(pid, so_path);
-
     // ── PLT BRAA → BR patch ──────────────────────────────────────────────────
+    // PAC strip moved to immediately before each PTRACE_CONT in init_fn retry loop
+    // below — this eliminates the GGP race window where GGP re-signs GOT after
+    // strip but before init_fn executes.
     // MUST run AFTER dlopen (so the .so is mapped) and BEFORE zx_payload_start.
     // Replaces PAC-authenticated PLT stubs with plain unconditional branches.
     // Required because bionic (FF's linker) writes unsigned GOT entries; BRAA
@@ -1212,85 +1208,99 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
             sc2.i[3] = 0xD503201Fu; // NOP (align)
             sc2.fn   = (uint64_t)fn_start;
             if (ProcMem::write(sc_addr, &sc2, sizeof(sc2))) {
-                pt_regs r2; get_regs(pid, &r2);
-                r2.pstate &= ~(uint64_t)(3u << 10);
-                r2.pc = sc_addr;
-                set_regs(pid, &r2);
-                ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-                int st2 = 0; waitpid(pid, &st2, 0);
-                pt_regs sr2; get_regs(pid, &sr2);
-                if (WIFSTOPPED(st2) && WSTOPSIG(st2) == SIGTRAP && sr2.pc == sc_addr + 8) {
-                    zerr("remote_dlopen: init_fn OK");
-                } else {
-                    int sig2 = WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1;
-                    zerr("remote_dlopen: init_fn FAIL wst=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
-                         st2, sig2, (unsigned long)sr2.pc, (long)sr2.pc - (long)sc_addr);
-                    zerr("remote_dlopen: start regs X0=0x%lx X1=0x%lx X8=0x%lx X16=0x%lx X17=0x%lx",
-                         (unsigned long)sr2.regs[0], (unsigned long)sr2.regs[1],
-                         (unsigned long)sr2.regs[8], (unsigned long)sr2.regs[16],
-                         (unsigned long)sr2.regs[17]);
-                    zerr("remote_dlopen: start regs X29=0x%lx X30=0x%lx SP=0x%lx pstate=0x%lx",
-                         (unsigned long)sr2.regs[29], (unsigned long)sr2.regs[30],
-                         (unsigned long)sr2.sp, (unsigned long)sr2.pstate);
-                    // siginfo gives the exact fault address + code
-                    siginfo_t si2 = {};
-                    ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si2);
-                    zerr("remote_dlopen: start siginfo signo=%d code=%d si_addr=0x%lx",
-                         si2.si_signo, si2.si_code, (unsigned long)(uintptr_t)si2.si_addr);
-                    // Stack dump — 8 words at SP
-                    uint64_t stk2[8] = {};
-                    if (ProcMem::read(sr2.sp, stk2, sizeof(stk2)))
-                        zerr("remote_dlopen: start stack[SP]: %lx %lx %lx %lx %lx %lx %lx %lx",
-                             (unsigned long)stk2[0], (unsigned long)stk2[1],
-                             (unsigned long)stk2[2], (unsigned long)stk2[3],
-                             (unsigned long)stk2[4], (unsigned long)stk2[5],
-                             (unsigned long)stk2[6], (unsigned long)stk2[7]);
-                    // Instructions at crash PC
-                    if (sr2.pc && sr2.pc < 0x800000000000ULL) {
-                        uint32_t ci2[8] = {};
-                        if (ProcMem::read(sr2.pc > 16 ? sr2.pc - 16 : sr2.pc, ci2, sizeof(ci2)))
-                            zerr("remote_dlopen: start insns@[PC-16]: %08x %08x %08x %08x | %08x %08x %08x %08x",
-                                 ci2[0],ci2[1],ci2[2],ci2[3],ci2[4],ci2[5],ci2[6],ci2[7]);
-                    }
-                    // Maps scan — which lib owns X16, X17, LR, stack frames
-                    {
-                        constexpr uintptr_t PAC_MASK = 0x0000FFFFFFFFFFFFull;
-                        uintptr_t probes[] = {
-                            sr2.regs[16] & PAC_MASK,
-                            sr2.regs[17] & PAC_MASK,
-                            sr2.regs[30] & PAC_MASK,
-                            stk2[0] & PAC_MASK,
-                            stk2[1] & PAC_MASK,
-                        };
-                        const char *labels[] = {"X16","X17","X30","stk0","stk1"};
-                        zerr("remote_dlopen: start maps probe X16=0x%lx X17=0x%lx X30=0x%lx stk0=0x%lx stk1=0x%lx",
-                             (unsigned long)probes[0], (unsigned long)probes[1],
-                             (unsigned long)probes[2], (unsigned long)probes[3],
-                             (unsigned long)probes[4]);
-                        char mpath2[64]; snprintf(mpath2, sizeof(mpath2), "/proc/%d/maps", pid);
-                        FILE *mf2 = fopen(mpath2, "r");
-                        if (mf2) {
-                            char mline[512];
-                            while (fgets(mline, sizeof(mline), mf2)) {
-                                uintptr_t ms = 0, me = 0; char mp[8]={}, mn[256]={};
-                                sscanf(mline, "%lx-%lx %7s %*s %*s %*s %255s", &ms, &me, mp, mn);
-                                if (mp[2] != 'x') continue;
-                                bool hit = false;
-                                for (auto a : probes) if (a && a >= ms && a < me) { hit = true; break; }
-                                if (!hit) continue;
-                                char hbuf[128] = {}; int hp = 0;
-                                for (int k = 0; k < 5; k++)
-                                    if (probes[k] && probes[k] >= ms && probes[k] < me)
-                                        hp += snprintf(hbuf+hp, sizeof(hbuf)-hp, "%s+0x%lx ",
-                                                       labels[k], (unsigned long)(probes[k]-ms));
-                                zerr("remote_dlopen: start maps HIT %lx-%lx %s [%s] %s",
-                                     (unsigned long)ms, (unsigned long)me, mp,
-                                     mn[0] ? mn : "[anon]", hbuf);
+                // Retry loop — GGP (AnoSDK thread, skipped by freeze_threads_safe) can
+                // re-sign our payload's GOT with PACIA between strip and PTRACE_CONT.
+                // Strip immediately before each PTRACE_CONT to close the race window.
+                bool init_ok = false;
+                for (int attempt = 0; attempt < 3 && !init_ok; attempt++) {
+                    if (attempt > 0)
+                        zerr("remote_dlopen: init_fn retry %d — GGP re-signed GOT, re-stripping PAC", attempt);
+                    // Strip PAC right before PTRACE_CONT using the cached elf_base2 to
+                    // avoid a redundant /proc/maps scan and shrink the race window further.
+                    strip_pac_via_rela(pid, so_path, elf_base2);
+                    pt_regs r2; get_regs(pid, &r2);
+                    r2.pstate &= ~(uint64_t)(3u << 10);
+                    r2.pc = sc_addr;
+                    set_regs(pid, &r2);
+                    ptrace(PTRACE_CONT, pid, nullptr, nullptr);
+                    int st2 = 0; waitpid(pid, &st2, 0);
+                    pt_regs sr2; get_regs(pid, &sr2);
+                    if (WIFSTOPPED(st2) && WSTOPSIG(st2) == SIGTRAP && sr2.pc == sc_addr + 8) {
+                        zerr("remote_dlopen: init_fn OK (attempt %d)", attempt + 1);
+                        init_ok = true;
+                    } else {
+                        int sig2 = WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1;
+                        zerr("remote_dlopen: init_fn FAIL wst=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
+                             st2, sig2, (unsigned long)sr2.pc, (long)sr2.pc - (long)sc_addr);
+                        zerr("remote_dlopen: start regs X0=0x%lx X1=0x%lx X8=0x%lx X16=0x%lx X17=0x%lx",
+                             (unsigned long)sr2.regs[0], (unsigned long)sr2.regs[1],
+                             (unsigned long)sr2.regs[8], (unsigned long)sr2.regs[16],
+                             (unsigned long)sr2.regs[17]);
+                        zerr("remote_dlopen: start regs X29=0x%lx X30=0x%lx SP=0x%lx pstate=0x%lx",
+                             (unsigned long)sr2.regs[29], (unsigned long)sr2.regs[30],
+                             (unsigned long)sr2.sp, (unsigned long)sr2.pstate);
+                        siginfo_t si2 = {};
+                        ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si2);
+                        zerr("remote_dlopen: start siginfo signo=%d code=%d si_addr=0x%lx",
+                             si2.si_signo, si2.si_code, (unsigned long)(uintptr_t)si2.si_addr);
+                        uint64_t stk2[8] = {};
+                        if (ProcMem::read(sr2.sp, stk2, sizeof(stk2)))
+                            zerr("remote_dlopen: start stack[SP]: %lx %lx %lx %lx %lx %lx %lx %lx",
+                                 (unsigned long)stk2[0], (unsigned long)stk2[1],
+                                 (unsigned long)stk2[2], (unsigned long)stk2[3],
+                                 (unsigned long)stk2[4], (unsigned long)stk2[5],
+                                 (unsigned long)stk2[6], (unsigned long)stk2[7]);
+                        if (sr2.pc && sr2.pc < 0x800000000000ULL) {
+                            uint32_t ci2[8] = {};
+                            if (ProcMem::read(sr2.pc > 16 ? sr2.pc - 16 : sr2.pc, ci2, sizeof(ci2)))
+                                zerr("remote_dlopen: start insns@[PC-16]: %08x %08x %08x %08x | %08x %08x %08x %08x",
+                                     ci2[0],ci2[1],ci2[2],ci2[3],ci2[4],ci2[5],ci2[6],ci2[7]);
+                        }
+                        {
+                            constexpr uintptr_t PAC_MASK = 0x0000FFFFFFFFFFFFull;
+                            uintptr_t probes[] = {
+                                sr2.regs[16] & PAC_MASK,
+                                sr2.regs[17] & PAC_MASK,
+                                sr2.regs[30] & PAC_MASK,
+                                stk2[0] & PAC_MASK,
+                                stk2[1] & PAC_MASK,
+                            };
+                            const char *labels[] = {"X16","X17","X30","stk0","stk1"};
+                            zerr("remote_dlopen: start maps probe X16=0x%lx X17=0x%lx X30=0x%lx stk0=0x%lx stk1=0x%lx",
+                                 (unsigned long)probes[0], (unsigned long)probes[1],
+                                 (unsigned long)probes[2], (unsigned long)probes[3],
+                                 (unsigned long)probes[4]);
+                            char mpath2[64]; snprintf(mpath2, sizeof(mpath2), "/proc/%d/maps", pid);
+                            FILE *mf2 = fopen(mpath2, "r");
+                            if (mf2) {
+                                char mline[512];
+                                while (fgets(mline, sizeof(mline), mf2)) {
+                                    uintptr_t ms = 0, me = 0; char mp[8]={}, mn[256]={};
+                                    sscanf(mline, "%lx-%lx %7s %*s %*s %*s %255s", &ms, &me, mp, mn);
+                                    if (mp[2] != 'x') continue;
+                                    bool hit = false;
+                                    for (auto a : probes) if (a && a >= ms && a < me) { hit = true; break; }
+                                    if (!hit) continue;
+                                    char hbuf[128] = {}; int hp = 0;
+                                    for (int k = 0; k < 5; k++)
+                                        if (probes[k] && probes[k] >= ms && probes[k] < me)
+                                            hp += snprintf(hbuf+hp, sizeof(hbuf)-hp, "%s+0x%lx ",
+                                                           labels[k], (unsigned long)(probes[k]-ms));
+                                    zerr("remote_dlopen: start maps HIT %lx-%lx %s [%s] %s",
+                                         (unsigned long)ms, (unsigned long)me, mp,
+                                         mn[0] ? mn : "[anon]", hbuf);
+                                }
+                                fclose(mf2);
                             }
-                            fclose(mf2);
+                        }
+                        // SIGSEGV means GGP re-signed GOT — restore original regs and retry.
+                        if (sig2 == SIGSEGV && attempt < 2) {
+                            zerr("remote_dlopen: init_fn SIGSEGV — restoring regs and retrying");
+                            set_regs(pid, &orig);
+                            continue;
                         }
                     }
-                }
+                } // end retry loop
                 set_regs(pid, &orig);
             }
         } else {
