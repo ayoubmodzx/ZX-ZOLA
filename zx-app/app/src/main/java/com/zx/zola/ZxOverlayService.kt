@@ -204,6 +204,9 @@ class ZxOverlayService : Service() {
         super.onCreate()
         startForegroundCompat()
         ZxEngine.init(this)
+        ZxEngine.onStatusUpdate = { cmd, ok, msg ->
+            uiHandler.post { onInjectResult(cmd, ok, msg) }
+        }
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         panelW = dp(DEF_W_DP)
         panelH = dp(DEF_H_DP)
@@ -796,6 +799,26 @@ class ZxOverlayService : Service() {
         statusDot.background = ContextCompat.getDrawable(this, R.drawable.bg_status_dot_off)
         statusText.text = "OFFLINE"
         statusText.setTextColor(Color.parseColor("#9090B0"))
+    }
+
+    private fun onInjectResult(cmd: Int, ok: Boolean, msg: String) {
+        if (ok) ZxLog.i("inject cmd=$cmd: SHIELD OK") else ZxLog.e("inject cmd=$cmd FAIL: $msg")
+        if (!::statusText.isInitialized) return
+        val pid = ZxEngine.getTargetPid()
+        val pidStr = if (pid > 0) "PID $pid" else ""
+        when {
+            cmd == 0 && ok -> {
+                statusText.text = if (pidStr.isNotEmpty()) "$pidStr · SHIELD ✓" else "SHIELD ✓"
+                statusText.setTextColor(Color.parseColor("#00E676"))
+            }
+            cmd == 0 && !ok -> {
+                statusText.text = if (pidStr.isNotEmpty()) "$pidStr · ERR" else "ERR"
+                statusText.setTextColor(Color.parseColor("#FF5252"))
+            }
+            !ok -> {
+                statusText.setTextColor(Color.parseColor("#FF5252"))
+            }
+        }
     }
 
     // ─── Utils ────────────────────────────────────────────────────────────────

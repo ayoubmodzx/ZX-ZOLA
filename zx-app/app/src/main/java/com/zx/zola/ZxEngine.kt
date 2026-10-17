@@ -58,6 +58,7 @@ object ZxEngine {
     private val cmdLock = Any()
     private val bgThread = HandlerThread("zx-engine").also { it.start() }
     private val bgHandler = Handler(bgThread.looper)
+    var onStatusUpdate: ((cmd: Int, ok: Boolean, msg: String) -> Unit)? = null
 
     fun init(context: Context) {
         val appCtx = context.applicationContext
@@ -102,6 +103,8 @@ object ZxEngine {
         }
         val payload = payloadPath
         bgHandler.post {
+            var injectOk  = false
+            var injectMsg = ""
             synchronized(cmdLock) {
                 try {
                     val en = if (on) 1 else 0
@@ -112,15 +115,20 @@ object ZxEngine {
                     val stdout = proc.inputStream.bufferedReader().readText().trim()
                     val stderr = proc.errorStream.bufferedReader().readText().trim()
                     val rc = proc.waitFor()
+                    injectOk  = rc == 0
+                    injectMsg = if (rc == 0) "ok" else "rc=$rc ${stderr.takeLast(120)}"
                     Log.i("ZxEngine", "toggle cmd=$cmd on=$on rc=$rc")
                     ZxLog.i("rc=$rc cmd=$cmd on=$on")
                     if (stdout.isNotEmpty()) ZxLog.i("out: $stdout")
                     if (stderr.isNotEmpty()) ZxLog.e("err: $stderr")
                 } catch (e: Exception) {
+                    injectOk  = false
+                    injectMsg = e.message ?: "exception"
                     Log.e("ZxEngine", "toggle failed: ${e.message}")
                     ZxLog.e("ex: ${e.message}")
                 }
             }
+            onStatusUpdate?.invoke(cmd, injectOk, injectMsg)
         }
     }
 
