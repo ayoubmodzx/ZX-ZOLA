@@ -1481,6 +1481,20 @@ int main(int argc, char *argv[]) {
                  (unsigned long)cb, orig ? orig : "(null)");
     }
     if (ctrl_addr) {
+        // Read live/ack BEFORE write to show current payload state
+        int pre_live = 0, pre_ack = 0;
+        ProcMem::read(ctrl_addr + 16, &pre_live, sizeof(int));
+        ProcMem::read(ctrl_addr + 12, &pre_ack,  sizeof(int));
+
+        // live bitmask: 1=antidect 2=il2cpp 4=features_ready 8=loop_running
+        char live_desc[64];
+        if (pre_live == 0)        snprintf(live_desc, sizeof(live_desc), "DEAD(0x0) — payload not started yet");
+        else if (!(pre_live & 1)) snprintf(live_desc, sizeof(live_desc), "0x%x — antidect not done", pre_live);
+        else if (!(pre_live & 8)) snprintf(live_desc, sizeof(live_desc), "0x%x — antidect OK, loop still in init", pre_live);
+        else if (!(pre_live & 4)) snprintf(live_desc, sizeof(live_desc), "0x%x — loop running but features NOT ready (il2cpp fail?)", pre_live);
+        else                      snprintf(live_desc, sizeof(live_desc), "0x%x — FULLY READY", pre_live);
+        zerr("payload_state: live=%s  last_ack=%d", live_desc, pre_ack);
+
         // Write enable (+4) and intensity (+8) before cmd (+0) so the payload never
         // reads a non-zero cmd with stale enable/intensity values (write-ordering fix)
         int enable_val    = enable ? 1 : 0;
@@ -1488,7 +1502,27 @@ int main(int argc, char *argv[]) {
         ProcMem::write(ctrl_addr + 4, &enable_val,    sizeof(int));
         ProcMem::write(ctrl_addr + 8, &intensity_val, sizeof(int));
         ProcMem::write(ctrl_addr,     &cmd,           sizeof(int)); // cmd last as trigger
+        zerr("ctrl_write: cmd=%d en=%d intensity=%d @ 0x%lx", cmd, enable_val, intensity_val, (unsigned long)ctrl_addr);
+
+        // Poll for ACK from ctrl_loop (cmd cleared = processed); up to 600ms
+        // During the 60s init phase the loop won't process — report that explicitly
+        bool acked = false;
+        for (int i = 0; i < 12; i++) {
+            usleep(50000); // 50ms
+            int rb = 0;
+            if (ProcMem::read(ctrl_addr, &rb, sizeof(int)) && rb == 0) { acked = true; break; }
+        }
+        int post_ack = 0, post_live = 0;
+        ProcMem::read(ctrl_addr + 12, &post_ack,  sizeof(int));
+        ProcMem::read(ctrl_addr + 16, &post_live, sizeof(int));
+        if (acked)
+            zerr("ctrl_ack: PROCESSED by ctrl_loop (ack=%d live=0x%x)", post_ack, post_live);
+        else
+            zerr("ctrl_ack: NOT processed within 600ms — loop in 60s init or crashed (live=0x%x)", post_live);
+
         LOG("Command sent: cmd=%d enable=%d intensity=%d", cmd, enable_val, intensity_val);
+    } else {
+        zerr("ctrl_write: SKIP — ctrl_addr=0 (payload struct not found)");
     }
 
     ProcMem::close();

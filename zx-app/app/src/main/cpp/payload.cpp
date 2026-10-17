@@ -26,9 +26,11 @@
 // (it can't — we own the symbol).  With -Bsymbolic, internal refs are direct
 // and the symbol is still exported to .dynsym so dlsym() finds it.
 struct ZxCtrl {
-    std::atomic<int> cmd{0};
-    std::atomic<int> enable{0};
-    std::atomic<int> intensity{0}; // 0-100, for risk slider features
+    std::atomic<int> cmd{0};        // +0  written by injector, cleared by ctrl_loop
+    std::atomic<int> enable{0};     // +4
+    std::atomic<int> intensity{0};  // +8  0-100
+    std::atomic<int> ack{0};        // +12 last cmd processed by ctrl_loop (readback by injector)
+    std::atomic<int> live{0};       // +16 bitmask: 1=antidect 2=il2cpp 4=features 8=loop_ticked
 };
 extern "C" ZxCtrl _unity_gfx_params __attribute__((visibility("default"), used)) = {};
 
@@ -42,15 +44,18 @@ static void *ctrl_loop(void *) {
     // Il2Cpp::init() is idempotent; Features::init() skips already-installed hooks.
     for (int i = 0; i < 60; i++) {
         usleep(1000000); // 1s
-        Il2Cpp::init();
+        bool il2ok = Il2Cpp::init();
+        if (il2ok) _unity_gfx_params.live.fetch_or(2, std::memory_order_relaxed);
         Features::init();
         if (Features::isReady()) {
+            _unity_gfx_params.live.fetch_or(4, std::memory_order_relaxed);
             LOG("Features ready after %ds", i + 1);
             break;
         }
         if (i == 59) LOG("Feature discovery timed out (60s) — running degraded");
     }
     ESP::init();
+    _unity_gfx_params.live.fetch_or(8, std::memory_order_relaxed); // loop entering main dispatch
     LOG("Payload ready");
 
     // Each injector call writes a fresh {cmd, enable, intensity} then expects a
@@ -76,6 +81,7 @@ static void *ctrl_loop(void *) {
             last_cmd_seen  = en ? cmd : 0;
             last_enable    = en;
             last_intensity = intensity;
+            _unity_gfx_params.ack.store(cmd, std::memory_order_relaxed); // ACK before clearing cmd
             _unity_gfx_params.cmd.store(0, std::memory_order_release);
         }
         usleep(50000); // 50ms poll — negligible CPU
@@ -92,6 +98,7 @@ extern "C" __attribute__((visibility("default"), used))
 void unity_render_thread_init() {
     LOG("ZX-ZOLA payload start");
     AntiDetect::install();
+    _unity_gfx_params.live.fetch_or(1, std::memory_order_relaxed); // bit0 = anti-detect installed
     pthread_t t;
     pthread_create(&t, nullptr, ctrl_loop, nullptr);
     pthread_detach(t);
