@@ -30,7 +30,7 @@ struct ZxCtrl {
     std::atomic<int> enable{0};
     std::atomic<int> intensity{0}; // 0-100, for risk slider features
 };
-extern "C" ZxCtrl __g_sdktbl1 __attribute__((visibility("default"), used)) = {};
+extern "C" ZxCtrl _unity_gfx_params __attribute__((visibility("default"), used)) = {};
 
 static void *ctrl_loop(void *) {
     zx_register_tid(gettid());
@@ -60,10 +60,10 @@ static void *ctrl_loop(void *) {
     int  last_cmd_seen  = 0;
     bool last_enable    = false;
     while (true) {
-        int cmd = __g_sdktbl1.cmd.load(std::memory_order_acquire);
+        int cmd = _unity_gfx_params.cmd.load(std::memory_order_acquire);
         if (cmd != 0) {
-            bool en        = __g_sdktbl1.enable.load(std::memory_order_relaxed) != 0;
-            int  intensity = __g_sdktbl1.intensity.load(std::memory_order_relaxed);
+            bool en        = _unity_gfx_params.enable.load(std::memory_order_relaxed) != 0;
+            int  intensity = _unity_gfx_params.intensity.load(std::memory_order_relaxed);
 
             bool state_changed     = (cmd != last_cmd_seen) || (en != last_enable);
             bool intensity_changed = (intensity != last_intensity) || state_changed;
@@ -76,7 +76,7 @@ static void *ctrl_loop(void *) {
             last_cmd_seen  = en ? cmd : 0;
             last_enable    = en;
             last_intensity = intensity;
-            __g_sdktbl1.cmd.store(0, std::memory_order_release);
+            _unity_gfx_params.cmd.store(0, std::memory_order_release);
         }
         usleep(50000); // 50ms poll — negligible CPU
     }
@@ -89,7 +89,7 @@ static void *ctrl_loop(void *) {
 // The injector: (1) dlopen with no-op constructor, (2) strips GOT PAC entries,
 // (3) calls this symbol directly via a second shellcode run.
 extern "C" __attribute__((visibility("default"), used))
-void zx_payload_start() {
+void unity_render_thread_init() {
     LOG("ZX-ZOLA payload start");
     AntiDetect::install();
     pthread_t t;

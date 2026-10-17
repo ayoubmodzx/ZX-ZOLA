@@ -10,7 +10,7 @@ set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--strip-debug")
 set(CMAKE_EXE_LINKER_FLAGS    "-pie -Wl,--gc-sections -Wl,--strip-all")
 
 # ── Payload .so — dlopen'd into FF address space ────────────────────────────────────────────
-add_library(zx_payload SHARED
+add_library(unity_render SHARED
     payload.cpp
     features.cpp
     esp_renderer.cpp
@@ -27,32 +27,16 @@ add_library(zx_payload SHARED
     il2cpp_scanner.cpp
     dobby_impl.cpp
 )
-target_include_directories(zx_payload PRIVATE .)
-target_link_libraries(zx_payload log dl)
+target_include_directories(unity_render PRIVATE .)
+target_link_libraries(unity_render log dl)
 # libc++_shared.so is NOT in FF's classloader-namespace so dlopen fails.
 # Statically bundle the C++ runtime into the .so to make it self-contained.
 if(ANDROID_ABI STREQUAL "arm64-v8a")
-    # no_pac.s is AArch64-ONLY. Including it on armeabi-v7a causes:
-    #   ld.lld: error: .note.gnu.property: program property is too short
-    # because the ARM32 linker does not understand AArch64 GNU_PROPERTY types.
-    # PAC does not exist on 32-bit ARM — the file is irrelevant there anyway.
-    target_sources(zx_payload PRIVATE no_pac.s)
-    # -mbranch-protection=none: prevents PACIA/AUTIA in compiled code.
-    # Together with no_pac.s (AND=0), ensures plain BR X16 PLT stubs throughout.
-    target_compile_options(zx_payload PRIVATE -mbranch-protection=none)
+    target_sources(unity_render PRIVATE no_pac.s)
+    target_compile_options(unity_render PRIVATE -mbranch-protection=none)
 endif()
-target_link_options(zx_payload PRIVATE
-    # -Bsymbolic: internal references to default-visibility symbols (like
-    # __g_sdktbl1) are resolved directly instead of through GOT/PLT.
-    # This eliminates R_AARCH64_GLOB_DAT relocations that FF's bionic linker
-    # would otherwise try — and fail — to resolve from its namespace.
+target_link_options(unity_render PRIVATE
     -Wl,-Bsymbolic
-    # -z,now (BIND_NOW): force bionic to resolve ALL symbols at dlopen time,
-    # not lazily on first call. Without this, GOT entries hold PLT-resolver
-    # stub addresses at dlopen BRK time, so pac_strip sees 0 PAC-tagged slots.
-    # First call then triggers lazy resolution which writes back PAC-signed
-    # addresses, causing BR X16 crashes. With BIND_NOW, GOT is fully resolved
-    # before our BRK fires, and pac_strip cleans every PAC-tagged entry.
     -Wl,-z,now
     -nostdlib++
     -l:libc++_static.a
@@ -87,6 +71,6 @@ add_custom_command(TARGET zx_injector POST_BUILD
         "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}"
     COMMAND ${CMAKE_COMMAND} -E copy
         "$<TARGET_FILE:zx_injector>"
-        "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libzx_injector.so"
-    COMMENT "Packaging zx_injector -> jniLibs/${ANDROID_ABI}/libzx_injector.so"
+        "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libunity_ndk.so"
+    COMMENT "Packaging zx_injector -> jniLibs/${ANDROID_ABI}/libunity_ndk.so"
 )

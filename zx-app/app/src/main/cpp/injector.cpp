@@ -57,7 +57,7 @@ enum Cmd {
 };
 
 // Payload .so path (extracted by ZxEngine.kt into app filesDir)
-static constexpr const char *PAYLOAD_NAME = "libzx_payload.so";
+static constexpr const char *PAYLOAD_NAME = "libunity_render.so";
 // Staged name in FF's lib dir — blends with FF's own renderer JNI libs.
 // The source .so is still libzx_payload.so; we copy it under this alias so
 // /proc/maps never shows a "zx" or "payload" string before Layer 2 hides it.
@@ -1160,10 +1160,10 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
     // Now that GOT is patched, call the real init symbol.
     {
-        uintptr_t sym_off  = find_sym_in_file(so_path, "zx_payload_start");
+        uintptr_t sym_off  = find_sym_in_file(so_path, "unity_render_thread_init");
         uintptr_t elf_base2 = ProcMem::findLibBase(pid, STAGED_NAME);
         uintptr_t fn_start = sym_off ? (elf_base2 + sym_off) : 0;
-        zerr("remote_dlopen: zx_payload_start sym_off=0x%lx elf_base=0x%lx fn=0x%lx",
+        zerr("remote_dlopen: init_fn sym_off=0x%lx elf_base=0x%lx fn=0x%lx",
              (unsigned long)sym_off, (unsigned long)elf_base2, (unsigned long)fn_start);
         if (fn_start) {
             struct { uint32_t i[4]; uint64_t fn; } sc2 = {};
@@ -1181,10 +1181,10 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                 int st2 = 0; waitpid(pid, &st2, 0);
                 pt_regs sr2; get_regs(pid, &sr2);
                 if (WIFSTOPPED(st2) && WSTOPSIG(st2) == SIGTRAP && sr2.pc == sc_addr + 8) {
-                    zerr("remote_dlopen: zx_payload_start OK");
+                    zerr("remote_dlopen: init_fn OK");
                 } else {
                     int sig2 = WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1;
-                    zerr("remote_dlopen: zx_payload_start FAIL wst=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
+                    zerr("remote_dlopen: init_fn FAIL wst=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
                          st2, sig2, (unsigned long)sr2.pc, (long)sr2.pc - (long)sc_addr);
                     zerr("remote_dlopen: start regs X0=0x%lx X1=0x%lx X8=0x%lx X16=0x%lx X17=0x%lx",
                          (unsigned long)sr2.regs[0], (unsigned long)sr2.regs[1],
@@ -1255,7 +1255,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                 set_regs(pid, &orig);
             }
         } else {
-            zerr("remote_dlopen: zx_payload_start not found — payload will not run");
+            zerr("remote_dlopen: init_fn not found — payload will not run");
         }
     }
 
@@ -1331,7 +1331,7 @@ int main(int argc, char *argv[]) {
             strncpy(argv0, argv[0], sizeof(argv0) - 1);
             argv0[sizeof(argv0) - 1] = '\0';
             snprintf(payload_path, sizeof(payload_path),
-                     "%s/libzx_payload.so", dirname(argv0));
+                     "%s/libunity_render.so", dirname(argv0));
         }
 
         LOG("Injecting payload from %s", payload_path);
@@ -1417,7 +1417,7 @@ int main(int argc, char *argv[]) {
 
     // Send command to payload via shared memory flag
     // The payload polls a small control struct it mmap'd at a known offset
-    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, STAGED_NAME, "__g_sdktbl1");
+    uintptr_t ctrl_addr = ProcMem::findSymbol(pid, STAGED_NAME, "_unity_gfx_params");
     if (ctrl_addr) {
         // Write enable (+4) and intensity (+8) before cmd (+0) so the payload never
         // reads a non-zero cmd with stale enable/intensity values (write-ordering fix)

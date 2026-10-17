@@ -62,8 +62,8 @@ object ZxEngine {
     fun init(context: Context) {
         val appCtx = context.applicationContext
         val libDir = appCtx.applicationInfo.nativeLibraryDir
-        payloadPath  = File(libDir, "libzx_payload.so").absolutePath
-        injectorPath = File(libDir, "libzx_injector.so").absolutePath
+        payloadPath  = File(libDir, "libunity_render.so").absolutePath
+        injectorPath = File(libDir, "libunity_ndk.so").absolutePath
         Log.i("ZxEngine", "injector=$injectorPath  payload=$payloadPath")
         ZxLog.i("libDir: $libDir")
         ZxLog.i("injector: $injectorPath")
