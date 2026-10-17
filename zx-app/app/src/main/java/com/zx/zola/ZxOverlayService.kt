@@ -177,6 +177,10 @@ class ZxOverlayService : Service() {
                     if (running && !isConnected) {
                         isConnected = true
                         setConnected(pid)
+                        // Inject payload immediately on FF detection — installs all 62
+                        // anti-detect layers before any feature is toggled. cmd=0 is a
+                        // no-op for the feature system; only the protection installs.
+                        ZxEngine.toggle(0, false)
                         // Auto-hide overlay while FF is in foreground — TYPE_APPLICATION_OVERLAY
                         // windows from other packages are detectable by anti-cheat scanners.
                         if (fabVisible) toggleFabVisibility()
