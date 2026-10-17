@@ -1190,6 +1190,11 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // stubs expect pacia-signed values → auth fail → poison → SIGSEGV.
     patch_plt_braa(pid);
 
+    // ── Cleanup anonymous shellcode buffer NOW — before init_fn can crash ────
+    // remote_munmap needs the process alive (PTRACE_GETREGSET). init_fn SIGSEGV
+    // kills the process before we can munmap if we wait until after init_fn runs.
+    remote_munmap(pid, remote_buf, alloc);
+
     // ── Call zx_payload_start() ──────────────────────────────────────────────
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
     // Now that GOT is patched, call the real init symbol.
@@ -1320,16 +1325,11 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: __loader_dlopen@0x%lx bytes: %08x %08x %08x %08x",
              (unsigned long)loader_dlopen_addr, ldi[0], ldi[1], ldi[2], ldi[3]);
     }
-    // Valid handle: non-zero AND fits in 32 bits (random obfuscated cookie on Android 10+)
-    // OR the library simply appeared in maps (handle may be a cookie that looks like -4)
-    bool ok = (handle != 0 && handle <= 0xFFFFFFFFULL) || in_maps;
+    // Valid handle: non-zero (includes PAC-tagged handles like 0x3e2b...063 on PAC devices)
+    // OR the library appeared in maps (handle may be an internal cookie)
+    bool ok = (handle != 0) || in_maps;
     if (!ok)
         zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d", (unsigned long)handle, in_maps);
-
-    // ── Cleanup: unmap shellcode/path buffer ─────────────────────────────────
-    // The anonymous rwxp mapping is the #1 AnoSDK injection indicator.
-    // Unmap it before detaching so it never appears in a scanner pass.
-    remote_munmap(pid, remote_buf, alloc);
 
     return ok;
 }
