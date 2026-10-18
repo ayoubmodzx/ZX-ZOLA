@@ -165,15 +165,27 @@ static Il2CppClass *findClassByFields(const FieldPattern *p, int n, const char *
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void discoverClasses() {
-    g_cls.playerState = Il2Cpp::cls("CSPlayerState");
-    if (g_cls.playerState) LOG("CSPlayerState OK");
-    else ERR("CSPlayerState not found");
+    // PlayerState — try multiple class name variants
+    static const char *kPSCls[] = {
+        "CSPlayerState","PlayerState","CSCharacterState",
+        "CharacterState","PlayerStateBase","CSPlayerStateMgr",nullptr
+    };
+    for (const char **c = kPSCls; *c && !g_cls.playerState; c++)
+        g_cls.playerState = Il2Cpp::cls(*c);
+    if (g_cls.playerState) LOG("PlayerState: %s", Il2Cpp::className(g_cls.playerState));
+    else ERR("PlayerState not found (tried all variants)");
 
     static const char *kFireNames[][3] = {
-        {"fireRate",    "recoilX",    "recoilY"},
-        {"FireRate",    "RecoilX",    "RecoilY"},
-        {"m_fireRate",  "m_recoilH",  "m_recoilV"},
-        {"fireInterval","kickX",      "kickY"},
+        {"fireRate",     "recoilX",      "recoilY"},
+        {"FireRate",     "RecoilX",      "RecoilY"},
+        {"m_fireRate",   "m_recoilH",    "m_recoilV"},
+        {"fireInterval", "kickX",        "kickY"},
+        {"m_fFireRate",  "m_fRecoilX",   "m_fRecoilY"},
+        {"fFireRate",    "fRecoilX",     "fRecoilY"},
+        {"nFireRate",    "nRecoilX",     "nRecoilY"},
+        {"m_fireRate",   "m_recoilX",    "m_recoilY"},
+        {"m_ShootCD",    "m_RecoilX",    "m_RecoilY"},
+        {"shootRate",    "recoilHor",    "recoilVer"},
         {nullptr, nullptr, nullptr}
     };
     for (int i = 0; kFireNames[i][0] && !g_cls.weaponFire; i++) {
@@ -194,11 +206,14 @@ static void discoverClasses() {
         }
     }
 
-    // Ammo fields
+    // Ammo fields — try multiple naming conventions
     if (g_cls.weaponFire) {
-        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_curBulletNum"))  g_cls.offAmmo       = Il2Cpp::fieldOffset(f);
-        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_maxBulletNum"))  g_cls.offMaxAmmo    = Il2Cpp::fieldOffset(f);
-        if (auto *f = Il2Cpp::getField(g_cls.weaponFire, "m_reloadTime"))    g_cls.offReloadTime = Il2Cpp::fieldOffset(f);
+        static const char *kAmmo[]   = {"m_curBulletNum","curBullets","m_curAmmo","currentAmmo","m_nCurBullet","bulletCount",nullptr};
+        static const char *kMaxAmmo[]= {"m_maxBulletNum","maxBullets","m_maxAmmo","maxAmmo","m_nMaxBullet","maxBulletCount",nullptr};
+        static const char *kReload[] = {"m_reloadTime","reloadTime","m_fReloadTime","reloadDuration","m_fReloadCD",nullptr};
+        for (const char **k = kAmmo;    *k; k++) { auto *f = Il2Cpp::getField(g_cls.weaponFire, *k); if (f) { g_cls.offAmmo       = Il2Cpp::fieldOffset(f); break; } }
+        for (const char **k = kMaxAmmo; *k; k++) { auto *f = Il2Cpp::getField(g_cls.weaponFire, *k); if (f) { g_cls.offMaxAmmo    = Il2Cpp::fieldOffset(f); break; } }
+        for (const char **k = kReload;  *k; k++) { auto *f = Il2Cpp::getField(g_cls.weaponFire, *k); if (f) { g_cls.offReloadTime = Il2Cpp::fieldOffset(f); break; } }
     }
     // Bullet damage field — walked from most common to least common FF naming
     if (g_cls.weaponFire && g_cls.offDamage < 0) {
@@ -217,12 +232,20 @@ static void discoverClasses() {
         }
     }
     // Health fields
-    g_cls.healthCls = Il2Cpp::cls("CSCharacterHealth");
-    if (!g_cls.healthCls) g_cls.healthCls = Il2Cpp::cls("PlayerHealth");
+    // Health class — try more name variants
+    static const char *kHpCls[] = {
+        "CSCharacterHealth","PlayerHealth","CharacterHealth",
+        "CSPlayerHealth","HealthComponent","HPComponent",nullptr
+    };
+    for (const char **h = kHpCls; *h && !g_cls.healthCls; h++)
+        g_cls.healthCls = Il2Cpp::cls(*h);
     if (g_cls.healthCls) {
-        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_curHp"))     g_cls.offHP        = Il2Cpp::fieldOffset(f);
-        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_maxHp"))     g_cls.offMaxHP     = Il2Cpp::fieldOffset(f);
-        if (auto *f = Il2Cpp::getField(g_cls.healthCls, "m_isKnocked")) g_cls.offIsKnocked = Il2Cpp::fieldOffset(f);
+        static const char *kHP[]  = {"m_curHp","curHp","m_hp","hp","currentHp","m_fCurHp","fHp",nullptr};
+        static const char *kMHP[] = {"m_maxHp","maxHp","m_maxHP","maxHP","m_fMaxHp",nullptr};
+        static const char *kKnk[] = {"m_isKnocked","isKnocked","bKnocked","m_bKnocked","knocked",nullptr};
+        for (const char **k = kHP;  *k; k++) { auto *f = Il2Cpp::getField(g_cls.healthCls, *k); if (f) { g_cls.offHP        = Il2Cpp::fieldOffset(f); break; } }
+        for (const char **k = kMHP; *k; k++) { auto *f = Il2Cpp::getField(g_cls.healthCls, *k); if (f) { g_cls.offMaxHP     = Il2Cpp::fieldOffset(f); break; } }
+        for (const char **k = kKnk; *k; k++) { auto *f = Il2Cpp::getField(g_cls.healthCls, *k); if (f) { g_cls.offIsKnocked = Il2Cpp::fieldOffset(f); break; } }
     }
 
     // Only mark ready if weapon fire class was found — without it, all fire hooks
