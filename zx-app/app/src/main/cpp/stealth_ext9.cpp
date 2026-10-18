@@ -221,7 +221,7 @@ typedef int (*connect_fn9)(int, const struct sockaddr*, socklen_t);
 static connect_fn9 orig_connect9 = nullptr;
 
 static int hook_connect9(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    if (caller_is_ggp9()) { errno = ECONNREFUSED; return -1; }
+    if (caller_is_scanner9()) { errno = ECONNREFUSED; return -1; }
     if (!orig_connect9) { errno = ENOSYS; return -1; }
     return orig_connect9(sockfd, addr, addrlen);
 }
@@ -232,7 +232,7 @@ static sendto_fn9 orig_sendto9 = nullptr;
 
 static ssize_t hook_sendto9(int sockfd, const void *buf, size_t len, int flags,
                             const struct sockaddr *dest, socklen_t addrlen) {
-    if (caller_is_ggp9()) { errno = ECONNREFUSED; return -1; }
+    if (caller_is_scanner9()) { errno = ECONNREFUSED; return -1; }
     if (!orig_sendto9) { errno = ENOSYS; return -1; }
     return orig_sendto9(sockfd, buf, len, flags, dest, addrlen);
 }
@@ -241,7 +241,7 @@ typedef ssize_t (*sendmsg_fn9)(int, const struct msghdr*, int);
 static sendmsg_fn9 orig_sendmsg9 = nullptr;
 
 static ssize_t hook_sendmsg9(int sockfd, const struct msghdr *msg, int flags) {
-    if (caller_is_ggp9()) { errno = ECONNREFUSED; return -1; }
+    if (caller_is_scanner9()) { errno = ECONNREFUSED; return -1; }
     if (!orig_sendmsg9) { errno = ENOSYS; return -1; }
     return orig_sendmsg9(sockfd, msg, flags);
 }
@@ -361,7 +361,7 @@ static int hook_cgt9(clockid_t clk, struct timespec *ts) {
     int ret = orig_cgt9 ? orig_cgt9(clk, ts) : -1;
     // For callers inside GGP, subtract a small fixed bias (3 ms) from every
     // timestamp so their delta measurements see clean, unhooky intervals.
-    if (ret == 0 && ts && caller_is_ggp9()) {
+    if (ret == 0 && ts && caller_is_scanner9()) {
         const long bias_ns = 3000000L; // 3 ms
         if (ts->tv_nsec >= bias_ns) {
             ts->tv_nsec -= bias_ns;

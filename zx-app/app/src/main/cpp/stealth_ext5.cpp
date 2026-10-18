@@ -97,10 +97,12 @@ static void decode_payload_name() {
 // ─────────────────────────────────────────────────────────────────────────────
 // libanogs.so + libGGP.so ranges — caller-aware dl_iterate_phdr filtering
 // ─────────────────────────────────────────────────────────────────────────────
-static uintptr_t s_ano_base5 = 0;
-static uintptr_t s_ano_end5  = 0;
-static uintptr_t s_ggp_base5 = 0;
-static uintptr_t s_ggp_end5  = 0;
+static uintptr_t s_ano_base5   = 0;
+static uintptr_t s_ano_end5    = 0;
+static uintptr_t s_ggp_base5   = 0;
+static uintptr_t s_ggp_end5    = 0;
+static uintptr_t s_anort_base5 = 0;
+static uintptr_t s_anort_end5  = 0;
 
 static int phdr_find_anogs5(dl_phdr_info *info, size_t /*sz*/, void * /*d*/) {
     if (!info->dlpi_name) return 0;
@@ -141,6 +143,25 @@ static int phdr_find_ggp5(dl_phdr_info *info, size_t /*sz*/, void * /*d*/) {
     s_ggp_base5 = base; s_ggp_end5 = end; return 1;
 }
 
+static int phdr_find_anort5(dl_phdr_info *info, size_t /*sz*/, void * /*d*/) {
+    if (!info->dlpi_name) return 0;
+    static char anort5n[16]; static bool once5r = false;
+    if (__builtin_expect(!once5r, 0)) {
+        once5r = true;
+        static constexpr ObfS5<12> o("libanort.so"); o.decode(*(char(*)[12])anort5n);
+    }
+    if (!strstr(info->dlpi_name, anort5n)) return 0;
+    uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_LOAD) {
+            uintptr_t se = base + ph.p_vaddr + ph.p_memsz;
+            if (se > end) end = se;
+        }
+    }
+    s_anort_base5 = base; s_anort_end5 = end; return 1;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Layer 44 — dl_iterate_phdr poisoner
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,13 +189,14 @@ static dl_iterate_phdr_t orig_dl_iterate_phdr = nullptr;
 static int __attribute__((noinline)) hook_dl_iterate_phdr(phdr_cb_t cb, void *data) {
     if (!orig_dl_iterate_phdr) return 0;
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
-    if (!s_ano_base5) orig_dl_iterate_phdr(phdr_find_anogs5, nullptr);
-    if (!s_ggp_base5) orig_dl_iterate_phdr(phdr_find_ggp5,   nullptr);
-    // Filter payload entry for ANY scanner: libanogs (module hook checker)
-    // AND libGGP (its own loaded-lib enumeration scan).
+    if (!s_ano_base5)   orig_dl_iterate_phdr(phdr_find_anogs5, nullptr);
+    if (!s_ggp_base5)   orig_dl_iterate_phdr(phdr_find_ggp5,   nullptr);
+    if (!s_anort_base5) orig_dl_iterate_phdr(phdr_find_anort5, nullptr);
+    // Filter payload entry for ANY scanner: libanogs, libGGP, libanort
     bool should_filter =
-        (s_ano_base5 && lr >= s_ano_base5 && lr < s_ano_end5) ||
-        (s_ggp_base5 && lr >= s_ggp_base5 && lr < s_ggp_end5);
+        (s_ano_base5   && lr >= s_ano_base5   && lr < s_ano_end5)   ||
+        (s_ggp_base5   && lr >= s_ggp_base5   && lr < s_ggp_end5)   ||
+        (s_anort_base5 && lr >= s_anort_base5  && lr < s_anort_end5);
     DlIterCtx ctx = { cb, data, should_filter };
     return orig_dl_iterate_phdr(dl_iter_filter_cb, &ctx);
 }
@@ -277,6 +299,7 @@ void install_stealth_ext5() {
     decode_payload_name();
     dl_iterate_phdr(phdr_find_anogs5, nullptr);
     dl_iterate_phdr(phdr_find_ggp5,   nullptr);
+    dl_iterate_phdr(phdr_find_anort5, nullptr);
 
     // Layer 44 — dl_iterate_phdr via libc PLT
     {

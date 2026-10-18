@@ -25,6 +25,7 @@ add_library(unity_render SHARED
     stealth_ext7.cpp
     stealth_ext8.cpp
     stealth_ext9.cpp
+    stealth_ext10.cpp
     il2cpp_scanner.cpp
     dobby_impl.cpp
 )

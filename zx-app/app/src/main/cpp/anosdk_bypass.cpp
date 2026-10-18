@@ -56,8 +56,10 @@ struct ObfA {
 // ─────────────────────────────────────────────────────────────────────────────
 // libanogs.so load range — used for caller-aware ptrace hook
 // ─────────────────────────────────────────────────────────────────────────────
-static uintptr_t s_ano_base_bp = 0;
-static uintptr_t s_ano_end_bp  = 0;
+static uintptr_t s_ano_base_bp   = 0;
+static uintptr_t s_ano_end_bp    = 0;
+static uintptr_t s_anort_base_bp = 0;
+static uintptr_t s_anort_end_bp  = 0;
 
 static int phdr_find_anogs_bp(dl_phdr_info *info, size_t, void*) {
     if (!info->dlpi_name) return 0;
@@ -76,6 +78,25 @@ static int phdr_find_anogs_bp(dl_phdr_info *info, size_t, void*) {
         }
     }
     s_ano_base_bp = base; s_ano_end_bp = end; return 1;
+}
+
+static int phdr_find_anort_bp(dl_phdr_info *info, size_t, void*) {
+    if (!info->dlpi_name) return 0;
+    static char anortbp_n[16]; static bool once_rt = false;
+    if (__builtin_expect(!once_rt, 0)) {
+        once_rt = true;
+        static constexpr ObfA<12> o("libanort.so"); o.decode(*(char(*)[12])anortbp_n);
+    }
+    if (!strstr(info->dlpi_name, anortbp_n)) return 0;
+    uintptr_t base = (uintptr_t)info->dlpi_addr, end = base;
+    for (int i = 0; i < info->dlpi_phnum; i++) {
+        const ElfW(Phdr) &ph = info->dlpi_phdr[i];
+        if (ph.p_type == PT_LOAD) {
+            uintptr_t se = base + ph.p_vaddr + ph.p_memsz;
+            if (se > end) end = se;
+        }
+    }
+    s_anort_base_bp = base; s_anort_end_bp = end; return 1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -123,7 +144,8 @@ static int hook_InitEx(void *cfg, int flags, void *extra) {
 // ─────────────────────────────────────────────────────────────────────────────
 static long hook_ptrace(int request, pid_t pid, void *addr, void *data) {
     uintptr_t lr = (uintptr_t)__builtin_return_address(0);
-    bool from_ano = s_ano_base_bp && lr >= s_ano_base_bp && lr < s_ano_end_bp;
+    bool from_ano = (s_ano_base_bp   && lr >= s_ano_base_bp   && lr < s_ano_end_bp)  ||
+                    (s_anort_base_bp && lr >= s_anort_base_bp && lr < s_anort_end_bp);
 
     if (from_ano) {
         if (request == PTRACE_TRACEME) {
@@ -147,7 +169,8 @@ static long hook_ptrace(int request, pid_t pid, void *addr, void *data) {
 // install
 // ─────────────────────────────────────────────────────────────────────────────
 void install_ano_bypass() {
-    dl_iterate_phdr(phdr_find_anogs_bp, nullptr);
+    dl_iterate_phdr(phdr_find_anogs_bp,  nullptr);
+    dl_iterate_phdr(phdr_find_anort_bp,  nullptr);
 
     // ── ptrace hook (libc, caller-aware) ────────────────────────────────────
     {
