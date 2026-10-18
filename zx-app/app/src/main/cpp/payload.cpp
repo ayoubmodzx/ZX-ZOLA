@@ -38,32 +38,53 @@ static void *ctrl_loop(void *) {
     zx_register_tid(gettid());
     prctl(PR_SET_NAME, "kworker/u16:3", 0, 0, 0);
 
-    // il2cpp loads asynchronously — Unity domain + assemblies may not be ready for
-    // several seconds after injection. We retry il2cpp init + feature discovery
-    // every 1s for up to 60s so Features::init() always runs with a live image.
-    // Il2Cpp::init() is idempotent; Features::init() skips already-installed hooks.
-    for (int i = 0; i < 60; i++) {
-        usleep(1000000); // 1s
+    // Phase-1: il2cpp + feature discovery retry (200ms ticks, 300 ticks = 60s max).
+    // Commands arriving during this window are buffered and applied immediately on
+    // each tick so the injector's 600ms ACK window always catches the first dispatch.
+    int  last_intensity  = -1;
+    int  last_cmd_seen   = 0;
+    bool last_enable     = false;
+    bool features_primed = false;
+
+    for (int i = 0; i < 300; i++) {
+        usleep(200000); // 200ms — 5× faster ticks vs old 1s
+
         bool il2ok = Il2Cpp::init();
         if (il2ok) _unity_gfx_params.live.fetch_or(2, std::memory_order_relaxed);
         Features::init();
-        if (Features::isReady()) {
+        if (!features_primed && Features::isReady()) {
+            features_primed = true;
             _unity_gfx_params.live.fetch_or(4, std::memory_order_relaxed);
-            LOG("Features ready after %ds", i + 1);
-            break;
+            LOG("Features ready after %.1fs", (i + 1) * 0.2f);
         }
-        if (i == 59) LOG("Feature discovery timed out (60s) — running degraded");
+
+        // Drain any command that arrived while we were initialising — this is
+        // what makes features toggle within the injector's 600ms ACK window even
+        // when il2cpp is still warming up.
+        int cmd = _unity_gfx_params.cmd.load(std::memory_order_acquire);
+        if (cmd != 0) {
+            bool en        = _unity_gfx_params.enable.load(std::memory_order_relaxed) != 0;
+            int  intensity = _unity_gfx_params.intensity.load(std::memory_order_relaxed);
+            bool st_chg    = (cmd != last_cmd_seen) || (en != last_enable);
+            bool in_chg    = (intensity != last_intensity) || st_chg;
+            if (st_chg) Features::apply(cmd, en);
+            if (in_chg) Features::applyIntensity(cmd, intensity);
+            last_cmd_seen  = en ? cmd : 0;
+            last_enable    = en;
+            last_intensity = intensity;
+            _unity_gfx_params.ack.store(cmd, std::memory_order_relaxed);
+            _unity_gfx_params.cmd.store(0, std::memory_order_release);
+            LOG("Init-phase cmd=%d en=%d dispatched at tick %d", cmd, (int)en, i);
+        }
+
+        if (features_primed && il2ok) break; // fully ready — skip remaining ticks
+        if (i == 299) LOG("Feature discovery timed out (60s) — running degraded");
     }
     ESP::init();
-    _unity_gfx_params.live.fetch_or(8, std::memory_order_relaxed); // loop entering main dispatch
+    _unity_gfx_params.live.fetch_or(8, std::memory_order_relaxed); // entering main dispatch
     LOG("Payload ready");
 
-    // Each injector call writes a fresh {cmd, enable, intensity} then expects a
-    // single processing pass. We clear cmd after each dispatch so the next write
-    // is always treated as a new command — this fixes re-toggle and toggle-off.
-    int  last_intensity = -1;
-    int  last_cmd_seen  = 0;
-    bool last_enable    = false;
+    // Phase-2: main dispatch loop (50ms poll).
     while (true) {
         int cmd = _unity_gfx_params.cmd.load(std::memory_order_acquire);
         if (cmd != 0) {
@@ -81,7 +102,7 @@ static void *ctrl_loop(void *) {
             last_cmd_seen  = en ? cmd : 0;
             last_enable    = en;
             last_intensity = intensity;
-            _unity_gfx_params.ack.store(cmd, std::memory_order_relaxed); // ACK before clearing cmd
+            _unity_gfx_params.ack.store(cmd, std::memory_order_relaxed);
             _unity_gfx_params.cmd.store(0, std::memory_order_release);
         }
         usleep(50000); // 50ms poll — negligible CPU
