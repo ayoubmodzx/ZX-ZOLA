@@ -24,6 +24,10 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
+#ifndef PTRACE_SEIZE
+#define PTRACE_SEIZE 0x4206
+#endif
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
