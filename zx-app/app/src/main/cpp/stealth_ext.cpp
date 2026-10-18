@@ -207,35 +207,50 @@ static void* hook_dlopen(const char *path, int flags) {
 //   AnoSDKRegistInfoListener — registers info listener callback
 // ═════════════════════════════════════════════════════════════════════════════
 
-static int  hook_AnoSDKInitEx(int id, void *d, int l, void *ex)
-    { (void)id;(void)d;(void)l;(void)ex; return 0; }
-static int  hook_AnoSDKIoctlOld(int c, void *d, int l)
-    { (void)c;(void)d;(void)l; return 0; }
-static int  hook_AnoSDKForExport(int a, void *b, int c)
-    { (void)a;(void)b;(void)c; return 0; }
-static void hook_AnoSDKFree(void *p) { (void)p; }
-static int  hook_AnoSDKOnRecvData(void *d, int l)
-    { (void)d;(void)l; return 0; }
-// Most critical: kills server-pushed signature scanning
+// orig_ pointers — must call through so SDK lifecycle runs (transparent mode)
+static int  (*orig_AnoSDKInitEx)(int, void*, int, void*)       = nullptr;
+static int  (*orig_AnoSDKIoctlOld)(int, void*, int)            = nullptr;
+static int  (*orig_AnoSDKForExport)(int, void*, int)           = nullptr;
+static void (*orig_AnoSDKFree)(void*)                          = nullptr;
+static int  (*orig_AnoSDKOnRecvData)(void*, int)               = nullptr;
+static int  (*orig_AnoSDKRegistInfoListener)(void*, void*)     = nullptr;
+
+static int  hook_AnoSDKInitEx(int id, void *d, int l, void *ex) {
+    return orig_AnoSDKInitEx ? orig_AnoSDKInitEx(id, d, l, ex) : 0;
+}
+static int  hook_AnoSDKIoctlOld(int c, void *d, int l) {
+    return orig_AnoSDKIoctlOld ? orig_AnoSDKIoctlOld(c, d, l) : 0;
+}
+static int  hook_AnoSDKForExport(int a, void *b, int c) {
+    return orig_AnoSDKForExport ? orig_AnoSDKForExport(a, b, c) : 0;
+}
+static void hook_AnoSDKFree(void *p) {
+    if (orig_AnoSDKFree) orig_AnoSDKFree(p);
+}
+static int  hook_AnoSDKOnRecvData(void *d, int l) {
+    return orig_AnoSDKOnRecvData ? orig_AnoSDKOnRecvData(d, l) : 0;
+}
+// Block server-pushed scan signatures — server can't arm new detectors
 static int  hook_AnoSDKOnRecvSignature(void *sig, int l)
     { (void)sig;(void)l; return 0; }
-static int  hook_AnoSDKRegistInfoListener(void *cb, void *ud)
-    { (void)cb;(void)ud; return 0; }
+static int  hook_AnoSDKRegistInfoListener(void *cb, void *ud) {
+    return orig_AnoSDKRegistInfoListener ? orig_AnoSDKRegistInfoListener(cb, ud) : 0;
+}
 
 static void install_ano_missing(void *h, const char *lib) {
-    auto hk = [&](const char *sym, void *rep) {
+    auto hk = [&](const char *sym, void *rep, void **orig) {
         void *a = dlsym(h, sym);
         if (!a) { char buf[128]; snprintf(buf,sizeof(buf),"%s@@ANO",sym); a=dlsym(h,buf); }
         if (!a) a = DobbySymbolResolver(lib, sym);
-        if (a) { DobbyHook(a, rep, nullptr); LI("L7c hooked %s", sym); }
+        if (a) { DobbyHook(a, rep, orig); LI("L7c hooked %s", sym); }
     };
-    hk("AnoSDKInitEx",            (void*)hook_AnoSDKInitEx);
-    hk("AnoSDKIoctlOld",          (void*)hook_AnoSDKIoctlOld);
-    hk("AnoSDKForExport",         (void*)hook_AnoSDKForExport);
-    hk("AnoSDKFree",              (void*)hook_AnoSDKFree);
-    hk("AnoSDKOnRecvData",        (void*)hook_AnoSDKOnRecvData);
-    hk("AnoSDKOnRecvSignature",   (void*)hook_AnoSDKOnRecvSignature);
-    hk("AnoSDKRegistInfoListener",(void*)hook_AnoSDKRegistInfoListener);
+    hk("AnoSDKInitEx",            (void*)hook_AnoSDKInitEx,            (void**)&orig_AnoSDKInitEx);
+    hk("AnoSDKIoctlOld",          (void*)hook_AnoSDKIoctlOld,          (void**)&orig_AnoSDKIoctlOld);
+    hk("AnoSDKForExport",         (void*)hook_AnoSDKForExport,         (void**)&orig_AnoSDKForExport);
+    hk("AnoSDKFree",              (void*)hook_AnoSDKFree,              (void**)&orig_AnoSDKFree);
+    hk("AnoSDKOnRecvData",        (void*)hook_AnoSDKOnRecvData,        (void**)&orig_AnoSDKOnRecvData);
+    hk("AnoSDKOnRecvSignature",   (void*)hook_AnoSDKOnRecvSignature,   nullptr);
+    hk("AnoSDKRegistInfoListener",(void*)hook_AnoSDKRegistInfoListener,(void**)&orig_AnoSDKRegistInfoListener);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

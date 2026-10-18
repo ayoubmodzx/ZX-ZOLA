@@ -144,11 +144,8 @@ typedef int (*connect_t)(int, const struct sockaddr*, socklen_t);
 static connect_t orig_connect = nullptr;
 
 static int __attribute__((noinline)) hook_connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    uintptr_t lr = (uintptr_t)__builtin_return_address(0);
-    if (caller_is_anogs(lr)) {
-        errno = ECONNREFUSED;
-        return -1;
-    }
+    // libanogs must connect freely — its scan results are nullified so only
+    // clean reports reach the server. Blocking here causes silent-death ban.
     if (!orig_connect) { errno = ENOSYS; return -1; }
     return orig_connect(sockfd, addr, addrlen);
 }

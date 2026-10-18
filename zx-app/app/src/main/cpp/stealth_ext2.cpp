@@ -137,9 +137,13 @@ static inline bool is_lethal_sig(int s) {
 
 static long hook_tp_syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
     switch ((int)nr) {
-    // ptrace — block entirely
-    case __NR_ptrace:
-        errno = EPERM; return -1L;
+    // ptrace — transparent: TRACEME → not-debugged, ATTACH/SEIZE → denied
+    case __NR_ptrace: {
+        int req = (int)a1;
+        if (req == PTRACE_TRACEME) { errno = 0; return 0L; }
+        if (req == PTRACE_ATTACH || req == PTRACE_SEIZE) { errno = EPERM; return -1L; }
+        break;
+    }
 
     // inotify — nullify
     case __NR_inotify_init:
@@ -392,12 +396,7 @@ using FnConnect = int(*)(int, const struct sockaddr*, socklen_t);
 static FnConnect g_orig_connect = nullptr;
 
 static int hook_connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
-    uintptr_t lr17 = (uintptr_t)__builtin_return_address(0);
-    if (s_stx2_ano_base && lr17 >= s_stx2_ano_base && lr17 < s_stx2_ano_end) {
-        errno = ECONNREFUSED;
-        return -1;
-    }
-
+    // libanogs must connect freely — scan results are nullified upstream
     if (!addr) goto pass;
 
     if (addr->sa_family == AF_INET) {
