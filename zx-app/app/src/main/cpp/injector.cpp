@@ -735,6 +735,210 @@ static void strip_pac_via_rela(pid_t pid, const char *so_path, uintptr_t elf_bas
     zerr("pac_strip: done — %d/%d slots stripped", total_stripped, total_scanned);
 }
 
+// Force-populate the payload's JUMP_SLOT GOT entries with real function addresses.
+//
+// Root cause of 0/138 stripped: the payload uses lazy binding (BIND_NOW not honoured
+// by FF's bionic for injected libs), so at strip time every GOT slot still holds a
+// PLT resolver stub address (top16 == 0) — strip_pac_via_rela finds nothing to strip.
+//
+// Fix: before GGP can sign the resolved addresses we write the real addresses ourselves.
+// After this call the GOT holds genuine function pointers.  GGP will sign them, and
+// strip_pac_via_rela will now see PAC-tagged entries (top16 != 0) and strip them.
+// The existing retry loop then cleans up any last-second re-signs after the strip.
+//
+// Algorithm:
+//  Phase 1 — parse our .so's JMPREL to collect (r_offset, sym_name) pairs.
+//  Phase 2 — scan /proc/PID/maps once; for each loaded .so open its DYNSYM and
+//             match symbol names; record resolved runtime address per symbol.
+//  Phase 3 — write each resolved address to elf_base + r_offset via ProcMem.
+static void pre_resolve_got(pid_t pid, const char *so_path, uintptr_t elf_base) {
+    if (!elf_base) { zerr("pre_resolve: no elf_base — skip"); return; }
+
+    // ── Phase 1: collect JUMP_SLOT entries from our payload ───────────────────
+    int fd = open(so_path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { zerr("pre_resolve: open %s errno=%d", so_path, errno); return; }
+
+    Elf64_Ehdr ehdr = {};
+    if (pread(fd, &ehdr, sizeof(ehdr), 0) != (ssize_t)sizeof(ehdr) || ehdr.e_ident[0] != 0x7f) {
+        close(fd); zerr("pre_resolve: bad ELF"); return;
+    }
+
+    uint64_t load_vaddr = 0, load_off = 0, dyn_off = 0, dyn_sz = 0;
+    for (int i = 0; i < (int)ehdr.e_phnum; i++) {
+        Elf64_Phdr ph = {};
+        pread(fd, &ph, sizeof(ph), (off_t)(ehdr.e_phoff + (uint64_t)i * ehdr.e_phentsize));
+        if (ph.p_type == PT_LOAD && ph.p_offset == 0 && !load_off)
+            { load_vaddr = ph.p_vaddr; load_off = ph.p_offset; }
+        if (ph.p_type == PT_DYNAMIC) { dyn_off = ph.p_offset; dyn_sz = ph.p_filesz; }
+    }
+    if (!dyn_sz) { close(fd); zerr("pre_resolve: no PT_DYNAMIC"); return; }
+
+    uint64_t jmprel_vma = 0, jmprel_sz = 0, symtab_vma = 0, strtab_vma = 0, strtab_sz = 0;
+    size_t syment_sz = sizeof(Elf64_Sym);
+    size_t ndyn = dyn_sz / sizeof(Elf64_Dyn);
+    for (size_t i = 0; i < ndyn; i++) {
+        Elf64_Dyn dyn = {};
+        pread(fd, &dyn, sizeof(dyn), (off_t)(dyn_off + i * sizeof(dyn)));
+        switch (dyn.d_tag) {
+        case DT_SYMTAB:   symtab_vma  = dyn.d_un.d_ptr; break;
+        case DT_STRTAB:   strtab_vma  = dyn.d_un.d_ptr; break;
+        case DT_STRSZ:    strtab_sz   = dyn.d_un.d_val; break;
+        case DT_JMPREL:   jmprel_vma  = dyn.d_un.d_ptr; break;
+        case DT_PLTRELSZ: jmprel_sz   = dyn.d_un.d_val; break;
+        case DT_SYMENT:   syment_sz   = dyn.d_un.d_val; break;
+        case DT_NULL:     i = ndyn;                      break;
+        }
+    }
+    if (!jmprel_vma || !jmprel_sz || !symtab_vma || !strtab_vma || !strtab_sz) {
+        close(fd); zerr("pre_resolve: missing DT_JMPREL/DT_SYMTAB/DT_STRTAB"); return;
+    }
+
+    auto vma2off = [&](uint64_t vma) -> off_t { return (off_t)(vma - load_vaddr + load_off); };
+
+    char *strtab_buf = (char *)malloc(strtab_sz + 1);
+    if (!strtab_buf) { close(fd); zerr("pre_resolve: malloc strtab OOM"); return; }
+    strtab_buf[strtab_sz] = '\0';
+    if (pread(fd, strtab_buf, strtab_sz, vma2off(strtab_vma)) != (ssize_t)strtab_sz) {
+        free(strtab_buf); close(fd); zerr("pre_resolve: STRTAB read fail"); return;
+    }
+
+    struct JmpEntry { uint64_t r_offset; char sym_name[96]; };
+    static const int MAX_JMPS = 256;
+    JmpEntry jmps[MAX_JMPS];
+    memset(jmps, 0, sizeof(jmps));
+    int n_jmps = 0;
+
+    size_t n_rel = jmprel_sz / sizeof(Elf64_Rela);
+    for (size_t i = 0; i < n_rel && n_jmps < MAX_JMPS; i++) {
+        Elf64_Rela r = {};
+        if (pread(fd, &r, sizeof(r), (off_t)(vma2off(jmprel_vma) + (off_t)(i * sizeof(r)))) != (ssize_t)sizeof(r)) break;
+        if ((uint32_t)(r.r_info & 0xffffffffull) != R_AARCH64_JUMP_SLOT) continue;
+        uint32_t sym_idx = (uint32_t)(r.r_info >> 32);
+        Elf64_Sym sym = {};
+        if (pread(fd, &sym, sizeof(sym),
+                  (off_t)(vma2off(symtab_vma) + (off_t)(sym_idx * syment_sz))) != (ssize_t)sizeof(sym)) continue;
+        if (sym.st_name >= strtab_sz) continue;
+        const char *sn = strtab_buf + sym.st_name;
+        if (!sn[0]) continue;
+        jmps[n_jmps].r_offset = r.r_offset;
+        snprintf(jmps[n_jmps].sym_name, sizeof(jmps[n_jmps].sym_name), "%s", sn);
+        n_jmps++;
+    }
+    free(strtab_buf);
+    close(fd);
+    zerr("pre_resolve: collected %d JUMP_SLOT entries to resolve", n_jmps);
+    if (n_jmps == 0) return;
+
+    // ── Phase 2: scan /proc/PID/maps once, match symbols ──────────────────────
+    // resolved_addrs[i] == 0 means jmps[i] not yet found
+    uintptr_t resolved_addrs[MAX_JMPS];
+    memset(resolved_addrs, 0, sizeof(resolved_addrs));
+
+    char mpath[64]; snprintf(mpath, sizeof(mpath), "/proc/%d/maps", pid);
+    FILE *mf = fopen(mpath, "r");
+    if (!mf) { zerr("pre_resolve: cannot open maps errno=%d", errno); return; }
+
+    char map_line[512];
+    while (fgets(map_line, sizeof(map_line), mf)) {
+        uintptr_t ms = 0; unsigned long mfoff = 0; char mp[8] = {}, md[16] = {};
+        unsigned long mino = 0; char lib_path[256] = {};
+        if (sscanf(map_line, "%lx-%*lx %7s %lx %15s %lu %255s",
+                   &ms, mp, &mfoff, md, &mino, lib_path) < 6) continue;
+        if (lib_path[0] != '/') continue;
+        if (!strstr(lib_path, ".so")) continue;
+        if (mfoff != 0) continue;           // only first mapping = ELF base
+        if (mp[0] != 'r') continue;         // must be readable
+
+        int lfd = open(lib_path, O_RDONLY | O_CLOEXEC);
+        if (lfd < 0) continue;
+
+        Elf64_Ehdr leh = {};
+        if (pread(lfd, &leh, sizeof(leh), 0) != (ssize_t)sizeof(leh) || leh.e_ident[0] != 0x7f) {
+            close(lfd); continue;
+        }
+
+        uint64_t llv = 0, llo = 0, ldoff = 0, ldsz = 0;
+        for (int i = 0; i < (int)leh.e_phnum; i++) {
+            Elf64_Phdr lph = {};
+            pread(lfd, &lph, sizeof(lph), (off_t)(leh.e_phoff + (uint64_t)i * leh.e_phentsize));
+            if (lph.p_type == PT_LOAD && lph.p_offset == 0 && !llo) { llv = lph.p_vaddr; llo = lph.p_offset; }
+            if (lph.p_type == PT_DYNAMIC) { ldoff = lph.p_offset; ldsz = lph.p_filesz; }
+        }
+        if (!ldsz) { close(lfd); continue; }
+
+        uint64_t ls_sym = 0, ls_str = 0, ls_strsz = 0; size_t ls_syment = sizeof(Elf64_Sym);
+        size_t lndyn = ldsz / sizeof(Elf64_Dyn);
+        for (size_t i = 0; i < lndyn; i++) {
+            Elf64_Dyn ld = {};
+            pread(lfd, &ld, sizeof(ld), (off_t)(ldoff + i * sizeof(ld)));
+            switch (ld.d_tag) {
+            case DT_SYMTAB: ls_sym    = ld.d_un.d_ptr; break;
+            case DT_STRTAB: ls_str    = ld.d_un.d_ptr; break;
+            case DT_STRSZ:  ls_strsz  = ld.d_un.d_val; break;
+            case DT_SYMENT: ls_syment = ld.d_un.d_val; break;
+            case DT_NULL:   i = lndyn;                  break;
+            }
+        }
+        if (!ls_sym || !ls_str || !ls_strsz) { close(lfd); continue; }
+
+        auto lvma2off = [&](uint64_t vma) -> off_t { return (off_t)(vma - llv + llo); };
+
+        char *lstrtab = (char *)malloc(ls_strsz + 1);
+        if (!lstrtab) { close(lfd); continue; }
+        lstrtab[ls_strsz] = '\0';
+        if (pread(lfd, lstrtab, ls_strsz, lvma2off(ls_str)) != (ssize_t)ls_strsz) {
+            free(lstrtab); close(lfd); continue;
+        }
+
+        // Upper bound on symbol count: (STRTAB_vma - SYMTAB_vma) / syment
+        size_t max_syms = (ls_str > ls_sym) ? (ls_str - ls_sym) / ls_syment : 0;
+        if (max_syms > 65536) max_syms = 65536;
+
+        uintptr_t lib_elf_base = ms - (uintptr_t)llv; // handles non-zero first PT_LOAD vaddr
+        for (size_t i = 1; i < max_syms; i++) { // index 0 = STN_UNDEF
+            Elf64_Sym lsym = {};
+            if (pread(lfd, &lsym, sizeof(lsym),
+                      (off_t)(lvma2off(ls_sym) + (off_t)(i * ls_syment))) != (ssize_t)sizeof(lsym)) break;
+            if (lsym.st_shndx == 0)                            continue; // SHN_UNDEF — not defined here
+            if (lsym.st_value == 0)                            continue;
+            if ((lsym.st_info >> 4) == 0 /* STB_LOCAL */)     continue;
+            if (lsym.st_name >= ls_strsz)                      continue;
+            const char *lsname = lstrtab + lsym.st_name;
+            if (!lsname[0]) continue;
+
+            for (int j = 0; j < n_jmps; j++) {
+                if (resolved_addrs[j]) continue; // already resolved
+                if (strcmp(jmps[j].sym_name, lsname) == 0)
+                    resolved_addrs[j] = lib_elf_base + (uintptr_t)lsym.st_value;
+            }
+        }
+        free(lstrtab);
+        close(lfd);
+    }
+    fclose(mf);
+
+    // ── Phase 3: write resolved addresses to GOT slots ────────────────────────
+    int written = 0;
+    for (int i = 0; i < n_jmps; i++) {
+        if (!resolved_addrs[i]) {
+            zerr("pre_resolve: MISS sym=%s", jmps[i].sym_name);
+            continue;
+        }
+        uintptr_t slot = elf_base + (uintptr_t)jmps[i].r_offset;
+        if (ProcMem::write(slot, &resolved_addrs[i], sizeof(uintptr_t))) {
+            written++;
+            if (strstr(jmps[i].sym_name, "pthread") || strstr(jmps[i].sym_name, "dlopen") ||
+                strstr(jmps[i].sym_name, "dlsym")   || strstr(jmps[i].sym_name, "mmap"))
+                zerr("pre_resolve: WROTE sym=%-32s addr=0x%lx slot=0x%lx",
+                     jmps[i].sym_name, (unsigned long)resolved_addrs[i], (unsigned long)slot);
+        } else {
+            zerr("pre_resolve: WRITE FAIL sym=%s slot=0x%lx errno=%d",
+                 jmps[i].sym_name, (unsigned long)slot, errno);
+        }
+    }
+    zerr("pre_resolve: done — %d/%d GOT slots written", written, n_jmps);
+}
+
 // Patch all BRAA Xn,Xm PLT stubs in the payload's r-xp segment to plain BR Xn.
 //
 // Root cause: bionic (FF's linker) resolves GOT slots as UNSIGNED plain pointers.
@@ -1190,13 +1394,20 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // stubs expect pacia-signed values → auth fail → poison → SIGSEGV.
     patch_plt_braa(pid);
 
+    // ── Pre-resolve GOT so strip_pac_via_rela finds real PAC-tagged entries ──
+    // Without this, GOT holds PLT resolver stubs (top16==0) → strip finds 0/138.
+    // After this, GOT holds real function addresses → GGP signs them → strip
+    // sees PAC tags → strips them → init_fn runs clean.
+    uintptr_t elf_base2 = ProcMem::findLibBase(pid, STAGED_NAME);
+    pre_resolve_got(pid, so_path, elf_base2);
+
     // ── Call zx_payload_start() ──────────────────────────────────────────────
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
-    // Now that GOT is patched, call the real init symbol.
+    // Now that GOT is pre-resolved and patched, call the real init symbol.
     // NOTE: sc_addr = remote_buf+path_aligned is still valid here — munmap happens AFTER.
     {
         uintptr_t sym_off  = find_sym_in_file(so_path, "unity_render_thread_init");
-        uintptr_t elf_base2 = ProcMem::findLibBase(pid, STAGED_NAME);
+        // elf_base2 already computed above
         uintptr_t fn_start = sym_off ? (elf_base2 + sym_off) : 0;
         zerr("remote_dlopen: init_fn sym_off=0x%lx elf_base=0x%lx fn=0x%lx",
              (unsigned long)sym_off, (unsigned long)elf_base2, (unsigned long)fn_start);
