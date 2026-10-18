@@ -359,18 +359,22 @@ static int  (*orig_AnoSetUser)(int,const char*,int)= nullptr;
 static int  (*orig_AnoIoctl)(int,void*,int)        = nullptr;
 static int  (*orig_SetPeriod)(int)                 = nullptr;
 
+// Lifecycle functions: pass through — blocking Init/Pause/Resume puts AnoSDK
+// in undefined state with no heartbeats sent, causing server-side ban.
+// Scan functions (ms_scan_start, inline_hook_opcode_dismatch etc.) are
+// nullified separately so the SDK runs normally but finds nothing.
 static int hook_AnoInit(int id, void *d, int l) {
-    (void)id; (void)d; (void)l;
-    return 0;
+    return orig_AnoInit ? orig_AnoInit(id, d, l) : 0;
 }
 static int hook_AnoIoctl(int cmd, void *d, int l) {
-    (void)cmd; (void)d; (void)l;
-    return 0;
+    return orig_AnoIoctl ? orig_AnoIoctl(cmd, d, l) : 0;
 }
-static void hook_AnoOnPause()  {}
-static void hook_AnoOnResume() {}
+static void hook_AnoOnPause()  { if (orig_AnoOnPause)  orig_AnoOnPause(); }
+static void hook_AnoOnResume() { if (orig_AnoOnResume) orig_AnoOnResume(); }
+// SetUserInfo: pass through — server correlates reports by user ID;
+// anonymous reports (null user) are an anomaly signal.
 static int hook_AnoSetUser(int t, const char *u, int l) {
-    (void)t; (void)u; (void)l; return 0;
+    return orig_AnoSetUser ? orig_AnoSetUser(t, u, l) : 0;
 }
 static int hook_SetPeriod(int ms) {
     (void)ms;

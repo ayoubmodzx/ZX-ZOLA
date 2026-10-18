@@ -114,20 +114,30 @@ static long  (*orig_ptrace)(int,pid_t,void*,void*)   = nullptr;
 // ─────────────────────────────────────────────────────────────────────────────
 // AnoSDK export hooks
 // ─────────────────────────────────────────────────────────────────────────────
-static int   hook_Ioctl(int,void*,int)    { return 0; }
-static void *hook_GetData (int *len)      { if(len)*len=0; return nullptr; }
-static void *hook_GetData2(int,int *len)  { if(len)*len=0; return nullptr; }
-static void *hook_GetData3(int,int *len,int)     { if(len)*len=0; return nullptr; }
-static void *hook_GetData4(int,int *len,int,int) { if(len)*len=0; return nullptr; }
+// Ioctl: pass through — scan functions are nullified so any triggered scan
+// returns clean results. Blocking all ioctl prevents heartbeat commands from
+// reaching the server, causing a "silent sensor" server-side ban.
+static int hook_Ioctl(int cmd, void *d, int l) {
+    return orig_Ioctl ? orig_Ioctl(cmd, d, l) : 0;
+}
+
+// GetReportData: pass through — internal scan state is already clean because
+// ms_scan_start / inline_hook_opcode_dismatch are nullified. Returning null
+// makes the server see zero bytes every cycle which is an anomaly signal.
+static void *hook_GetData (int *len)             { return orig_GetData  ? orig_GetData(len)         : nullptr; }
+static void *hook_GetData2(int t, int *len)      { return orig_GetData2 ? orig_GetData2(t,len)      : nullptr; }
+static void *hook_GetData3(int t, int *len,int f){ return orig_GetData3 ? orig_GetData3(t,len,f)    : nullptr; }
+static void *hook_GetData4(int t, int *len,int f,int g){ return orig_GetData4 ? orig_GetData4(t,len,f,g) : nullptr; }
 
 static void *hook_InlineCheck(void *a, void *b, int c) { (void)a;(void)b;(void)c; return nullptr; }
 
-// AnoSDKInitEx — extended init that passes extra config/channel info.
-// Swallow it: return 0 (success) without actually initialising the scan subsystem.
+// AnoSDKInitEx — let real init run so SDK starts its heartbeat thread.
+// Scan functions (ms_scan_start etc.) are already nullified so every scan
+// the SDK performs reports "nothing found". Swallowing init causes a
+// "silent sensor" state where the server receives zero heartbeats → ban.
 static int hook_InitEx(void *cfg, int flags, void *extra) {
-    (void)cfg; (void)flags; (void)extra;
-    LOG("AnoSDKInitEx swallowed");
-    return 0;
+    LOG("AnoSDKInitEx pass-through (transparent mode)");
+    return orig_InitEx ? orig_InitEx(cfg, flags, extra) : 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

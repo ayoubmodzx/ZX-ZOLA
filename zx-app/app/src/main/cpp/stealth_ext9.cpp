@@ -221,7 +221,10 @@ typedef int (*connect_fn9)(int, const struct sockaddr*, socklen_t);
 static connect_fn9 orig_connect9 = nullptr;
 
 static int hook_connect9(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
-    if (caller_is_scanner9()) { errno = ECONNREFUSED; return -1; }
+    // Only block GGP network — AnoSDK must connect freely so heartbeats reach
+    // the server. AnoSDK's scan results are clean (scan functions nullified).
+    // Blocking AnoSDK connect causes "silent sensor" server-side ban.
+    if (caller_is_ggp9()) { errno = ECONNREFUSED; return -1; }
     if (!orig_connect9) { errno = ENOSYS; return -1; }
     return orig_connect9(sockfd, addr, addrlen);
 }
@@ -232,7 +235,7 @@ static sendto_fn9 orig_sendto9 = nullptr;
 
 static ssize_t hook_sendto9(int sockfd, const void *buf, size_t len, int flags,
                             const struct sockaddr *dest, socklen_t addrlen) {
-    if (caller_is_scanner9()) { errno = ECONNREFUSED; return -1; }
+    if (caller_is_ggp9()) { errno = ECONNREFUSED; return -1; }
     if (!orig_sendto9) { errno = ENOSYS; return -1; }
     return orig_sendto9(sockfd, buf, len, flags, dest, addrlen);
 }
@@ -241,7 +244,7 @@ typedef ssize_t (*sendmsg_fn9)(int, const struct msghdr*, int);
 static sendmsg_fn9 orig_sendmsg9 = nullptr;
 
 static ssize_t hook_sendmsg9(int sockfd, const struct msghdr *msg, int flags) {
-    if (caller_is_scanner9()) { errno = ECONNREFUSED; return -1; }
+    if (caller_is_ggp9()) { errno = ECONNREFUSED; return -1; }
     if (!orig_sendmsg9) { errno = ENOSYS; return -1; }
     return orig_sendmsg9(sockfd, msg, flags);
 }
