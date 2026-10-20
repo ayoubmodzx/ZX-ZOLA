@@ -2,10 +2,37 @@
 #include "il2cpp_api.hpp"
 #include "async_worker.hpp"
 
+// Feature command IDs — shared with the Android app's socket client
+enum ZxCmd : uint8_t {
+    ZX_ANTI_RECOIL    = 1,  ZX_NO_SPREAD      = 2,
+    ZX_RAPID_FIRE     = 3,  ZX_WIDE_POV       = 4,
+    ZX_SPEED_HACK     = 6,  ZX_HIGH_JUMP      = 7,
+    ZX_VEHICLE_SPEED  = 8,  ZX_RAPID_RISK     = 9,
+    ZX_NO_GRASS       = 10, ZX_ANTI_DAMAGE    = 11,
+    ZX_AIM_ENABLE     = 12, ZX_AIM_BONE       = 13,
+    ZX_AIM_FOV        = 14, ZX_AIM_SMOOTH     = 15,
+    ZX_MAX_HEALTH     = 16,
+};
+
+#pragma pack(push, 1)
+struct ZxPacket {
+    uint8_t cmd;
+    uint8_t enable;   // 1=on, 0=off
+    float   intensity; // optional multiplier / angle / percentage
+};
+#pragma pack(pop)
+
 class FeatureEngine {
 public:
     static FeatureEngine &get();
+
     void init(AsyncWorker *worker);
+
+    // Start the Unix socket server (call from worker thread after init)
+    void startServer();
+
+    // Dispatch a command received via socket (or called directly)
+    void dispatch(uint8_t cmd, bool enable, float intensity = 0.f);
 
     // ── COMBAT ────────────────────────────────────────────────────
     void applyAntiRecoil(bool enable = true);
@@ -67,4 +94,7 @@ private:
     } m_mth;
 
     void resolveClasses();
+
+    static void *serverThread(void *self);
+    void runServer();
 };

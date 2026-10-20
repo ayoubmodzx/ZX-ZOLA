@@ -76,10 +76,10 @@ public:
                 return;
             }
 
-            // Features — run delayed to let il2cpp stabilize
+            // Features — resolve il2cpp classes + start socket server for app control
             FeatureEngine::get().init(&g_worker);
 
-            LOGI("ZX-ZOLA fully loaded");
+            LOGI("ZX-ZOLA fully loaded — listening on \\0zx_zola");
         });
     }
 
