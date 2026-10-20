@@ -506,14 +506,13 @@ static void hookAimUpdate(void *self) {
 
     // Full aimbot: force aim angle toward nearest enemy head
     if (g_fullAimbot.load(std::memory_order_relaxed)) {
-        // CE-1: hasHeadTarget/getHeadTarget are declared in esp_renderer.hpp (already included)
-        if (ESP::hasHeadTarget() && g_aim.offAimAngle >= 0) {
-            // Max lock-on: set smooth to 0 (instant), bone to head
-            Il2Cpp::writeField<float>(self, g_aim.offAimSmooth, 0.0f);
-            Il2Cpp::writeField<int32_t>(self, g_aim.offBoneIndex, 5);
-            // Force aim angle to direct lock
-            if (g_aim.offAimAngle >= 0)
-                Il2Cpp::writeField<float>(self, g_aim.offAimAngle, 0.0f);
+        if (ESP::hasHeadTarget()) {
+            // Instant snap: smooth=0 (no lerp), bone=HEAD, cone=180° (full sphere lock-on).
+            // aimAngle is the assist cone half-angle in degrees.
+            // 0.0 = no cone = no assist (wrong); 180.0 = hemisphere = always locks.
+            if (g_aim.offAimSmooth  >= 0) Il2Cpp::writeField<float>  (self, g_aim.offAimSmooth,  0.0f);
+            if (g_aim.offBoneIndex  >= 0) Il2Cpp::writeField<int32_t>(self, g_aim.offBoneIndex,   5);
+            if (g_aim.offAimAngle   >= 0) Il2Cpp::writeField<float>  (self, g_aim.offAimAngle,  180.0f);
         }
     }
     if (g_aimEnabled) {
@@ -772,11 +771,23 @@ static GetFireDirFn g_origGetFireDir = nullptr;
 static Vec3 hookGetFireDir(void *self) {
     Vec3 orig = g_origGetFireDir ? g_origGetFireDir(self) : Vec3{0,0,1};
     if (!g_silentAim.load(std::memory_order_relaxed)) return orig;
-    // CE-1: hasHeadTarget/getHeadTarget declared in esp_renderer.hpp
     if (!ESP::hasHeadTarget()) return orig;
-    Vec2 head = ESP::getHeadTarget();
-    (void)head; // screen-space target; aim assist uses head.x, head.y
-    return orig;
+
+    // Get nearest enemy head in world space
+    float hx, hy, hz;
+    if (!ESP::getHeadWorldPos3(&hx, &hy, &hz)) return orig;
+
+    // Get local player root position; camera eye is ~1.6m above root
+    float lx = 0.f, ly = 0.f, lz = 0.f;
+    ESP::getLocalPos3(&lx, &ly, &lz);
+
+    float dx = hx - lx;
+    float dy = hy - (ly + 1.6f);  // eye-height offset so direction starts from camera
+    float dz = hz - lz;
+    float len = sqrtf(dx*dx + dy*dy + dz*dz);
+    if (len < 0.001f) return orig;  // degenerate case: coincident positions
+
+    return Vec3{ dx/len, dy/len, dz/len };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -693,13 +693,17 @@ static void *position_updater(void *) {
 
 static std::atomic<bool> g_hs_target_valid{false};
 static Vec2              g_hs_target_screen{};
+static Vec3              s_hs_world{};  // world-space head of the nearest visible enemy
 
 // Updates every position-refresh cycle — not per frame
 static void update_hs_target(void *cam) {
-    if (!g_hs_on.load() || !cam) { g_hs_target_valid = false; return; }
+    // Always run regardless of g_hs_on — silent aim also needs the world target.
+    // The visual head-dot indicator in hook_OnPostRender is separately gated by g_hs_on.
+    if (!cam) { g_hs_target_valid = false; return; }
 
     float best_dist = 1e9f;
     Vec2  best_pos  = {};
+    Vec3  best_world = {};
     bool  found     = false;
 
     pthread_mutex_lock(&g_mu);
@@ -710,12 +714,20 @@ static void update_hs_target(void *cam) {
         float cx = (float)g_sw * 0.5f;
         float cy = (float)g_sh * 0.5f;
         float d  = sqrtf((s.x-cx)*(s.x-cx) + (s.y-cy)*(s.y-cy));
-        if (d < best_dist) { best_dist = d; best_pos = s; found = true; }
+        if (d < best_dist) {
+            best_dist  = d;
+            best_pos   = s;
+            best_world = g_cache[i].head;
+            found      = true;
+        }
     }
     pthread_mutex_unlock(&g_mu);
 
     g_hs_target_valid = found;
-    if (found) g_hs_target_screen = best_pos;
+    if (found) {
+        g_hs_target_screen = best_pos;
+        s_hs_world         = best_world;
+    }
 }
 
 // Hook Camera.OnPostRender is above — it calls update_hs_target each frame too
@@ -726,6 +738,21 @@ static void update_hs_target(void *cam) {
 // g_hs_target_screen value exposed via ESP::getHeadTarget().
 Vec2 ESP::getHeadTarget() { return g_hs_target_screen; }
 bool ESP::hasHeadTarget()  { return g_hs_target_valid.load(); }
+
+bool ESP::getHeadWorldPos3(float *x, float *y, float *z) {
+    if (!g_hs_target_valid.load(std::memory_order_relaxed)) return false;
+    *x = s_hs_world.x;
+    *y = s_hs_world.y;
+    *z = s_hs_world.z;
+    return true;
+}
+
+bool ESP::getLocalPos3(float *x, float *y, float *z) {
+    Vec3 p = get_local_pos();
+    if (p.x == 0.f && p.y == 0.f && p.z == 0.f) return false;
+    *x = p.x; *y = p.y; *z = p.z;
+    return true;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Init — resolve all icalls and install the Camera hook
