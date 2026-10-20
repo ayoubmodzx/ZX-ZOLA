@@ -1,0 +1,97 @@
+name: Publish Dev Release
+
+on:
+  workflow_run:
+    workflows:
+      - "Build ZX-ZOLA APK"
+      - "Build ZX APK"
+      - "Build Zygisk Module ZIP"
+    types: [completed]
+    branches: ["**"]
+
+jobs:
+  release:
+    # Only run when at least one build succeeded on the same commit
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      # ── Download artifact from the triggering workflow run ──────────────
+      - name: Download artifacts from triggering run
+        uses: actions/download-artifact@v4
+        with:
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: release-files
+        continue-on-error: true
+
+      - name: List downloaded files
+        run: |
+          echo "=== Downloaded files ==="
+          find release-files -type f 2>/dev/null || echo "(none)"
+
+      # ── Build info ───────────────────────────────────────────────────────
+      - name: Gather release metadata
+        id: meta
+        run: |
+          SHA="${{ github.event.workflow_run.head_sha }}"
+          SHORT_SHA="${SHA:0:7}"
+          BRANCH="${{ github.event.workflow_run.head_branch }}"
+          RUN_NUM="${{ github.event.workflow_run.run_number }}"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "run_num=$RUN_NUM" >> "$GITHUB_OUTPUT"
+
+          # Collect all downloadable files into flat directory
+          mkdir -p dist
+          find release-files -type f \( -name "*.apk" -o -name "*.zip" \) \
+            -exec cp {} dist/ \; 2>/dev/null || true
+
+          echo "=== dist contents ==="
+          ls -lh dist/ || echo "(empty)"
+
+          # Check if any files exist
+          COUNT=$(find dist -type f | wc -l)
+          echo "file_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      # ── Publish release ──────────────────────────────────────────────────
+      - name: Create/update dev release
+        if: steps.meta.outputs.file_count != '0'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          name: "ZX Dev Build — ${{ steps.meta.outputs.short_sha }}"
+          prerelease: true
+          draft: false
+          body: |
+            **Branch:** `${{ steps.meta.outputs.branch }}`
+            **Commit:** `${{ steps.meta.outputs.short_sha }}`
+            **Build:** #${{ steps.meta.outputs.run_num }}
+
+            ---
+
+            ### Files
+            - `ZX-ZOLA-debug.apk` — main app APK (ZX-ZOLA)
+            - `app-debug.apk` — ZX standalone APK
+            - `ZX-ZOLA-*.zip` — Zygisk module ZIP (install via Magisk/KernelSU)
+
+            > ⚠️ Dev build — auto-generated on every push. Not stable.
+          files: dist/*
+          fail_on_unmatched_files: false
+          generate_release_notes: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No files to release
+        if: steps.meta.outputs.file_count == '0'
+        run: |
+          echo "No APK/ZIP artifacts found from triggering run."
+          echo "This can happen when workflows are still uploading — the next run will catch them."
