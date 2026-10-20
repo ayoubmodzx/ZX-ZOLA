@@ -1560,7 +1560,9 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                     if (init_ok_attempt) {
                         zerr("remote_dlopen: init_fn OK (attempt %d)", attempt + 1);
                         init_ok = true;
-                    } else if (!proc_dead) {
+                    } else if (proc_dead) {
+                        break; // process dead — exit_group(127) fired, no point retrying on corpse
+                    } else {
                         int sig2 = WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1;
                         zerr("remote_dlopen: init_fn FAIL wst=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
                              st2, sig2, (unsigned long)sr2.pc, (long)sr2.pc - (long)sc_addr);
