@@ -829,6 +829,34 @@ static void pre_resolve_got(pid_t pid, const char *so_path, uintptr_t elf_base) 
     zerr("pre_resolve: collected %d JUMP_SLOT entries to resolve", n_jmps);
     if (n_jmps == 0) return;
 
+    // ── Phase 1.5: build executable address ranges ────────────────────────────
+    // When a process has two copies of libc (e.g. AnoSDK loads its own copy),
+    // the first copy in /proc/maps may be r--p (non-executable).  pre_resolve
+    // must only write addresses from executable (r-xp / r-x) segments, otherwise
+    // the GOT contains a non-exec address → BLR → SIGSEGV code=2 at the callee.
+    struct ExecRange { uintptr_t start, end; };
+    static const int MAX_EXEC_R = 128;
+    ExecRange exec_ranges[MAX_EXEC_R] = {};
+    int n_exec_r = 0;
+    {
+        char emap[64]; snprintf(emap, sizeof(emap), "/proc/%d/maps", pid);
+        FILE *ef = fopen(emap, "r");
+        if (ef) {
+            char el[256];
+            while (fgets(el, sizeof(el), ef) && n_exec_r < MAX_EXEC_R) {
+                uintptr_t es = 0, ee = 0; char ep[8] = {};
+                if (sscanf(el, "%lx-%lx %7s", &es, &ee, ep) >= 3 && ep[2] == 'x')
+                    exec_ranges[n_exec_r++] = {es, ee};
+            }
+            fclose(ef);
+        }
+    }
+    auto is_exec_addr = [&](uintptr_t a) -> bool {
+        for (int i = 0; i < n_exec_r; i++)
+            if (a >= exec_ranges[i].start && a < exec_ranges[i].end) return true;
+        return false;
+    };
+
     // ── Phase 2: scan /proc/PID/maps once, match symbols ──────────────────────
     // resolved_addrs[i] == 0 means jmps[i] not yet found
     uintptr_t resolved_addrs[MAX_JMPS];
@@ -907,9 +935,13 @@ static void pre_resolve_got(pid_t pid, const char *so_path, uintptr_t elf_base) 
             if (!lsname[0]) continue;
 
             for (int j = 0; j < n_jmps; j++) {
-                if (resolved_addrs[j]) continue; // already resolved
-                if (strcmp(jmps[j].sym_name, lsname) == 0)
-                    resolved_addrs[j] = lib_elf_base + (uintptr_t)lsym.st_value;
+                if (strcmp(jmps[j].sym_name, lsname) != 0) continue;
+                uintptr_t cand = lib_elf_base + (uintptr_t)lsym.st_value;
+                // Prefer executable address; first exec match is final.
+                if (!resolved_addrs[j])
+                    resolved_addrs[j] = cand;
+                else if (is_exec_addr(cand) && !is_exec_addr(resolved_addrs[j]))
+                    resolved_addrs[j] = cand;
             }
         }
         free(lstrtab);
@@ -922,6 +954,11 @@ static void pre_resolve_got(pid_t pid, const char *so_path, uintptr_t elf_base) 
     for (int i = 0; i < n_jmps; i++) {
         if (!resolved_addrs[i]) {
             zerr("pre_resolve: MISS sym=%s", jmps[i].sym_name);
+            continue;
+        }
+        if (!is_exec_addr(resolved_addrs[i])) {
+            zerr("pre_resolve: SKIP sym=%s addr=0x%lx non-exec — would SIGSEGV code=2",
+                 jmps[i].sym_name, (unsigned long)resolved_addrs[i]);
             continue;
         }
         uintptr_t slot = elf_base + (uintptr_t)jmps[i].r_offset;
