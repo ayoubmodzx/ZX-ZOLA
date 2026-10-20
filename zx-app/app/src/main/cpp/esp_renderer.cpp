@@ -493,6 +493,7 @@ static const char *k_lft_names[]   = { "LeftFoot","l_foot","Bip001 L Foot","mixa
 static const char *k_rft_names[]   = { "RightFoot","r_foot","Bip001 R Foot","mixamo:RightFoot","foot_r",nullptr };
 
 // Get a child Transform by bone name candidates — searches all candidate names
+// Shallow fallback: only immediate children (kept for fallback path)
 static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
     if (!transform) return nullptr;
     MethodInfo *findM = Il2Cpp::getMethod(
@@ -504,6 +505,68 @@ static Il2CppObject *find_bone(Il2CppObject *transform, const char **names) {
         if (!nameStr) continue;
         Il2CppObject *bone = Il2Cpp::invoke1(findM, transform, nameStr);
         if (bone) return bone;
+    }
+    return nullptr;
+}
+
+// Direct UTF-16 comparison on an IL2CppString — no alloc, no API call
+static bool il2cpp_str_eq(Il2CppObject *ms, const char *ascii) {
+    if (!ms || !ascii) return false;
+    int32_t len;
+    __builtin_memcpy(&len, (const char*)ms + sizeof(Il2CppObject), sizeof(int32_t));
+    const uint16_t *ch = (const uint16_t*)((const char*)ms + sizeof(Il2CppObject) + 4);
+    int n = (int)strlen(ascii);
+    if (len != n) return false;
+    for (int i = 0; i < n; i++)
+        if (ch[i] != (uint16_t)(unsigned char)ascii[i]) return false;
+    return true;
+}
+
+// Deep bone search — iterative DFS through the full transform hierarchy.
+// Free Fire rigs nest bones 4-6 levels deep; Transform.Find only reaches
+// immediate children. Falls back to find_bone if icalls can't be resolved.
+static Il2CppObject *find_bone_deep(Il2CppObject *root_tr, const char **names) {
+    if (!root_tr) return nullptr;
+
+    static MethodInfo *s_cnt  = nullptr;
+    static MethodInfo *s_get  = nullptr;
+    static MethodInfo *s_name = nullptr;
+
+    if (!s_cnt) {
+        Il2CppClass *trCls  = Il2Cpp::cls("Transform", "UnityEngine");
+        Il2CppClass *objCls = Il2Cpp::cls("Object",    "UnityEngine");
+        if (trCls) {
+            s_cnt = Il2Cpp::getMethod(trCls, "get_childCount", 0);
+            s_get = Il2Cpp::getMethod(trCls, "GetChild",       1);
+        }
+        if (objCls) s_name = Il2Cpp::getMethod(objCls, "get_name", 0);
+    }
+    if (!s_cnt || !s_get || !s_name)
+        return find_bone(root_tr, names);
+
+    Il2CppObject *stack[128];
+    int top = 0;
+    stack[top++] = root_tr;
+
+    while (top > 0) {
+        Il2CppObject *cur = stack[--top];
+        if (!cur) continue;
+
+        Il2CppObject *nameObj = Il2Cpp::invoke0(s_name, cur);
+        if (nameObj) {
+            for (int ni = 0; names[ni]; ni++)
+                if (il2cpp_str_eq(nameObj, names[ni])) return cur;
+        }
+
+        Il2CppObject *cntBoxed = Il2Cpp::invoke0(s_cnt, cur);
+        int32_t count = 0;
+        if (cntBoxed) __builtin_memcpy(&count, (char*)cntBoxed + sizeof(Il2CppObject), sizeof(int32_t));
+
+        // Push children in reverse order so first child is processed first
+        for (int32_t i = count - 1; i >= 0 && top < 127; i--) {
+            Il2CppObject *child = Il2Cpp::invoke1(s_get, cur, (void*)&i);
+            if (child) stack[top++] = child;
+        }
     }
     return nullptr;
 }
@@ -595,9 +658,15 @@ static void *position_updater(void *) {
     // Wait for il2cpp full init
     sleep(4);
 
-    Il2CppClass *playerCls = Il2Cpp::cls("CSPlayerState");
+    Il2CppClass *playerCls = nullptr;
+    {
+        static const char *kPlayerCls[] = {"CSPlayerState","PlayerState","CSPlayerAgent",
+                                           "BasePlayer","PlayerInfo","CharacterState",nullptr};
+        for (const char **n = kPlayerCls; *n && !playerCls; n++)
+            playerCls = Il2Cpp::cls(*n);
+    }
     if (!playerCls) {
-        LE("CSPlayerState not found in position_updater");
+        LE("Player class not found in position_updater");
         return nullptr;
     }
 
@@ -606,6 +675,12 @@ static void *position_updater(void *) {
     MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component", "UnityEngine"), "get_transform", 0);
     // Resolved once — playerCls never changes, no point re-querying every 50ms per player
     FieldInfo *aliveF = Il2Cpp::getField(playerCls, "IsAlive");
+    // Local-player marker field — try multiple name candidates
+    static const char *kLocalNames[] = {"IsLocalPlayer","isLocalPlayer","m_isLocalPlayer",
+                                        "IsLocal","bLocalPlayer","isLocal",nullptr};
+    FieldInfo *localF = nullptr;
+    for (const char **n = kLocalNames; *n && !localF; n++)
+        localF = Il2Cpp::getField(playerCls, *n);
 
     while (true) {
         usleep(50000); // 50ms — smooth update, no CPU burn
@@ -615,8 +690,13 @@ static void *position_updater(void *) {
         int player_count = 0;
         Il2Cpp::findObjectsOfType(playerCls, &players, &player_count);
 
-        // Update local player reference
-        g_local_player = Il2Cpp::getLocalInstance(playerCls);
+        // Identify local player from already-fetched array (avoids second FindObjectsOfType)
+        g_local_player = nullptr;
+        for (int i = 0; i < player_count && !g_local_player; i++) {
+            if (!players[i]) continue;
+            if (localF && Il2Cpp::getFieldBool(players[i], localF))
+                g_local_player = players[i];
+        }
         Vec3 local_pos = get_local_pos();
 
         EnemyData new_cache[MAX_ENM];
@@ -644,12 +724,12 @@ static void *position_updater(void *) {
             if (!bc && s_bone_cache_n < MAX_ENM) {
                 bc = &s_bone_cache[s_bone_cache_n++];
                 bc->player_ptr = p;
-                bc->head_b  = find_bone(tr, k_head_names);
-                bc->chest_b = find_bone(tr, k_chest_names);
-                bc->lsh_b   = find_bone(tr, k_lsh_names);
-                bc->rsh_b   = find_bone(tr, k_rsh_names);
-                bc->lft_b   = find_bone(tr, k_lft_names);
-                bc->rft_b   = find_bone(tr, k_rft_names);
+                bc->head_b  = find_bone_deep(tr, k_head_names);
+                bc->chest_b = find_bone_deep(tr, k_chest_names);
+                bc->lsh_b   = find_bone_deep(tr, k_lsh_names);
+                bc->rsh_b   = find_bone_deep(tr, k_rsh_names);
+                bc->lft_b   = find_bone_deep(tr, k_lft_names);
+                bc->rft_b   = find_bone_deep(tr, k_rft_names);
             }
             Il2CppObject *head_b  = bc ? bc->head_b  : nullptr;
             Il2CppObject *chest_b = bc ? bc->chest_b : nullptr;
