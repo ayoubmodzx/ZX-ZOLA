@@ -1158,12 +1158,24 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     regs.regs[0] = remote_buf;   // path
     regs.regs[1] = RTLD_NOW;     // flags
     regs.regs[2] = 0;            // extinfo = NULL
-    // caller_addr: libmain.so+0x1000 → do_dlopen resolves in FF's app namespace.
+    // caller_addr: any FF native lib base+0x1000 → do_dlopen resolves in FF's app namespace.
+    // libmain.so may be absent in some FF versions; fall back through known Unity/FF libs.
     {
-        uintptr_t libmain_base = ProcMem::findLibBase(pid, "libmain.so");
-        regs.regs[3] = libmain_base ? libmain_base + 0x1000 : dlopen_addr;
-        zerr("remote_dlopen: caller_addr=0x%lx (libmain_base=0x%lx)",
-             (unsigned long)regs.regs[3], (unsigned long)libmain_base);
+        static const char *const kNSLibs[] = {
+            "libmain.so", "libil2cpp.so", "libunity.so", "libGameSDK.so",
+            "libtersafe.so", "libUE4.so", nullptr
+        };
+        uintptr_t ff_ns_base = 0;
+        const char *ff_ns_name = nullptr;
+        for (int li = 0; kNSLibs[li] && !ff_ns_base; li++) {
+            ff_ns_base = ProcMem::findLibBase(pid, kNSLibs[li]);
+            if (ff_ns_base) ff_ns_name = kNSLibs[li];
+        }
+        regs.regs[3] = ff_ns_base ? ff_ns_base + 0x1000 : dlopen_addr;
+        zerr("remote_dlopen: caller_addr=0x%lx via %s (base=0x%lx)",
+             (unsigned long)regs.regs[3],
+             ff_ns_name ? ff_ns_name : "dlopen_fallback",
+             (unsigned long)ff_ns_base);
     }
     regs.pc = sc_addr;
 
@@ -1623,13 +1635,21 @@ int main(int argc, char *argv[]) {
             // Parse /proc/<pid>/maps to extract directory of libmain.so
             char ff_lib_dir[512] = {};
             {
+                // libmain.so may be absent in some FF versions — try several known Unity/FF libs
+                static const char *const kDirLibs[] = {
+                    "libmain.so", "libil2cpp.so", "libunity.so", "libGameSDK.so",
+                    "libtersafe.so", "libUE4.so", nullptr
+                };
                 char maps_path[64];
                 snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
                 FILE *mf = fopen(maps_path, "r");
                 if (mf) {
                     char mline[1024];
-                    while (fgets(mline, sizeof(mline), mf)) {
-                        if (!strstr(mline, "libmain.so")) continue;
+                    while (fgets(mline, sizeof(mline), mf) && !ff_lib_dir[0]) {
+                        bool matched = false;
+                        for (int li = 0; kDirLibs[li] && !matched; li++)
+                            if (strstr(mline, kDirLibs[li])) matched = true;
+                        if (!matched) continue;
                         if (!strstr(mline, "r-xp") && !strstr(mline, "r--p")) continue;
                         char mpath[512] = {};
                         if (sscanf(mline, "%*lx-%*lx %*s %*lx %*s %*lu %511[^\n]", mpath) == 1) {
@@ -1643,7 +1663,6 @@ int main(int argc, char *argv[]) {
                                 }
                             }
                         }
-                        break;
                     }
                     fclose(mf);
                 }
