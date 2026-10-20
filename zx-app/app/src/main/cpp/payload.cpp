@@ -6,6 +6,7 @@
 #include "esp_renderer.hpp"
 #include "stealth_ext7.hpp"
 #include <android/log.h>
+#include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/prctl.h>
@@ -118,11 +119,21 @@ static void *ctrl_loop(void *) {
 extern "C" __attribute__((visibility("default"), used))
 void unity_render_thread_init() {
     LOG("ZX-ZOLA payload start");
+    // Resolve pthread via dlsym BEFORE calling AntiDetect::install().
+    // dlsym's GOT entry is always correctly written by the injector (libdl.so is
+    // stable across sessions); pthread_create/detach PLT entries may point to a
+    // non-executable libc copy when the process has multiple libc mappings.
+    typedef int (*fn_pc_t)(pthread_t*, const pthread_attr_t*, void*(*)(void*), void*);
+    typedef int (*fn_pd_t)(pthread_t);
+    auto real_pthread_create = (fn_pc_t)dlsym(RTLD_DEFAULT, "pthread_create");
+    auto real_pthread_detach = (fn_pd_t)dlsym(RTLD_DEFAULT, "pthread_detach");
     AntiDetect::install();
     _unity_gfx_params.live.fetch_or(1, std::memory_order_relaxed); // bit0 = anti-detect installed
-    pthread_t t;
-    pthread_create(&t, nullptr, ctrl_loop, nullptr);
-    pthread_detach(t);
+    if (real_pthread_create) {
+        pthread_t t;
+        real_pthread_create(&t, nullptr, ctrl_loop, nullptr);
+        if (real_pthread_detach) real_pthread_detach(t);
+    }
 }
 
 // Constructor is intentionally a no-op so dlopen completes without touching PLT.

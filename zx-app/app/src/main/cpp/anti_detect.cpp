@@ -106,25 +106,39 @@ struct Obf {
 // ═════════════════════════════════════════════════════════════════════════════
 
 struct RwxPage { uintptr_t start; uintptr_t end; };
-static constexpr int      MAX_RWX = 128;
-static RwxPage            g_rwx[MAX_RWX];
-static int                g_rwx_n = 0;
-static pthread_mutex_t    g_rwx_mu = PTHREAD_MUTEX_INITIALIZER;
+static constexpr int     MAX_RWX = 128;
+static RwxPage           g_rwx[MAX_RWX];
+static int               g_rwx_n = 0;
+// Spinlock instead of pthread_mutex — zero PLT dependency.
+// Injector's pre_resolve can write wrong (non-executable) libc addresses into
+// our GOT; using pthread_mutex_lock through PLT would SIGSEGV before live is set.
+// std::atomic uses inline LL/SC instructions — no external function calls.
+static std::atomic<int>  g_rwx_lock{0};
+
+static inline void rwx_lock()   {
+    int exp = 0;
+    while (!g_rwx_lock.compare_exchange_weak(exp, 1,
+            std::memory_order_acquire, std::memory_order_relaxed))
+        exp = 0;
+}
+static inline void rwx_unlock() {
+    g_rwx_lock.store(0, std::memory_order_release);
+}
 
 void zx_track_rwx_page(void *p, size_t sz) {
     if (!p || sz == 0) return;
-    pthread_mutex_lock(&g_rwx_mu);
+    rwx_lock();
     if (g_rwx_n < MAX_RWX)
         g_rwx[g_rwx_n++] = { (uintptr_t)p, (uintptr_t)p + sz };
-    pthread_mutex_unlock(&g_rwx_mu);
+    rwx_unlock();
 }
 
 static bool addr_is_ours(uintptr_t a) {
-    pthread_mutex_lock(&g_rwx_mu);
+    rwx_lock();
     bool found = false;
     for (int i = 0; i < g_rwx_n && !found; i++)
         found = (a >= g_rwx[i].start && a < g_rwx[i].end);
-    pthread_mutex_unlock(&g_rwx_mu);
+    rwx_unlock();
     return found;
 }
 
