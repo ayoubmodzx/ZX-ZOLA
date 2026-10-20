@@ -147,12 +147,26 @@ static void freeze_threads_safe(pid_t pid) {
         if (e->d_name[0] == '.') continue;
         pid_t tid = (pid_t)atoi(e->d_name);
         if (tid <= 0 || tid == pid) continue;
-        if (is_anogs_thread(pid, tid)) {
-            LOG("freeze: skip tid=%d (AnoSDK/ctrl)", tid);
+        // Skip ONLY our own ctrl_loop (kworker/*).
+        // AnoSDK scanner threads ARE frozen here — if left running they escalate
+        // from sigqueue(SIGABRT) to exit_group(127) after 2 suppressed signals,
+        // killing the whole process mid-injection. SIGSTOP leaves no TracerPid
+        // in /proc so it's undetectable by AnoSDK's ptrace self-check.
+        char comm_buf[32] = {};
+        char cpath[64];
+        snprintf(cpath, sizeof(cpath), "/proc/%d/task/%d/comm", pid, tid);
+        int cfd = open(cpath, O_RDONLY | O_CLOEXEC);
+        if (cfd >= 0) { read(cfd, comm_buf, sizeof(comm_buf) - 1); close(cfd); }
+        if (strncmp(comm_buf, "kworker", 7) == 0) {
+            LOG("freeze: skip tid=%d (our ctrl_loop)", tid);
             continue;
         }
-        if (kill(tid, SIGSTOP) == 0)
+        bool is_ano = is_anogs_thread(pid, tid);
+        if (kill(tid, SIGSTOP) == 0) {
+            if (is_ano)
+                LOG("freeze: SIGSTOP tid=%d (AnoSDK scanner — preventing exit_group)", tid);
             s_sigstop_tids[s_sigstop_n++] = tid;
+        }
     }
     closedir(d);
     usleep(8000);
@@ -1510,8 +1524,15 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                     for (int drain = 0; drain < 64; drain++) {
                         waitpid(pid, &st2, 0);
                         if (WIFSIGNALED(st2)) {
-                            // AnoSDK's watchdog delivered SIGKILL — process is dead
                             zerr("remote_dlopen: init_fn KILLED termsig=%d (AnoSDK watchdog)", WTERMSIG(st2));
+                            proc_dead = true; break;
+                        }
+                        if (WIFEXITED(st2)) {
+                            // Scanner thread called exit_group(127) after 2 suppressed SIGABRTs.
+                            // freeze_threads_safe now stops scanner threads so this path is
+                            // a fallback — mark dead so we stop retrying on a corpse.
+                            zerr("remote_dlopen: init_fn process exited code=%d (AnoSDK scanner exit_group)",
+                                 WEXITSTATUS(st2));
                             proc_dead = true; break;
                         }
                         if (!WIFSTOPPED(st2)) {
