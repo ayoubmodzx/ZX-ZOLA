@@ -186,13 +186,11 @@ class ZxOverlayService : Service() {
                             // First detection — start the stabilisation timer
                             ffFirstSeenMs = now
                         } else if (now - ffFirstSeenMs >= FF_INJECT_DELAY_MS) {
-                            // FF has been running for at least 5 s — safe to inject
+                            // FF has been running for at least 5 s — connect to Zygisk module
                             isConnected   = true
                             ffFirstSeenMs = 0L
                             setConnected(pid)
-                            // Inject payload — installs all anti-detect layers.
-                            // cmd=0 is a no-op for features; only protection installs.
-                            ZxEngine.toggle(0, false)
+                            ZxEngine.connect()
                             // Hide overlay while FF is in foreground
                             if (fabVisible) toggleFabVisibility()
                         }
@@ -200,6 +198,7 @@ class ZxOverlayService : Service() {
                     } else if (!running && isConnected) {
                         isConnected   = false
                         ffFirstSeenMs = 0L
+                        ZxEngine.disconnect()
                         setDisconnected()
                         if (!fabVisible) toggleFabVisibility()
                     } else if (!running) {
@@ -584,7 +583,7 @@ class ZxOverlayService : Service() {
     }
 
     private fun buildLogsContent() {
-        if (::footerCountTv.isInitialized) footerCountTv.text = "INJECTION CONSOLE"
+        if (::footerCountTv.isInitialized) footerCountTv.text = "IPC CONSOLE"
 
         val hdr = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -595,7 +594,7 @@ class ZxOverlayService : Service() {
             ).also { it.bottomMargin = dp(6) }
         }
         hdr.addView(TextView(this).apply {
-            text = "INJECTION LOG"
+            text = "IPC LOG"
             setTextColor(Color.parseColor("#7C4DFF"))
             textSize = 9f; letterSpacing = 0.15f
             typeface = android.graphics.Typeface.MONOSPACE
@@ -818,13 +817,13 @@ class ZxOverlayService : Service() {
     }
 
     private fun onInjectResult(cmd: Int, ok: Boolean, msg: String) {
-        if (ok) ZxLog.i("inject cmd=$cmd: SHIELD OK") else ZxLog.e("inject cmd=$cmd FAIL: $msg")
+        if (ok) ZxLog.i("cmd=$cmd: $msg") else ZxLog.e("cmd=$cmd FAIL: $msg")
         if (!::statusText.isInitialized) return
         val pid = ZxEngine.getTargetPid()
         val pidStr = if (pid > 0) "PID $pid" else ""
         when {
             cmd == 0 && ok -> {
-                statusText.text = if (pidStr.isNotEmpty()) "$pidStr · SHIELD ✓" else "SHIELD ✓"
+                statusText.text = if (pidStr.isNotEmpty()) "$pidStr · LIVE ✓" else "LIVE ✓"
                 statusText.setTextColor(Color.parseColor("#00E676"))
             }
             cmd == 0 && !ok -> {

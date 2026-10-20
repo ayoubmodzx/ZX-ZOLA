@@ -5,6 +5,8 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import java.io.File
+import java.io.OutputStream
+import java.util.concurrent.atomic.AtomicReference
 
 object ZxEngine {
 
@@ -52,25 +54,22 @@ object ZxEngine {
         const val ESP               = 5
     }
 
+    private var clientBinPath: String = ""
     private var targetPid: Int = -1
-    private var payloadPath: String = ""
-    private var injectorPath: String = ""
-    private val cmdLock = Any()
+
     private val bgThread = HandlerThread("zx-engine").also { it.start() }
     private val bgHandler = Handler(bgThread.looper)
+
+    // Persistent zx_client --loop process
+    private val clientProc  = AtomicReference<Process?>(null)
+    private val clientStdin = AtomicReference<OutputStream?>(null)
+
     var onStatusUpdate: ((cmd: Int, ok: Boolean, msg: String) -> Unit)? = null
 
     fun init(context: Context) {
-        val appCtx = context.applicationContext
-        val libDir = appCtx.applicationInfo.nativeLibraryDir
-        payloadPath  = File(libDir, "libunity_render.so").absolutePath
-        injectorPath = File(libDir, "libunity_ndk.so").absolutePath
-        Log.i("ZxEngine", "injector=$injectorPath  payload=$payloadPath")
-        ZxLog.i("libDir: $libDir")
-        ZxLog.i("injector: $injectorPath")
-        ZxLog.i("  exists=${File(injectorPath).exists()}  exec=${File(injectorPath).canExecute()}")
-        ZxLog.i("payload: $payloadPath")
-        ZxLog.i("  exists=${File(payloadPath).exists()}")
+        val libDir = context.applicationContext.applicationInfo.nativeLibraryDir
+        clientBinPath = File(libDir, "libzx_client.so").absolutePath
+        ZxLog.i("zx_client: $clientBinPath  exists=${File(clientBinPath).exists()}")
     }
 
     fun isFfRunning(): Boolean = try {
@@ -79,60 +78,102 @@ object ZxEngine {
                 "pidof com.dts.freefireth 2>/dev/null || pidof com.garena.game.fftw 2>/dev/null"))
         val out = proc.inputStream.bufferedReader().readText().trim()
         proc.waitFor()
-        if (out.isNotEmpty()) { targetPid = out.trim().split(" ")[0].toIntOrNull() ?: -1 }
-        else { targetPid = -1 }
+        if (out.isNotEmpty()) targetPid = out.trim().split(" ")[0].toIntOrNull() ?: -1
+        else targetPid = -1
         out.isNotEmpty()
     } catch (e: Exception) { false }
 
     fun getTargetPid(): Int = targetPid
 
-    fun setTarget(pid: Int, path: String) {
-        targetPid = pid
-        payloadPath = path
-    }
-
-    fun toggle(cmd: Int, on: Boolean, intensity: Int = 0) {
-        if (targetPid <= 0) {
-            ZxLog.w("skip cmd=$cmd: pid not set")
-            return
-        }
-        val injector = injectorPath
-        if (injector.isEmpty()) {
-            ZxLog.w("skip cmd=$cmd: injectorPath empty")
-            return
-        }
-        val payload = payloadPath
+    // Start the persistent zx_client --loop process (called once when FF is detected)
+    fun connect() {
         bgHandler.post {
-            var injectOk  = false
-            var injectMsg = ""
-            synchronized(cmdLock) {
-                try {
-                    val en = if (on) 1 else 0
-                    // Quote both paths — nativeLibraryDir contains ~~hash==/ on Android 12+
-                    val cmd2 = "'$injector' $targetPid $cmd $en '$payload' $intensity"
-                    ZxLog.i("exec cmd=$cmd on=$on pid=$targetPid")
-                    val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd2))
-                    val stdout = proc.inputStream.bufferedReader().readText().trim()
-                    val stderr = proc.errorStream.bufferedReader().readText().trim()
-                    val rc = proc.waitFor()
-                    injectOk  = rc == 0
-                    injectMsg = if (rc == 0) "ok" else "rc=$rc ${stderr.takeLast(120)}"
-                    Log.i("ZxEngine", "toggle cmd=$cmd on=$on rc=$rc")
-                    ZxLog.i("rc=$rc cmd=$cmd on=$on")
-                    if (stdout.isNotEmpty()) ZxLog.i("out: $stdout")
-                    if (stderr.isNotEmpty()) ZxLog.e("err: $stderr")
-                } catch (e: Exception) {
-                    injectOk  = false
-                    injectMsg = e.message ?: "exception"
-                    Log.e("ZxEngine", "toggle failed: ${e.message}")
-                    ZxLog.e("ex: ${e.message}")
-                }
+            if (clientProc.get()?.let { isAlive(it) } == true) return@post
+            val bin = clientBinPath
+            if (bin.isEmpty() || !File(bin).exists()) {
+                ZxLog.e("zx_client not found: $bin")
+                onStatusUpdate?.invoke(0, false, "binary missing")
+                return@post
             }
-            onStatusUpdate?.invoke(cmd, injectOk, injectMsg)
+            try {
+                ZxLog.i("starting zx_client --loop")
+                val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "'$bin' --loop"))
+                clientProc.set(proc)
+                clientStdin.set(proc.outputStream)
+                // Drain stderr in background so it doesn't block
+                Thread {
+                    proc.errorStream.bufferedReader().forEachLine { ZxLog.i("cli: $it") }
+                }.also { it.isDaemon = true }.start()
+                ZxLog.i("zx_client --loop started (pid=$targetPid)")
+                onStatusUpdate?.invoke(0, true, "connected")
+            } catch (e: Exception) {
+                ZxLog.e("connect failed: ${e.message}")
+                onStatusUpdate?.invoke(0, false, e.message ?: "exception")
+            }
         }
     }
 
-    fun setIntensity(cmd: Int, pct: Int) {
-        toggle(cmd, true, pct)
+    fun disconnect() {
+        bgHandler.post {
+            clientProc.getAndSet(null)?.destroy()
+            clientStdin.getAndSet(null)
+            ZxLog.i("zx_client disconnected")
+        }
     }
+
+    // Send a feature command.  intensity is the raw display value (angle, %, or raw).
+    fun toggle(cmd: Int, on: Boolean, intensity: Int = 0) {
+        bgHandler.post {
+            val en  = if (on) 1 else 0
+            val flt = intensity.toFloat()
+            val line = if (intensity != 0) "$cmd $en $flt\n" else "$cmd $en\n"
+            if (!writeLine(line)) {
+                // Pipe died — reconnect once and retry
+                ZxLog.w("pipe dead — reconnecting")
+                reconnect()
+                writeLine(line)
+            }
+            ZxLog.i("cmd=$cmd on=$on intensity=$intensity")
+            onStatusUpdate?.invoke(cmd, true, if (on) "ON" else "OFF")
+        }
+    }
+
+    fun setIntensity(cmd: Int, pct: Int) = toggle(cmd, true, pct)
+
+    // ── Private ──────────────────────────────────────────────────────────────
+
+    private fun writeLine(line: String): Boolean {
+        return try {
+            val out = clientStdin.get() ?: return false
+            out.write(line.toByteArray(Charsets.UTF_8))
+            out.flush()
+            true
+        } catch (e: Exception) {
+            clientStdin.set(null)
+            clientProc.set(null)
+            false
+        }
+    }
+
+    private fun reconnect() {
+        clientProc.getAndSet(null)?.destroy()
+        clientStdin.set(null)
+        val bin = clientBinPath
+        if (bin.isEmpty() || !File(bin).exists()) return
+        try {
+            val proc = Runtime.getRuntime().exec(arrayOf("su", "-c", "'$bin' --loop"))
+            clientProc.set(proc)
+            clientStdin.set(proc.outputStream)
+            Thread {
+                proc.errorStream.bufferedReader().forEachLine { ZxLog.i("cli: $it") }
+            }.also { it.isDaemon = true }.start()
+            ZxLog.i("reconnected zx_client --loop")
+        } catch (e: Exception) {
+            ZxLog.e("reconnect failed: ${e.message}")
+        }
+    }
+
+    private fun isAlive(p: Process): Boolean = try {
+        p.exitValue(); false
+    } catch (e: IllegalThreadStateException) { true }
 }
