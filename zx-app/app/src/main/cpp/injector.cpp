@@ -1198,6 +1198,9 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     regs.regs[2] = 0;            // extinfo = NULL
     // caller_addr: any FF native lib base+0x1000 → do_dlopen resolves in FF's app namespace.
     // libmain.so may be absent in some FF versions; fall back through known Unity/FF libs.
+    // Wait up to 30s for at least one NS lib to appear — early injection (app opened before
+    // game) would otherwise inject before FF's core libs are mapped, causing do_dlopen to
+    // return NULL (wrong/no namespace) and a ghost r-- mapping with no r-xp text segment.
     {
         static const char *const kNSLibs[] = {
             "libmain.so", "libil2cpp.so", "libunity.so", "libGameSDK.so",
@@ -1205,15 +1208,23 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         };
         uintptr_t ff_ns_base = 0;
         const char *ff_ns_name = nullptr;
-        for (int li = 0; kNSLibs[li] && !ff_ns_base; li++) {
-            ff_ns_base = ProcMem::findLibBase(pid, kNSLibs[li]);
-            if (ff_ns_base) ff_ns_name = kNSLibs[li];
+        for (int wi = 0; wi < 30 && !ff_ns_base; wi++) {
+            for (int li = 0; kNSLibs[li] && !ff_ns_base; li++) {
+                ff_ns_base = ProcMem::findLibBase(pid, kNSLibs[li]);
+                if (ff_ns_base) ff_ns_name = kNSLibs[li];
+            }
+            if (!ff_ns_base) {
+                if (wi == 0) zerr("remote_dlopen: NS libs not loaded yet — waiting (up to 30s)...");
+                usleep(1000000); // 1s tick
+            }
         }
+        if (!ff_ns_base)
+            zerr("remote_dlopen: FF NS libs not found after 30s — dlopen may fail (no namespace)");
         regs.regs[3] = ff_ns_base ? ff_ns_base + 0x1000 : dlopen_addr;
-        zerr("remote_dlopen: caller_addr=0x%lx via %s (base=0x%lx)",
+        zerr("remote_dlopen: libmain_base=0x%lx caller_addr=0x%lx via %s",
+             (unsigned long)ff_ns_base,
              (unsigned long)regs.regs[3],
-             ff_ns_name ? ff_ns_name : "dlopen_fallback",
-             (unsigned long)ff_ns_base);
+             ff_ns_name ? ff_ns_name : "dlopen_fallback");
     }
     regs.pc = sc_addr;
 
@@ -1641,13 +1652,31 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
         zerr("remote_dlopen: __loader_dlopen@0x%lx bytes: %08x %08x %08x %08x",
              (unsigned long)loader_dlopen_addr, ldi[0], ldi[1], ldi[2], ldi[3]);
     }
+    // Ghost library guard: when handle==0 (dlopen failed) bionic may have partially
+    // mapped the .so (r-- ELF header/rodata) but left the r-xp text segment unmapped.
+    // in_maps=1 for a ghost — calling init_fn on a ghost crashes with SIGSEGV SEGV_MAPERR.
+    // Require an r-xp segment when handle==0 to distinguish real load from ghost mapping.
+    bool has_rxp = (handle != 0); // non-null handle always implies text was mapped
+    if (!has_rxp && in_maps) {
+        char mpath2[64]; snprintf(mpath2, sizeof(mpath2), "/proc/%d/maps", pid);
+        FILE *mf2 = fopen(mpath2, "r");
+        char mline2[512];
+        const char *bname2 = strrchr(so_path, '/');
+        bname2 = bname2 ? bname2 + 1 : so_path;
+        while (mf2 && fgets(mline2, sizeof(mline2), mf2))
+            if (strstr(mline2, bname2) && strstr(mline2, "r-xp")) { has_rxp = true; break; }
+        if (mf2) fclose(mf2);
+        if (!has_rxp)
+            zerr("remote_dlopen: ghost library detected (in_maps=1, handle=0, no r-xp) — aborting init_fn");
+    }
+
     // Valid handle: non-zero (includes PAC-tagged handles like 0x3e2b...063 on PAC devices)
-    // OR the library appeared in maps (handle may be an internal cookie).
+    // OR the library appeared in maps WITH an executable text segment (not a ghost).
     // Also require payload_init_ok: if AntiDetect bit never set we abort to prevent ban.
-    bool mapped_ok = (handle != 0) || in_maps;
+    bool mapped_ok = has_rxp && (handle != 0 || in_maps);
     bool ok = mapped_ok && payload_init_ok;
     if (!mapped_ok)
-        zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d", (unsigned long)handle, in_maps);
+        zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d has_rxp=%d", (unsigned long)handle, in_maps, has_rxp);
     if (mapped_ok && !payload_init_ok)
         zerr("remote_dlopen: SAFETY ABORT — .so mapped but ANTIDECT bit never set");
 
