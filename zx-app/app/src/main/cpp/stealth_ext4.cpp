@@ -511,23 +511,11 @@ static int (*g_orig_getaddrinfo)(const char*, const char*,
                                   const struct addrinfo*, struct addrinfo**) = nullptr;
 static int hook_getaddrinfo(const char *node, const char *service,
                              const struct addrinfo *hints, struct addrinfo **res) {
-    static bool c2_rdy = false;
-    static char gc2[4][20];
-    if (__builtin_expect(!c2_rdy, 0)) {
-        c2_rdy = true;
-        { static constexpr ObfS4<12> o("tencent.com"); o.decode(*(char(*)[12])gc2[0]); }
-        { static constexpr ObfS4<7>  o("qq.com");      o.decode(*(char(*)[7]) gc2[1]); }
-        { static constexpr ObfS4<11> o("anti-cheat");  o.decode(*(char(*)[11])gc2[2]); }
-        { static constexpr ObfS4<6>  o("anods");       o.decode(*(char(*)[6]) gc2[3]); }
-    }
-    if (node) {
-        for (int i = 0; i < 4; i++) {
-            if (gc2[i][0] && strstr(node, gc2[i])) {
-                LI("Layer42: C2 DNS blocked: %s", node);
-                return EAI_NONAME;
-            }
-        }
-    }
+    // DNS blocking removed: AnoSDK resolves tencent.com / qq.com to send
+    // heartbeat reports. Blocking DNS here causes zero reports → server flags
+    // device as "silent sensor" → ban. GGP network is already blocked at the
+    // socket layer in Layer 65 (caller-aware connect/sendto/sendmsg in ext9).
+    if (!g_orig_getaddrinfo) { errno = EAI_AGAIN; return EAI_AGAIN; }
     return g_orig_getaddrinfo(node, service, hints, res);
 }
 
