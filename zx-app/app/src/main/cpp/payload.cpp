@@ -9,6 +9,7 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/prctl.h>
 #include <sys/types.h>
 #include <atomic>
@@ -111,6 +112,20 @@ static void *ctrl_loop(void *) {
     return nullptr;
 }
 
+// SIGABRT shield: absorb AnoSDK's sigqueue(pid,SIGABRT) during install window.
+// si_code <= 0 means external kill (SI_QUEUE=-1, SI_USER=0); si_code > 0 is kernel.
+// bionic's own abort() uses SI_TKILL (-6) — also <= 0 but g_in_antidect_install=false by then.
+static volatile bool g_in_antidect_install = false;
+static struct sigaction g_old_sigabrt_sa = {};
+
+static void ano_sigabrt_shield(int, siginfo_t *info, void *) {
+    if (g_in_antidect_install && info && info->si_code <= 0) {
+        return; // drop AnoSDK's sigqueue SIGABRT during install window
+    }
+    sigaction(SIGABRT, &g_old_sigabrt_sa, nullptr);
+    raise(SIGABRT);
+}
+
 // Called explicitly by injector after GOT PAC-stripping — NOT a constructor.
 // On PAC-capable devices FF's bionic signs our GLOB_DAT GOT entries with PACIA,
 // so any PLT call in a constructor crashes with BR X16 on the signed pointer.
@@ -127,8 +142,23 @@ void unity_render_thread_init() {
     typedef int (*fn_pd_t)(pthread_t);
     auto real_pthread_create = (fn_pc_t)dlsym(RTLD_DEFAULT, "pthread_create");
     auto real_pthread_detach = (fn_pd_t)dlsym(RTLD_DEFAULT, "pthread_detach");
+
+    // Shield against AnoSDK's scanner firing sigqueue(pid,SIGABRT) while we install hooks.
+    // The scanner detects Dobby's mprotect(rwxp) and tries to kill the process mid-install.
+    {
+        struct sigaction sa = {};
+        sa.sa_sigaction = ano_sigabrt_shield;
+        sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGABRT, &sa, &g_old_sigabrt_sa);
+    }
+    g_in_antidect_install = true;
     AntiDetect::install();
+    g_in_antidect_install = false;
     _unity_gfx_params.live.fetch_or(1, std::memory_order_relaxed); // bit0 = anti-detect installed
+    // Restore old handler — install_ano_bypass() now owns AnoSDK's signal path.
+    sigaction(SIGABRT, &g_old_sigabrt_sa, nullptr);
+
     if (real_pthread_create) {
         pthread_t t;
         real_pthread_create(&t, nullptr, ctrl_loop, nullptr);

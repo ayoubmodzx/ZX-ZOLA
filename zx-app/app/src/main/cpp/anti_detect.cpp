@@ -486,9 +486,9 @@ void AntiDetect::install() {
     OBF_DECODE(anolib, "libanogs.so");
     void *ano = dlopen(anolib, RTLD_LAZY | RTLD_NOLOAD);
 
+    install_ano_bypass();       // AnoSDK bypass FIRST — neutralise scanner before hooks trigger detection
     install_ffutil_bypass();    // Layer 1
     install_proc_hider();       // Layer 2
-    install_ano_bypass();       // AnoSDK bypass (proc hider active, race window closed)
     install_anosdk_extended(ano); // Layer 3
     // Layer 5 (RWX tracker) is passive — populated by dobby_impl.cpp
     // Layer 6 (string obfuscation) is passive — compile-time only
