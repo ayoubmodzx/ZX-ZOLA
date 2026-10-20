@@ -143,7 +143,10 @@ static Il2CppClass *findClassByFields(const FieldPattern *p, int n, const char *
         int ok = 0;
         for (int i = 0; i < n; i++) {
             FieldInfo *f = Il2Cpp::getField(c, p[i].name);
-            if (!f || Il2Cpp::fieldTypeId(f) != IL2CPP_TYPE_R4) break;
+            if (!f) break;
+            uint8_t ft = Il2Cpp::fieldTypeId(f);
+            // Accept float (R4) or int (I4) — some FF builds store fireRate as integer ticks
+            if (ft != IL2CPP_TYPE_R4 && ft != IL2CPP_TYPE_I4) break;
             ok++;
         }
         if (ok == n) {

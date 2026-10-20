@@ -356,8 +356,6 @@ static int  (*orig_AnoInit)(int, void*, int)       = nullptr;
 static void (*orig_AnoOnPause)()                   = nullptr;
 static void (*orig_AnoOnResume)()                  = nullptr;
 static int  (*orig_AnoSetUser)(int,const char*,int)= nullptr;
-static int  (*orig_AnoIoctl)(int,void*,int)        = nullptr;
-static int  (*orig_SetPeriod)(int)                 = nullptr;
 
 // Lifecycle functions: pass through — blocking Init/Pause/Resume puts AnoSDK
 // in undefined state with no heartbeats sent, causing server-side ban.
@@ -366,19 +364,12 @@ static int  (*orig_SetPeriod)(int)                 = nullptr;
 static int hook_AnoInit(int id, void *d, int l) {
     return orig_AnoInit ? orig_AnoInit(id, d, l) : 0;
 }
-static int hook_AnoIoctl(int cmd, void *d, int l) {
-    return orig_AnoIoctl ? orig_AnoIoctl(cmd, d, l) : 0;
-}
 static void hook_AnoOnPause()  { if (orig_AnoOnPause)  orig_AnoOnPause(); }
 static void hook_AnoOnResume() { if (orig_AnoOnResume) orig_AnoOnResume(); }
 // SetUserInfo: pass through — server correlates reports by user ID;
 // anonymous reports (null user) are an anomaly signal.
 static int hook_AnoSetUser(int t, const char *u, int l) {
     return orig_AnoSetUser ? orig_AnoSetUser(t, u, l) : 0;
-}
-static int hook_SetPeriod(int ms) {
-    (void)ms;
-    return orig_SetPeriod ? orig_SetPeriod(0x7FFFFFFF) : 0;
 }
 __attribute__((naked))
 static void *hook_ScanNullify() {
@@ -408,16 +399,14 @@ static void install_anosdk_extended(void *h) {
     OBF_DECODE(s_pau, "AnoSDKOnPause");
     OBF_DECODE(s_res, "AnoSDKOnResume");
     OBF_DECODE(s_usr, "AnoSDKSetUserInfo");
-    OBF_DECODE(s_ict, "AnoSDKIoctl");
-    OBF_DECODE(s_scp, "set_check_period");
-    OBF_DECODE(s_acp, "ano_set_check_period");
+    // AnoSDKIoctl: already hooked call-through in install_ano_bypass() — no second hook.
+    // set_check_period: scan functions are nullified below; period is irrelevant.
+    //   Setting it to INT_MAX risks breaking heartbeats if AnoSDK uses the same
+    //   timer for both scan scheduling and report delivery — never touch it.
     try_hk(s_ini, (void*)hook_AnoInit,     (void**)&orig_AnoInit);
     try_hk(s_pau, (void*)hook_AnoOnPause,  (void**)&orig_AnoOnPause);
     try_hk(s_res, (void*)hook_AnoOnResume, (void**)&orig_AnoOnResume);
     try_hk(s_usr, (void*)hook_AnoSetUser,  (void**)&orig_AnoSetUser);
-    try_hk(s_ict, (void*)hook_AnoIoctl,    (void**)&orig_AnoIoctl);
-    try_hk(s_scp, (void*)hook_SetPeriod,   (void**)&orig_SetPeriod);
-    try_hk(s_acp, (void*)hook_SetPeriod,   nullptr);
 
     OBF_DECODE(si0, "inline_hook_opcode_dismatch");
     OBF_DECODE(si1, "set_inline_hook_error");
@@ -426,9 +415,11 @@ static void install_anosdk_extended(void *h) {
     OBF_DECODE(si4, "check_module_integrity");
     OBF_DECODE(si5, "scan_for_hooks");
     OBF_DECODE(si6, "verify_code_section");
-    OBF_DECODE(si7, "ptimer_start");
-    OBF_DECODE(si8, "ptimer_create");
-    const char *k_internal[] = {si0,si1,si2,si3,si4,si5,si6,si7,si8,nullptr};
+    // ptimer_start / ptimer_create intentionally excluded: AnoSDK uses POSIX timers
+    // for both scan scheduling AND heartbeat delivery. Nullifying them would stop
+    // heartbeats, causing a server-side "silent sensor" ban. Scan functions (si0-si6)
+    // are already nullified so timer callbacks return 0 harmlessly.
+    const char *k_internal[] = {si0,si1,si2,si3,si4,si5,si6,nullptr};
     int found = 0;
     for (int i = 0; k_internal[i]; i++) {
         void *a = DobbySymbolResolver(lib, k_internal[i]);

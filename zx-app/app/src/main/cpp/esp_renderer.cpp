@@ -604,6 +604,8 @@ static void *position_updater(void *) {
     discover_health(playerCls);
 
     MethodInfo *getT = Il2Cpp::getMethod(Il2Cpp::cls("Component", "UnityEngine"), "get_transform", 0);
+    // Resolved once — playerCls never changes, no point re-querying every 50ms per player
+    FieldInfo *aliveF = Il2Cpp::getField(playerCls, "IsAlive");
 
     while (true) {
         usleep(50000); // 50ms — smooth update, no CPU burn
@@ -625,7 +627,6 @@ static void *position_updater(void *) {
             if (!p || p == g_local_player) continue;
 
             // Check alive status
-            FieldInfo *aliveF = Il2Cpp::getField(playerCls, "IsAlive");
             bool alive = aliveF ? Il2Cpp::getFieldBool(p, aliveF) : true;
             if (!alive) continue;
 
