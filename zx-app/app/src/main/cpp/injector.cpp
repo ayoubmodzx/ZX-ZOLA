@@ -303,18 +303,25 @@ static int kill_new_scanner_threads(pid_t pid) {
 }
 
 // ── AnoSDK exit_group patcher ─────────────────────────────────────────────────
-// Scans libanogs.so's executable segments for the pattern:
-//   mov x8, #94   (0xD2800BC8)  — exit_group syscall number (ARM64 Linux = 94)
-//   svc #0        (0xD4000001)
-// and overwrites the `svc #0` with a NOP (0xD503201F).
-// This prevents ANY thread in AnoSDK from calling exit_group(127) during init_fn.
-// Caller must restore via restore_anogs_exit_group() after init_fn completes.
-static constexpr int MAX_EG_PATCHES = 32;
+// Scans executable segments for exit_group syscall patterns and NOPs the SVC.
+//
+// ARM64 exit_group = syscall #94 (0x5E). Two valid MOV encodings:
+//   MOV X8, #94  → 0xD2800BC8  (MOVZ 64-bit, sf=1)
+//   MOV W8, #94  → 0x52800BC8  (MOVZ 32-bit, sf=0 — zero-extends to X8)
+//   SVC #0       → 0xD4000001
+//
+// Scans: libanogs.so first, then libc.so as fallback (AnoSDK may call _exit/exit_group
+// through bionic wrappers, placing the SVC in libc rather than inline in libanogs).
+static constexpr int MAX_EG_PATCHES = 64;
 static uintptr_t s_eg_patch_addrs[MAX_EG_PATCHES];
 static int       s_eg_patch_count = 0;
 
-static int patch_anogs_exit_group(pid_t pid) {
-    s_eg_patch_count = 0;
+static int scan_and_patch_exit_group(pid_t pid, const char *lib_name, int remaining) {
+    static constexpr uint32_t SVC0        = 0xD4000001u;
+    static constexpr uint32_t NOP_INSN    = 0xD503201Fu;
+    static constexpr uint32_t MOV_X8_EG  = 0xD2800BC8u; // MOV X8, #94
+    static constexpr uint32_t MOV_W8_EG  = 0x52800BC8u; // MOV W8, #94
+
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
     FILE *mf = fopen(maps_path, "r");
@@ -322,50 +329,64 @@ static int patch_anogs_exit_group(pid_t pid) {
 
     int patched = 0;
     char line[512];
-    while (fgets(line, sizeof(line), mf) && patched < MAX_EG_PATCHES) {
-        // Only care about executable segments of libanogs.so / libanogs_
+    while (fgets(line, sizeof(line), mf) && patched < remaining) {
         if (strstr(line, "r-xp") == nullptr) continue;
-        bool is_anogs = strstr(line, "libanogs") != nullptr;
-        if (!is_anogs) continue;
+        if (strstr(line, lib_name) == nullptr) continue;
 
         uintptr_t seg_start = 0, seg_end = 0;
         if (sscanf(line, "%lx-%lx", &seg_start, &seg_end) != 2) continue;
-        zerr("patch_exit_group: scanning libanogs r-xp [0x%lx-0x%lx] (%lu KB)",
-             (unsigned long)seg_start, (unsigned long)seg_end,
+        zerr("patch_exit_group: scanning %s r-xp [0x%lx-0x%lx] (%lu KB)",
+             lib_name, (unsigned long)seg_start, (unsigned long)seg_end,
              (unsigned long)(seg_end - seg_start) / 1024);
 
-        // Read segment in 4KB chunks to avoid huge stack buffers
         static uint8_t chunk[4096];
-        for (uintptr_t addr = seg_start; addr + 7 < seg_end && patched < MAX_EG_PATCHES;
-             addr += sizeof(chunk) - 4) { // -4 to not miss pairs straddling chunks
+        for (uintptr_t addr = seg_start; addr + 8 <= seg_end && patched < remaining;
+             addr += sizeof(chunk) - 4) {
             size_t to_read = sizeof(chunk);
             if (addr + to_read > seg_end) to_read = seg_end - addr;
             if (!ProcMem::read(addr, chunk, to_read)) continue;
 
-            for (size_t i = 0; i + 7 < to_read && patched < MAX_EG_PATCHES; i += 4) {
+            for (size_t i = 0; i + 8 <= to_read && patched < remaining; i += 4) {
                 uint32_t w0, w1;
                 __builtin_memcpy(&w0, chunk + i,     4);
                 __builtin_memcpy(&w1, chunk + i + 4, 4);
-                // mov x8, #94 (exit_group) followed by svc #0
-                if (w0 == 0xD2800BC8u && w1 == 0xD4000001u) {
-                    uintptr_t svc_addr = addr + i + 4; // address of svc #0
-                    uint32_t nop = 0xD503201Fu;
-                    if (ProcMem::write(svc_addr, &nop, 4)) {
-                        zerr("patch_exit_group: NOP'd exit_group SVC @0x%lx",
-                             (unsigned long)svc_addr);
+                if (w1 != SVC0) continue;
+                // Accept both MOV X8,#94 and MOV W8,#94 before SVC #0
+                if (w0 != MOV_X8_EG && w0 != MOV_W8_EG) continue;
+
+                uintptr_t svc_addr = addr + i + 4;
+                uint32_t nop = NOP_INSN;
+                if (ProcMem::write(svc_addr, &nop, 4)) {
+                    zerr("patch_exit_group: NOP'd exit_group SVC @0x%lx (%s mov_enc=0x%08X)",
+                         (unsigned long)svc_addr, lib_name, w0);
+                    if (s_eg_patch_count < MAX_EG_PATCHES)
                         s_eg_patch_addrs[s_eg_patch_count++] = svc_addr;
-                        patched++;
-                    } else {
-                        zerr("patch_exit_group: WRITE FAILED @0x%lx",
-                             (unsigned long)svc_addr);
-                    }
+                    patched++;
+                } else {
+                    zerr("patch_exit_group: WRITE FAILED @0x%lx", (unsigned long)svc_addr);
                 }
             }
         }
     }
     fclose(mf);
-    if (patched == 0) zerr("patch_exit_group: NO exit_group pattern found in libanogs.so");
-    else              zerr("patch_exit_group: patched %d exit_group SVC(s)", patched);
+    return patched;
+}
+
+static int patch_anogs_exit_group(pid_t pid) {
+    s_eg_patch_count = 0;
+
+    // Primary: libanogs.so (inline syscall, either MOV X8 or MOV W8 variant)
+    int patched = scan_and_patch_exit_group(pid, "libanogs", MAX_EG_PATCHES);
+
+    if (patched == 0) {
+        zerr("patch_exit_group: 0 found in libanogs — trying libc.so (AnoSDK may call _exit through bionic)");
+        // Fallback: patch libc.so's exit_group syscall wrapper.
+        // Safe because ALL threads are frozen during init_fn; restored immediately after.
+        patched += scan_and_patch_exit_group(pid, "libc.so", MAX_EG_PATCHES - patched);
+    }
+
+    if (patched == 0) zerr("patch_exit_group: NO exit_group pattern found anywhere — AnoSDK uses obfuscated syscall");
+    else              zerr("patch_exit_group: patched %d exit_group SVC(s) total", patched);
     return patched;
 }
 
