@@ -1417,6 +1417,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
     // Now that GOT is pre-resolved and patched, call the real init symbol.
     // NOTE: sc_addr = remote_buf+path_aligned is still valid here — munmap happens AFTER.
+    bool payload_init_ok = false; // set to true only when antidect bit confirmed
     {
         uintptr_t sym_off  = find_sym_in_file(so_path, "unity_render_thread_init");
         // elf_base2 already computed above
@@ -1524,6 +1525,47 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                         }
                     }
                 } // end retry loop
+
+                // ── Live-bits safety gate ─────────────────────────────────────────────
+                // AntiDetect::install() runs synchronously in init_fn — bit0 of live
+                // is set before init_fn returns.  If bit0==0 here the AnoSDK bypass
+                // never installed → AnoSDK sees the process unmodified but we already
+                // wrote shellcode into it → DETECTABLE → abort so the account survives.
+                //
+                // ZxCtrl layout: cmd@+0 enable@+4 intensity@+8 ack@+12 live@+16
+                // std::atomic<int> stores plain int at its own base (no wrapper offset).
+                if (init_ok) {
+                    uintptr_t ctrl_off = find_sym_in_file(so_path, "_unity_gfx_params");
+                    if (ctrl_off && elf_base2) {
+                        uintptr_t live_addr = elf_base2 + ctrl_off + 16;
+                        int live_val = 0;
+                        ProcMem::read(live_addr, &live_val, sizeof(live_val));
+                        bool b0 = (live_val & 1) != 0; // antidect installed
+                        bool b1 = (live_val & 2) != 0; // il2cpp ready
+                        bool b2 = (live_val & 4) != 0; // features ready
+                        bool b3 = (live_val & 8) != 0; // loop ticked
+                        zerr("ZX-SAFETY: live=0x%x ANTIDECT=%s IL2CPP=%s FEATURES=%s LOOP=%s",
+                             live_val,
+                             b0 ? "OK"      : "FAIL",
+                             b1 ? "OK"      : "PENDING",
+                             b2 ? "OK"      : "PENDING",
+                             b3 ? "OK"      : "PENDING");
+                        if (b0) {
+                            zerr("ZX-SAFETY: *** HOOKS ACTIVE — AnoSDK bypass installed, safe to run ***");
+                            payload_init_ok = true;
+                        } else {
+                            zerr("ZX-SAFETY: *** ANTIDECT FAILED — ABORTING INJECTION TO PREVENT BAN ***");
+                            // init_ok stays true so set_regs restores thread, but
+                            // payload_init_ok=false causes remote_dlopen to return false.
+                        }
+                    } else {
+                        zerr("ZX-SAFETY: WARNING _unity_gfx_params sym not found "
+                             "(ctrl_off=0x%lx elf_base=0x%lx) — skipping safety gate, assuming OK",
+                             (unsigned long)ctrl_off, (unsigned long)elf_base2);
+                        payload_init_ok = true; // can't verify — optimistic continue
+                    }
+                }
+
                 set_regs(pid, &orig);
             }
         } else {
@@ -1562,10 +1604,14 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
              (unsigned long)loader_dlopen_addr, ldi[0], ldi[1], ldi[2], ldi[3]);
     }
     // Valid handle: non-zero (includes PAC-tagged handles like 0x3e2b...063 on PAC devices)
-    // OR the library appeared in maps (handle may be an internal cookie)
-    bool ok = (handle != 0) || in_maps;
-    if (!ok)
+    // OR the library appeared in maps (handle may be an internal cookie).
+    // Also require payload_init_ok: if AntiDetect bit never set we abort to prevent ban.
+    bool mapped_ok = (handle != 0) || in_maps;
+    bool ok = mapped_ok && payload_init_ok;
+    if (!mapped_ok)
         zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d", (unsigned long)handle, in_maps);
+    if (mapped_ok && !payload_init_ok)
+        zerr("remote_dlopen: SAFETY ABORT — .so mapped but ANTIDECT bit never set");
 
     return ok;
 }
