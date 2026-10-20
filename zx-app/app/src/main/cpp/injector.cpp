@@ -1496,12 +1496,50 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                     r2.pc = sc_addr;
                     set_regs(pid, &r2);
                     ptrace(PTRACE_CONT, pid, nullptr, nullptr);
-                    int st2 = 0; waitpid(pid, &st2, 0);
-                    pt_regs sr2; get_regs(pid, &sr2);
-                    if (WIFSTOPPED(st2) && WSTOPSIG(st2) == SIGTRAP && sr2.pc == sc_addr + 8) {
+
+                    // Drain loop — AnoSDK fires sigqueue(SIGABRT/RT, SI_QUEUE=-1) targeting
+                    // FF's main thread while init_fn runs.  ptrace intercepts signals before
+                    // the payload's own sigaction handler can absorb them.  Suppress external
+                    // signals (si_code<=0: SI_QUEUE=-1, SI_USER=0) with PTRACE_CONT(sig=0);
+                    // keep waiting for our BRK #0 (SIGTRAP at sc_addr+8).
+                    int st2 = 0;
+                    pt_regs sr2 = {};
+                    siginfo_t si2 = {};
+                    bool init_ok_attempt = false;
+                    bool proc_dead = false;
+                    for (int drain = 0; drain < 64; drain++) {
+                        waitpid(pid, &st2, 0);
+                        if (WIFSIGNALED(st2)) {
+                            // AnoSDK's watchdog delivered SIGKILL — process is dead
+                            zerr("remote_dlopen: init_fn KILLED termsig=%d (AnoSDK watchdog)", WTERMSIG(st2));
+                            proc_dead = true; break;
+                        }
+                        if (!WIFSTOPPED(st2)) {
+                            zerr("remote_dlopen: init_fn unexpected wstatus=0x%x", st2); break;
+                        }
+                        get_regs(pid, &sr2);
+                        int sig2 = WSTOPSIG(st2);
+                        if (sig2 == SIGTRAP && sr2.pc == sc_addr + 8) {
+                            init_ok_attempt = true; break;
+                        }
+                        // Check if this is an external queued/user signal from AnoSDK
+                        ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si2);
+                        if (si2.si_code <= 0) {
+                            // si_code=SI_QUEUE(-1) or SI_USER(0) = sigqueue from AnoSDK scanner
+                            // Suppress by continuing with sig=0 (don't deliver to tracee)
+                            zerr("remote_dlopen: init_fn suppressed external sig=%d code=%d (AnoSDK) drain=%d",
+                                 sig2, si2.si_code, drain);
+                            ptrace(PTRACE_CONT, pid, nullptr, (void*)0);
+                            continue;
+                        }
+                        // Non-external signal — fall through to diagnostic logging
+                        break;
+                    }
+
+                    if (init_ok_attempt) {
                         zerr("remote_dlopen: init_fn OK (attempt %d)", attempt + 1);
                         init_ok = true;
-                    } else {
+                    } else if (!proc_dead) {
                         int sig2 = WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1;
                         zerr("remote_dlopen: init_fn FAIL wst=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
                              st2, sig2, (unsigned long)sr2.pc, (long)sr2.pc - (long)sc_addr);
@@ -1512,8 +1550,6 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                         zerr("remote_dlopen: start regs X29=0x%lx X30=0x%lx SP=0x%lx pstate=0x%lx",
                              (unsigned long)sr2.regs[29], (unsigned long)sr2.regs[30],
                              (unsigned long)sr2.sp, (unsigned long)sr2.pstate);
-                        siginfo_t si2 = {};
-                        ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si2);
                         zerr("remote_dlopen: start siginfo signo=%d code=%d si_addr=0x%lx",
                              si2.si_signo, si2.si_code, (unsigned long)(uintptr_t)si2.si_addr);
                         uint64_t stk2[8] = {};
