@@ -254,10 +254,11 @@ jobs:
       # ── Upload artifact ──────────────────────────────────────────────────
       - name: Upload module ZIP
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: ${{ env.ZIPNAME }}
           path: ${{ env.ZIPNAME }}
-          retention-days: 30
+          retention-days: 1
 
       # ── Release on main branch push ──────────────────────────────────────
       - name: Create GitHub Release
