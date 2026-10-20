@@ -1,108 +1,202 @@
+// Two-phase AnoSDK bypass
+// Phase 1: Hook libc.so kill/exit/abort — fires BEFORE libanogs.so loads
+// Phase 2: Watcher thread waits for libanogs.so, then hooks its API layer
+//
+// CONSTRAINT: Never block AnoSDK heartbeat/init commands — only null out
+// scanner triggers and kill mechanisms to avoid server-side bans.
+
 #include "anosdk_bypass.hpp"
 #include "hook_engine.hpp"
 #include <dlfcn.h>
 #include <cstring>
+#include <unistd.h>
+#include <signal.h>
+#include <pthread.h>
+#include <sys/types.h>
 #include <android/log.h>
 
 #define TAG "ZX-ANO"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// ── Original function pointers ────────────────────────────────────────────────
-static int   (*orig_AnoSDKIoctl)(int cmd, void *data, int len)              = nullptr;
-static void* (*orig_AnoSDKGetReportData)(int *len)                          = nullptr;
-static void* (*orig_AnoSDKGetReportData2)(int type, int *len)               = nullptr;
-static void* (*orig_AnoSDKGetReportData3)(int type, int *len, int flag)     = nullptr;
-static void* (*orig_AnoSDKGetReportData4)(int type, int *len, int flag, int extra) = nullptr;
-static int   (*orig_ms_scan_start)(int type, void *param)                   = nullptr;
+// ── Original pointers — Phase 1 (libc.so) ────────────────────────────────────
+static void (*orig_exit)(int)        = nullptr;
+static void (*orig__exit)(int)       = nullptr;
+static void (*orig_abort)()          = nullptr;
+static int  (*orig_kill)(pid_t, int) = nullptr;
 
-// ── Intercepts ────────────────────────────────────────────────────────────────
+// ── Original pointers — Phase 2 (libanogs.so) ────────────────────────────────
+static int   (*orig_AnoSDKIoctl)(int, void *, int)            = nullptr;
+static void* (*orig_AnoSDKGetReportData)(int *)               = nullptr;
+static void* (*orig_AnoSDKGetReportData2)(int, int *)         = nullptr;
+static void* (*orig_AnoSDKGetReportData3)(int, int *, int)    = nullptr;
+static void* (*orig_AnoSDKGetReportData4)(int, int *, int, int) = nullptr;
+static int   (*orig_ms_scan_start)(int, void *)               = nullptr;
 
-// Block all ioctl commands — commands 0x100+ are usually "report hack" signals
-static int hook_AnoSDKIoctl(int cmd, void *data, int len) {
-    // Allow init commands (< 0x10) to pass — blocking those causes crashes
-    if (cmd < 0x10 && orig_AnoSDKIoctl)
-        return orig_AnoSDKIoctl(cmd, data, len);
-    // Drop all scan/report commands
+// ── Phase 1 hooks ─────────────────────────────────────────────────────────────
+
+// AnoSDK calls exit(1) or exit(127) to terminate the process.
+// Spin on the calling thread forever — that thread is AnoSDK's kill thread,
+// not the main game thread, so the game keeps running.
+[[noreturn]] static void hook_exit(int code) {
+    if (code != 0) {
+        LOGE("BLOCKED exit(%d) — AnoSDK kill suppressed", code);
+        for (;;) usleep(2000000);
+    }
+    // Normal clean shutdown (code == 0) — allow it
+    if (orig_exit) { orig_exit(0); __builtin_unreachable(); }
+    ::_Exit(0);
+}
+
+[[noreturn]] static void hook__exit(int code) {
+    if (code != 0) {
+        LOGE("BLOCKED _exit(%d) — AnoSDK kill suppressed", code);
+        for (;;) usleep(2000000);
+    }
+    if (orig__exit) { orig__exit(0); __builtin_unreachable(); }
+    ::_Exit(0);
+}
+
+// abort() → raises SIGABRT internally; just return to suppress it
+static void hook_abort() {
+    LOGE("BLOCKED abort() — AnoSDK kill suppressed");
+    // Return silently — caller's stack unwinds normally
+}
+
+// Block SIGABRT / SIGKILL sent to self — AnoSDK's kill(getpid(), SIGABRT) path
+static int hook_kill(pid_t pid, int sig) {
+    pid_t self = getpid();
+    if ((pid == self || pid == 0) &&
+        (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM)) {
+        LOGE("BLOCKED kill(%d, %d) to self — AnoSDK kill suppressed", pid, sig);
+        return 0;
+    }
+    if (orig_kill) return orig_kill(pid, sig);
     return 0;
 }
 
-// Return empty report buffers — no data = nothing to report to server
+// ── Phase 2 hooks ─────────────────────────────────────────────────────────────
+
+// Allow init/heartbeat Ioctl (cmd < 0x10) — server must receive heartbeats
+// or the account gets soft-banned. Drop scan/report commands.
+static int hook_AnoSDKIoctl(int cmd, void *data, int len) {
+    if (cmd < 0x10 && orig_AnoSDKIoctl)
+        return orig_AnoSDKIoctl(cmd, data, len);
+    return 0;
+}
+
 static void *hook_AnoSDKGetReportData(int *len) {
-    if (len) *len = 0;
-    return nullptr;
+    if (len) *len = 0; return nullptr;
 }
-
 static void *hook_AnoSDKGetReportData2(int type, int *len) {
-    (void)type;
-    if (len) *len = 0;
-    return nullptr;
+    (void)type; if (len) *len = 0; return nullptr;
 }
-
 static void *hook_AnoSDKGetReportData3(int type, int *len, int flag) {
-    (void)type; (void)flag;
-    if (len) *len = 0;
-    return nullptr;
+    (void)type; (void)flag; if (len) *len = 0; return nullptr;
 }
-
 static void *hook_AnoSDKGetReportData4(int type, int *len, int flag, int extra) {
-    (void)type; (void)flag; (void)extra;
-    if (len) *len = 0;
+    (void)type; (void)flag; (void)extra; if (len) *len = 0; return nullptr;
+}
+
+// Inline hook detector — return 0 (pretend: no hooks found)
+static int hook_ms_scan_start(int type, void *param) {
+    (void)type; (void)param; return 0;
+}
+
+// ── Phase 2 installer — called from watcher thread once libanogs.so loads ────
+static void installAnogsApiHooks() {
+    auto &e = HookEngine::get();
+
+    e.hookSym("libanogs.so", "AnoSDKIoctl",
+              (void *)hook_AnoSDKIoctl,
+              (void **)&orig_AnoSDKIoctl, "AnoIoctl");
+    e.hookSym("libanogs.so", "AnoSDKGetReportData",
+              (void *)hook_AnoSDKGetReportData,
+              (void **)&orig_AnoSDKGetReportData, "AnoRep1");
+    e.hookSym("libanogs.so", "AnoSDKGetReportData2",
+              (void *)hook_AnoSDKGetReportData2,
+              (void **)&orig_AnoSDKGetReportData2, "AnoRep2");
+    e.hookSym("libanogs.so", "AnoSDKGetReportData3",
+              (void *)hook_AnoSDKGetReportData3,
+              (void **)&orig_AnoSDKGetReportData3, "AnoRep3");
+    e.hookSym("libanogs.so", "AnoSDKGetReportData4",
+              (void *)hook_AnoSDKGetReportData4,
+              (void **)&orig_AnoSDKGetReportData4, "AnoRep4");
+    e.hookSym("libanogs.so", "ms_scan_start",
+              (void *)hook_ms_scan_start,
+              (void **)&orig_ms_scan_start, "MsScan");
+    // Internal syms — Dobby resolves via DobbySymbolResolver
+    e.hookSym("libanogs.so", "inline_hook_opcode_dismatch",
+              (void *)hook_ms_scan_start, nullptr, "IHookDetect");
+    e.hookSym("libanogs.so", "set_inline_hook_error",
+              (void *)hook_ms_scan_start, nullptr, "HookErrSet");
+
+    LOGI("Phase 2: API hooks installed on libanogs.so");
+}
+
+// ── Watcher thread ────────────────────────────────────────────────────────────
+static volatile bool g_watcher_stop = false;
+
+static void *libanos_watcher(void *) {
+    // Poll every 100ms for up to 60 seconds
+    for (int i = 0; i < 600 && !g_watcher_stop; ++i) {
+        usleep(100000);
+        void *h = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
+        if (h) {
+            dlclose(h);
+            LOGI("Watcher: libanogs.so appeared at %dms — hooking API", (i + 1) * 100);
+            installAnogsApiHooks();
+            return nullptr;
+        }
+    }
+    LOGE("Watcher: libanogs.so never appeared in 60s");
     return nullptr;
 }
 
-// Delay all memory scans — ms_scan_start is the inline hook detector
-static int hook_ms_scan_start(int type, void *param) {
-    (void)type; (void)param;
-    return 0;  // Pretend scan ran successfully but did nothing
+// ── Public API ────────────────────────────────────────────────────────────────
+
+void AnoBypass::installEarly() {
+    auto &e = HookEngine::get();
+
+    bool e1 = e.hookSym("libc.so", "exit",
+                         (void *)hook_exit,  (void **)&orig_exit,   "ExitBlock");
+    bool e2 = e.hookSym("libc.so", "_exit",
+                         (void *)hook__exit, (void **)&orig__exit,  "_ExitBlock");
+    bool e3 = e.hookSym("libc.so", "abort",
+                         (void *)hook_abort, nullptr,               "AbortBlock");
+    bool e4 = e.hookSym("libc.so", "kill",
+                         (void *)hook_kill,  (void **)&orig_kill,   "KillBlock");
+
+    // Belt-and-suspenders: also ignore SIGABRT at the signal level
+    struct sigaction sa{};
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, nullptr);
+
+    LOGI("Phase 1 early hooks: exit=%d _exit=%d abort=%d kill=%d", e1, e2, e3, e4);
 }
 
-// ── Install / Remove ─────────────────────────────────────────────────────────
+void AnoBypass::startWatcher() {
+    pthread_t tid;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&tid, &attr, libanos_watcher, nullptr) == 0) {
+        LOGI("Phase 2: libanogs.so watcher thread started");
+    } else {
+        LOGE("Phase 2: failed to create watcher thread — installing now (may fail)");
+        installAnogsApiHooks();
+    }
+    pthread_attr_destroy(&attr);
+}
+
 bool AnoBypass::install() {
-    auto &engine = HookEngine::get();
-    bool ok = true;
-
-    ok &= engine.hookSym("libanogs.so", "AnoSDKIoctl",
-                         (void *)hook_AnoSDKIoctl,
-                         (void **)&orig_AnoSDKIoctl, "AnoIoctl");
-
-    ok &= engine.hookSym("libanogs.so", "AnoSDKGetReportData",
-                         (void *)hook_AnoSDKGetReportData,
-                         (void **)&orig_AnoSDKGetReportData, "AnoReport1");
-
-    ok &= engine.hookSym("libanogs.so", "AnoSDKGetReportData2",
-                         (void *)hook_AnoSDKGetReportData2,
-                         (void **)&orig_AnoSDKGetReportData2, "AnoReport2");
-
-    ok &= engine.hookSym("libanogs.so", "AnoSDKGetReportData3",
-                         (void *)hook_AnoSDKGetReportData3,
-                         (void **)&orig_AnoSDKGetReportData3, "AnoReport3");
-
-    ok &= engine.hookSym("libanogs.so", "AnoSDKGetReportData4",
-                         (void *)hook_AnoSDKGetReportData4,
-                         (void **)&orig_AnoSDKGetReportData4, "AnoReport4");
-
-    // ms_scan_start is NOT exported from libanogs.so (confirmed via nm -D on real binary).
-    // It appears as an internal symbol — DobbySymbolResolver can find it.
-    // inline_hook_opcode_dismatch is also confirmed as an internal symbol.
-    // HookEngine::hookSym falls back to DobbySymbolResolver automatically.
-    engine.hookSym("libanogs.so", "ms_scan_start",
-                   (void *)hook_ms_scan_start,
-                   (void **)&orig_ms_scan_start, "MsScan");
-
-    // Also hook the inline-hook detector directly (confirmed internal sym)
-    engine.hookSym("libanogs.so", "inline_hook_opcode_dismatch",
-                   (void *)hook_ms_scan_start,   // same stub is fine — return 0
-                   nullptr, "InlineHookDetect");
-    engine.hookSym("libanogs.so", "set_inline_hook_error",
-                   (void *)hook_ms_scan_start,
-                   nullptr, "SetHookError");
-
-    LOGI("AnoSDK bypass installed, hooks: %zu", engine.count());
-    return ok;
+    installEarly();
+    startWatcher();
+    return true;
 }
 
 void AnoBypass::remove() {
-    // Let HookEngine::unhookAll() handle cleanup
+    g_watcher_stop = true;
     LOGI("AnoSDK bypass removed");
 }

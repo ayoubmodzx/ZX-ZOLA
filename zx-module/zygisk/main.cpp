@@ -53,24 +53,30 @@ public:
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!m_target) return;
 
+        // Phase 1: Hook libc.so kill/exit/abort IMMEDIATELY on the main thread.
+        // libc.so is always loaded at this point — hooks succeed before any game
+        // library (including libanogs.so) has a chance to load and call exit().
+        AnoBypass::installEarly();
+
         g_worker.start();
 
         g_worker.post([] {
-            // 1. Hide ourselves from AnoSDK memory scan first
+            // Hide ourselves from AnoSDK memory scan
             if (MemoryGuard::init()) {
                 MemoryGuard::hideSelf();
             }
 
-            // 2. Intercept AnoSDK reporting — BEFORE it initializes
-            AnoBypass::install();
+            // Phase 2: Start watcher thread that polls for libanogs.so and
+            // installs SDK-level API hooks once it appears (~100ms intervals)
+            AnoBypass::startWatcher();
 
-            // 3. Init il2cpp API
+            // Init il2cpp API
             if (!Il2CppApi::init()) {
                 LOGE("Il2Cpp init failed");
                 return;
             }
 
-            // 4. Features — run delayed to let il2cpp stabilize
+            // Features — run delayed to let il2cpp stabilize
             FeatureEngine::get().init(&g_worker);
 
             LOGI("ZX-ZOLA fully loaded");
