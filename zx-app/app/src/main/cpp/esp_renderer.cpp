@@ -156,7 +156,7 @@ struct EnemyData {
 
 struct BoneCache {
     void         *player_ptr;
-    Il2CppObject *head_b, *chest_b, *lsh_b, *rsh_b, *lft_b, *rft_b;
+    Il2CppObject *head_b, *neck_b, *chest_b, *lsh_b, *rsh_b, *lft_b, *rft_b;
 };
 static BoneCache s_bone_cache[MAX_ENM];
 static int       s_bone_cache_n = 0;
@@ -484,13 +484,59 @@ skip_draw:
 // No IL2CPP calls on the render thread — zero FPS impact.
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Bone name candidates for FF character rig
-static const char *k_head_names[]  = { "Head","head","Bip001 Head","mixamo:Head","head_jnt","Spine3",nullptr };
-static const char *k_chest_names[] = { "Chest","chest","Bip001 Spine2","mixamo:Spine1","spine_03",nullptr };
-static const char *k_lsh_names[]   = { "LeftArm","l_arm","Bip001 L Clavicle","mixamo:LeftArm","shoulder_l",nullptr };
-static const char *k_rsh_names[]   = { "RightArm","r_arm","Bip001 R Clavicle","mixamo:RightArm","shoulder_r",nullptr };
-static const char *k_lft_names[]   = { "LeftFoot","l_foot","Bip001 L Foot","mixamo:LeftFoot","foot_l",nullptr };
-static const char *k_rft_names[]   = { "RightFoot","r_foot","Bip001 R Foot","mixamo:RightFoot","foot_r",nullptr };
+// Bone name candidates — covers generic FF rigs + Shizuko underscore convention
+// Shizuko uses Bip01_<bone> (underscore, no space) unlike older Bip001 rigs.
+// jnt_c_*, c_* = Free Fire 2022+ IK rig; mixamorig: = imported humanoid asset.
+static const char *k_head_names[]  = {
+    "Head","head",
+    "Bip001 Head","Bip001_Head",
+    "Bip01 Head","Bip01_Head",
+    "mixamo:Head","mixamorig:Head",
+    "head_jnt","head_01","jnt_c_head","c_head",
+    "Spine3",nullptr
+};
+static const char *k_neck_names[]  = {
+    "Neck","neck",
+    "Bip001 Neck","Bip001_Neck",
+    "Bip01 Neck","Bip01_Neck",
+    "mixamo:Neck","mixamorig:Neck",
+    "neck_01","jnt_c_neck","c_neck",nullptr
+};
+static const char *k_chest_names[] = {
+    "Chest","chest",
+    "Bip001 Spine2","Bip001_Spine2",
+    "Bip01 Spine2","Bip01_Spine2",
+    "mixamo:Spine1","mixamorig:Spine1",
+    "spine_03","spine_02","jnt_c_spine_02","c_spine_02",nullptr
+};
+static const char *k_lsh_names[]   = {
+    "LeftArm","l_arm",
+    "Bip001 L Clavicle","Bip001_L_Clavicle",
+    "Bip01 L UpperArm","Bip01_L_UpperArm",
+    "mixamo:LeftArm","mixamorig:LeftArm",
+    "shoulder_l","upperarm_l","jnt_l_upperarm","l_upperarm",nullptr
+};
+static const char *k_rsh_names[]   = {
+    "RightArm","r_arm",
+    "Bip001 R Clavicle","Bip001_R_Clavicle",
+    "Bip01 R UpperArm","Bip01_R_UpperArm",
+    "mixamo:RightArm","mixamorig:RightArm",
+    "shoulder_r","upperarm_r","jnt_r_upperarm","r_upperarm",nullptr
+};
+static const char *k_lft_names[]   = {
+    "LeftFoot","l_foot",
+    "Bip001 L Foot","Bip001_L_Foot",
+    "Bip01 L Foot","Bip01_L_Foot",
+    "mixamo:LeftFoot","mixamorig:LeftFoot",
+    "foot_l","jnt_l_foot","l_foot_01",nullptr
+};
+static const char *k_rft_names[]   = {
+    "RightFoot","r_foot",
+    "Bip001 R Foot","Bip001_R_Foot",
+    "Bip01 R Foot","Bip01_R_Foot",
+    "mixamo:RightFoot","mixamorig:RightFoot",
+    "foot_r","jnt_r_foot","r_foot_01",nullptr
+};
 
 // Get a child Transform by bone name candidates — searches all candidate names
 // Shallow fallback: only immediate children (kept for fallback path)
@@ -725,6 +771,7 @@ static void *position_updater(void *) {
                 bc = &s_bone_cache[s_bone_cache_n++];
                 bc->player_ptr = p;
                 bc->head_b  = find_bone_deep(tr, k_head_names);
+                bc->neck_b  = find_bone_deep(tr, k_neck_names);
                 bc->chest_b = find_bone_deep(tr, k_chest_names);
                 bc->lsh_b   = find_bone_deep(tr, k_lsh_names);
                 bc->rsh_b   = find_bone_deep(tr, k_rsh_names);
@@ -732,6 +779,7 @@ static void *position_updater(void *) {
                 bc->rft_b   = find_bone_deep(tr, k_rft_names);
             }
             Il2CppObject *head_b  = bc ? bc->head_b  : nullptr;
+            Il2CppObject *neck_b  = bc ? bc->neck_b  : nullptr;
             Il2CppObject *chest_b = bc ? bc->chest_b : nullptr;
             Il2CppObject *lsh_b   = bc ? bc->lsh_b   : nullptr;
             Il2CppObject *rsh_b   = bc ? bc->rsh_b   : nullptr;
@@ -740,7 +788,8 @@ static void *position_updater(void *) {
 
             Vec3 root_pos = get_position(tr);
             ed.head      = head_b  ? get_position(head_b)  : Vec3{root_pos.x, root_pos.y + 1.7f, root_pos.z};
-            ed.neck      = head_b  ? Vec3{ed.head.x, ed.head.y - 0.15f, ed.head.z} : ed.head;
+            // Shizuko has explicit neck node — use it if found, else derive from head
+            ed.neck      = neck_b  ? get_position(neck_b)  : Vec3{ed.head.x, ed.head.y - 0.15f, ed.head.z};
             ed.chest     = chest_b ? get_position(chest_b) : Vec3{root_pos.x, root_pos.y + 1.3f, root_pos.z};
             ed.lshoulder = lsh_b   ? get_position(lsh_b)   : Vec3{root_pos.x - 0.3f, root_pos.y + 1.3f, root_pos.z};
             ed.rshoulder = rsh_b   ? get_position(rsh_b)   : Vec3{root_pos.x + 0.3f, root_pos.y + 1.3f, root_pos.z};
