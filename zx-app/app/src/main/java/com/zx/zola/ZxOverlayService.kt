@@ -167,6 +167,12 @@ class ZxOverlayService : Service() {
     private var isConnected = false
     private val uiHandler = Handler(Looper.getMainLooper())
     private var ffWasRunning = false
+    // Timestamp when FF was first detected this session — we delay inject by 5s so
+    // FF finishes loading libanogs.so before our payload hooks it. Without this delay
+    // the service (START_STICKY) would inject mid-startup and AnoSDK would fire SIGABRT
+    // before our shield is installed.
+    private var ffFirstSeenMs: Long = 0L
+    private val FF_INJECT_DELAY_MS = 5000L
 
     private val pollTask = object : Runnable {
         override fun run() {
@@ -175,20 +181,30 @@ class ZxOverlayService : Service() {
                 val pid     = ZxEngine.getTargetPid()
                 uiHandler.post {
                     if (running && !isConnected) {
-                        isConnected = true
-                        setConnected(pid)
-                        // Inject payload immediately on FF detection — installs all 62
-                        // anti-detect layers before any feature is toggled. cmd=0 is a
-                        // no-op for the feature system; only the protection installs.
-                        ZxEngine.toggle(0, false)
-                        // Auto-hide overlay while FF is in foreground — TYPE_APPLICATION_OVERLAY
-                        // windows from other packages are detectable by anti-cheat scanners.
-                        if (fabVisible) toggleFabVisibility()
+                        val now = System.currentTimeMillis()
+                        if (ffFirstSeenMs == 0L) {
+                            // First detection — start the stabilisation timer
+                            ffFirstSeenMs = now
+                        } else if (now - ffFirstSeenMs >= FF_INJECT_DELAY_MS) {
+                            // FF has been running for at least 5 s — safe to inject
+                            isConnected   = true
+                            ffFirstSeenMs = 0L
+                            setConnected(pid)
+                            // Inject payload — installs all anti-detect layers.
+                            // cmd=0 is a no-op for features; only protection installs.
+                            ZxEngine.toggle(0, false)
+                            // Hide overlay while FF is in foreground
+                            if (fabVisible) toggleFabVisibility()
+                        }
+                        // else: still in stabilisation window — wait for next poll
                     } else if (!running && isConnected) {
-                        isConnected = false
+                        isConnected   = false
+                        ffFirstSeenMs = 0L
                         setDisconnected()
-                        // Restore overlay when user returns to our app
                         if (!fabVisible) toggleFabVisibility()
+                    } else if (!running) {
+                        // FF stopped before we injected — reset timer
+                        ffFirstSeenMs = 0L
                     }
                     ffWasRunning = running
                 }
