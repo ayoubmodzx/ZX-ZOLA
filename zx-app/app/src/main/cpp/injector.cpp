@@ -302,6 +302,88 @@ static int kill_new_scanner_threads(pid_t pid) {
     return killed;
 }
 
+// ── AnoSDK exit_group patcher ─────────────────────────────────────────────────
+// Scans libanogs.so's executable segments for the pattern:
+//   mov x8, #94   (0xD2800BC8)  — exit_group syscall number (ARM64 Linux = 94)
+//   svc #0        (0xD4000001)
+// and overwrites the `svc #0` with a NOP (0xD503201F).
+// This prevents ANY thread in AnoSDK from calling exit_group(127) during init_fn.
+// Caller must restore via restore_anogs_exit_group() after init_fn completes.
+static constexpr int MAX_EG_PATCHES = 32;
+static uintptr_t s_eg_patch_addrs[MAX_EG_PATCHES];
+static int       s_eg_patch_count = 0;
+
+static int patch_anogs_exit_group(pid_t pid) {
+    s_eg_patch_count = 0;
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    FILE *mf = fopen(maps_path, "r");
+    if (!mf) return 0;
+
+    int patched = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), mf) && patched < MAX_EG_PATCHES) {
+        // Only care about executable segments of libanogs.so / libanogs_
+        if (strstr(line, "r-xp") == nullptr) continue;
+        bool is_anogs = strstr(line, "libanogs") != nullptr;
+        if (!is_anogs) continue;
+
+        uintptr_t seg_start = 0, seg_end = 0;
+        if (sscanf(line, "%lx-%lx", &seg_start, &seg_end) != 2) continue;
+        zerr("patch_exit_group: scanning libanogs r-xp [0x%lx-0x%lx] (%lu KB)",
+             (unsigned long)seg_start, (unsigned long)seg_end,
+             (unsigned long)(seg_end - seg_start) / 1024);
+
+        // Read segment in 4KB chunks to avoid huge stack buffers
+        static uint8_t chunk[4096];
+        for (uintptr_t addr = seg_start; addr + 7 < seg_end && patched < MAX_EG_PATCHES;
+             addr += sizeof(chunk) - 4) { // -4 to not miss pairs straddling chunks
+            size_t to_read = sizeof(chunk);
+            if (addr + to_read > seg_end) to_read = seg_end - addr;
+            if (!ProcMem::read(addr, chunk, to_read)) continue;
+
+            for (size_t i = 0; i + 7 < to_read && patched < MAX_EG_PATCHES; i += 4) {
+                uint32_t w0, w1;
+                __builtin_memcpy(&w0, chunk + i,     4);
+                __builtin_memcpy(&w1, chunk + i + 4, 4);
+                // mov x8, #94 (exit_group) followed by svc #0
+                if (w0 == 0xD2800BC8u && w1 == 0xD4000001u) {
+                    uintptr_t svc_addr = addr + i + 4; // address of svc #0
+                    uint32_t nop = 0xD503201Fu;
+                    if (ProcMem::write(svc_addr, &nop, 4)) {
+                        zerr("patch_exit_group: NOP'd exit_group SVC @0x%lx",
+                             (unsigned long)svc_addr);
+                        s_eg_patch_addrs[s_eg_patch_count++] = svc_addr;
+                        patched++;
+                    } else {
+                        zerr("patch_exit_group: WRITE FAILED @0x%lx",
+                             (unsigned long)svc_addr);
+                    }
+                }
+            }
+        }
+    }
+    fclose(mf);
+    if (patched == 0) zerr("patch_exit_group: NO exit_group pattern found in libanogs.so");
+    else              zerr("patch_exit_group: patched %d exit_group SVC(s)", patched);
+    return patched;
+}
+
+static void restore_anogs_exit_group(pid_t pid) {
+    uint32_t svc = 0xD4000001u; // original svc #0
+    for (int i = 0; i < s_eg_patch_count; i++) {
+        if (ProcMem::write(s_eg_patch_addrs[i], &svc, 4)) {
+            // silent — normal path
+        } else {
+            zerr("restore_exit_group: WRITE FAILED @0x%lx",
+                 (unsigned long)s_eg_patch_addrs[i]);
+        }
+    }
+    if (s_eg_patch_count > 0)
+        zerr("restore_exit_group: restored %d SVC(s)", s_eg_patch_count);
+    s_eg_patch_count = 0;
+}
+
 static bool get_regs(pid_t pid, pt_regs *regs) {
     struct iovec iov = { regs, sizeof(*regs) };
     return ptrace(PTRACE_GETREGSET, pid, (void*)NT_PRSTATUS, &iov) == 0;
@@ -1603,6 +1685,15 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // freeze_threads_safe and will call exit_group(127) during init_fn otherwise.
     kill_new_scanner_threads(pid);
 
+    // Patch all exit_group SVC instructions in libanogs.so to NOP.
+    // Even with all scanner threads frozen (SIGSTOP state-T confirmed), AnoSDK
+    // can call exit_group via a delayed mechanism (POSIX timer SIGEV_THREAD that
+    // spawns a new OS thread, or a frozen thread that gets SIGCONT'd by the main
+    // thread's group-stop interaction). NOP-ing the syscall itself is the only
+    // guarantee — no thread can call exit_group regardless of how it gets there.
+    // Bytes are restored immediately after init_fn returns (success or fail).
+    patch_anogs_exit_group(pid);
+
     // ── Call zx_payload_start() ──────────────────────────────────────────────
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
     // Now that GOT is pre-resolved and patched, call the real init symbol.
@@ -1816,6 +1907,11 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
             zerr("remote_dlopen: init_fn not found — payload will not run");
         }
     }
+
+    // Restore libanogs.so exit_group SVCs that were NOP'd for init_fn safety.
+    // Must happen BEFORE thaw_threads_safe() so scanner threads don't race
+    // with a half-restored libanogs while they're being unfrozen.
+    restore_anogs_exit_group(pid);
 
     // ── Cleanup anonymous shellcode buffer (path + sc2 both live here) ───────
     remote_munmap(pid, remote_buf, alloc);
