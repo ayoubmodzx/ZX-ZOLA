@@ -1690,6 +1690,23 @@ int main(int argc, char *argv[]) {
             payload_base = 0;
         } else {
             zerr("version_check: payload v%d OK", file_ver);
+            // Check live bit — if init_fn was interrupted (SIGABRT/SIGSEGV) the
+            // payload is mapped but DEAD.  Force re-inject so a fresh init_fn runs.
+            const char *p_path = (argc >= 5 && argv[4][0] != '\0') ? argv[4] : nullptr;
+            if (p_path) {
+                uintptr_t ctrl_off = find_sym_in_file(p_path, "_unity_gfx_params");
+                if (ctrl_off) {
+                    uintptr_t live_addr = payload_base + ctrl_off + 16;
+                    int live_val = 0;
+                    ProcMem::read(live_addr, &live_val, sizeof(live_val));
+                    if (live_val == 0) {
+                        zerr("version_check: live=DEAD — init_fn failed previously, forcing re-inject");
+                        payload_base = 0;
+                    } else {
+                        zerr("version_check: live=0x%x — payload running OK, skip re-inject", live_val);
+                    }
+                }
+            }
         }
     }
 
