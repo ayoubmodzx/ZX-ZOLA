@@ -835,8 +835,9 @@ static void pre_resolve_got(pid_t pid, const char *so_path, uintptr_t elf_base) 
     // must only write addresses from executable (r-xp / r-x) segments, otherwise
     // the GOT contains a non-exec address → BLR → SIGSEGV code=2 at the callee.
     struct ExecRange { uintptr_t start, end; };
-    static const int MAX_EXEC_R = 128;
-    ExecRange exec_ranges[MAX_EXEC_R] = {};
+    static const int MAX_EXEC_R = 4096;
+    static ExecRange exec_ranges[MAX_EXEC_R];
+    memset(exec_ranges, 0, sizeof(exec_ranges));
     int n_exec_r = 0;
     {
         char emap[64]; snprintf(emap, sizeof(emap), "/proc/%d/maps", pid);
