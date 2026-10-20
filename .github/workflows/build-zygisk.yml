@@ -260,20 +260,13 @@ jobs:
           path: ${{ env.ZIPNAME }}
           retention-days: 1
 
-      # ── Release on main branch push ──────────────────────────────────────
-      - name: Create GitHub Release
-        if: github.ref == 'refs/heads/main'
+      - name: Release dev build
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "zygisk-build-${{ github.run_number }}"
-          name: "ZX-ZOLA Zygisk Build ${{ github.run_number }}"
-          body: |
-            ## ZX-ZOLA Zygisk Module
-
-            **arm64-v8a SHA256:** `${{ steps.hashes.outputs.arm64 }}`
-
-            ### Install
-            Flash in Magisk or KernelSU → reboot → hide root + Zygisk.
+          tag_name: dev-latest
+          name: "ZX Dev Build (latest)"
+          prerelease: true
+          body: "arm64-v8a SHA256: `${{ steps.hashes.outputs.arm64 }}`"
           files: ${{ env.ZIPNAME }}
           generate_release_notes: false
         env:
