@@ -170,8 +170,63 @@ static void freeze_threads_safe(pid_t pid) {
         }
     }
     closedir(d);
-    usleep(8000);
-    LOG("freeze_threads_safe: stopped %d threads", s_sigstop_n);
+    // Confirm each thread actually reached state T (stopped) before returning.
+    // A fixed sleep is a race: the scanner thread can call exit_group(127) in the
+    // window between SIGSTOP dispatch and kernel delivery. Poll /proc status instead.
+    for (int i = 0; i < s_sigstop_n; i++) {
+        pid_t tid = s_sigstop_tids[i];
+        bool confirmed = false;
+        for (int check = 0; check < 300; check++) { // up to 300ms per thread
+            char st_path[96];
+            snprintf(st_path, sizeof(st_path), "/proc/%d/task/%d/status", pid, tid);
+            FILE *sf = fopen(st_path, "r");
+            if (!sf) {
+                // Thread entry gone — either exited cleanly or exit_group fired.
+                // Check if the whole process is still alive.
+                char ppath[48]; snprintf(ppath, sizeof(ppath), "/proc/%d/status", pid);
+                FILE *pf = fopen(ppath, "r");
+                if (!pf) {
+                    LOG("freeze: TID=%d status gone AND process gone — exit_group already fired!", tid);
+                } else {
+                    fclose(pf);
+                    LOG("freeze: TID=%d status gone (thread exited cleanly)", tid);
+                }
+                break;
+            }
+            char line[128]; bool stopped = false;
+            while (fgets(line, sizeof(line), sf)) {
+                if (strncmp(line, "State:", 6) == 0) {
+                    // T = stopped by signal, t = stopped under ptrace
+                    stopped = (strchr(line + 6, 'T') != nullptr ||
+                               strchr(line + 6, 't') != nullptr);
+                    if (!stopped && check == 0) {
+                        // Log state on first check for diagnostics
+                        const char *p = line + 6;
+                        while (*p == ' ' || *p == '\t') p++;
+                        LOG("freeze: TID=%d state='%c' (not T yet, waiting...)", tid, *p);
+                    }
+                    break;
+                }
+            }
+            fclose(sf);
+            if (stopped) { confirmed = true; break; }
+            usleep(1000); // 1ms per retry
+        }
+        if (!confirmed) {
+            LOG("freeze: WARNING TID=%d never reached state T (300ms timeout or thread gone)", tid);
+        }
+    }
+    // Final sanity check: is the process still alive after freezing all threads?
+    {
+        char ppath[48]; snprintf(ppath, sizeof(ppath), "/proc/%d/status", pid);
+        FILE *pf = fopen(ppath, "r");
+        if (!pf) {
+            LOG("freeze_threads_safe: FATAL — process %d died during freeze! exit_group raced SIGSTOP.", pid);
+        } else {
+            fclose(pf);
+        }
+    }
+    LOG("freeze_threads_safe: stopped %d threads (state-confirmed)", s_sigstop_n);
 }
 
 static void thaw_threads_safe() {
@@ -218,6 +273,28 @@ static int kill_new_scanner_threads(pid_t pid) {
             zerr("kill_scanner: SIGKILL new scanner TID=%d comm=%s", tid, comm);
             syscall(SYS_tgkill, (long)pid, (long)tid, (long)SIGKILL);
             killed++;
+        } else {
+            // Log ALL unfrozen threads — even non-scanner ones may be AnoSDK watchdogs
+            // with unexpected names. This helps identify the real exit_group caller.
+            char st_line[32] = {};
+            char stpath[80];
+            snprintf(stpath, sizeof(stpath), "/proc/%d/task/%d/status", pid, tid);
+            FILE *sf2 = fopen(stpath, "r");
+            if (sf2) {
+                char lbuf[64];
+                while (fgets(lbuf, sizeof(lbuf), sf2)) {
+                    if (strncmp(lbuf, "State:", 6) == 0) {
+                        // grab just the state char
+                        const char *p = lbuf + 6;
+                        while (*p == ' ' || *p == '\t') p++;
+                        st_line[0] = *p; st_line[1] = '\0';
+                        break;
+                    }
+                }
+                fclose(sf2);
+            }
+            zerr("kill_scanner: NEW unfrozen TID=%d comm='%s' state=%s (NOT scanner-named — possible watchdog!)",
+                 tid, comm, st_line);
         }
     }
     closedir(d);
