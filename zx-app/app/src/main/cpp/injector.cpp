@@ -1481,6 +1481,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     // Now that GOT is pre-resolved and patched, call the real init symbol.
     // NOTE: sc_addr = remote_buf+path_aligned is still valid here — munmap happens AFTER.
     bool payload_init_ok = false; // set to true only when antidect bit confirmed
+    const char *init_fail_reason = "unknown";
     {
         uintptr_t sym_off  = find_sym_in_file(so_path, "unity_render_thread_init");
         // elf_base2 already computed above
@@ -1524,15 +1525,19 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                     for (int drain = 0; drain < 64; drain++) {
                         waitpid(pid, &st2, 0);
                         if (WIFSIGNALED(st2)) {
-                            zerr("remote_dlopen: init_fn KILLED termsig=%d (AnoSDK watchdog)", WTERMSIG(st2));
+                            int tsig = WTERMSIG(st2);
+                            zerr("remote_dlopen: KILL — scanner sent signal %d (AnoSDK watchdog killed process)", tsig);
+                            init_fail_reason = "AnoSDK watchdog killed process via signal";
                             proc_dead = true; break;
                         }
                         if (WIFEXITED(st2)) {
-                            // Scanner thread called exit_group(127) after 2 suppressed SIGABRTs.
-                            // freeze_threads_safe now stops scanner threads so this path is
-                            // a fallback — mark dead so we stop retrying on a corpse.
-                            zerr("remote_dlopen: init_fn process exited code=%d (AnoSDK scanner exit_group)",
-                                 WEXITSTATUS(st2));
+                            int xcode = WEXITSTATUS(st2);
+                            zerr("remote_dlopen: KILL — AnoSDK scanner called exit_group(%d) "
+                                 "after SIGABRT x%d suppressed (drain=%d) — process dead, init never completed",
+                                 xcode, drain, drain);
+                            init_fail_reason = (xcode == 127)
+                                ? "AnoSDK scanner exit_group(127): fired after SIGABRT x2 suppressed"
+                                : "AnoSDK scanner exit_group(unexpected code)";
                             proc_dead = true; break;
                         }
                         if (!WIFSTOPPED(st2)) {
@@ -1561,7 +1566,8 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                         zerr("remote_dlopen: init_fn OK (attempt %d)", attempt + 1);
                         init_ok = true;
                     } else if (proc_dead) {
-                        break; // process dead — exit_group(127) fired, no point retrying on corpse
+                        zerr("remote_dlopen: ABORT attempt=%d — %s", attempt, init_fail_reason);
+                        break;
                     } else {
                         int sig2 = WIFSTOPPED(st2) ? WSTOPSIG(st2) : -1;
                         zerr("remote_dlopen: init_fn FAIL wst=0x%x sig=%d PC=0x%lx (sc_addr+%ld)",
@@ -1737,7 +1743,7 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     if (!mapped_ok)
         zerr("remote_dlopen: FAILED — handle=0x%lx in_maps=%d has_rxp=%d", (unsigned long)handle, in_maps, has_rxp);
     if (mapped_ok && !payload_init_ok)
-        zerr("remote_dlopen: SAFETY ABORT — .so mapped but ANTIDECT bit never set");
+        zerr("remote_dlopen: SAFETY ABORT — init_fn never completed. Reason: %s", init_fail_reason);
 
     return ok;
 }
