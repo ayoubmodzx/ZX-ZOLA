@@ -28,6 +28,7 @@ typedef struct user_pt_regs pt_regs;
 #include <dirent.h>
 #include <cstdarg>
 #include <signal.h>
+#include <sys/syscall.h>
 
 #define TAG "ZX-INJ"
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
@@ -177,6 +178,51 @@ static void thaw_threads_safe() {
     for (int i = 0; i < s_sigstop_n; i++)
         kill(s_sigstop_tids[i], SIGCONT);
     s_sigstop_n = 0;
+}
+
+// Kill AnoSDK scanner threads that spawned AFTER freeze_threads_safe ran.
+// AnoSDK spawns its kill-sequence thread in response to detecting dlopen,
+// so freeze misses it. tgkill(tgid, tid, SIGKILL) kills that thread only —
+// not process-wide, so it can't call exit_group(127).
+static int kill_new_scanner_threads(pid_t pid) {
+    char task_dir[64];
+    snprintf(task_dir, sizeof(task_dir), "/proc/%d/task", pid);
+    DIR *d = opendir(task_dir);
+    if (!d) return 0;
+    struct dirent *e;
+    int killed = 0;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] == '.') continue;
+        pid_t tid = (pid_t)atoi(e->d_name);
+        if (tid <= 0 || tid == pid) continue;
+        // Skip already-frozen threads (SIGSTOP'd by freeze_threads_safe)
+        bool already_frozen = false;
+        for (int i = 0; i < s_sigstop_n; i++)
+            if (s_sigstop_tids[i] == tid) { already_frozen = true; break; }
+        if (already_frozen) continue;
+        // Read thread name
+        char comm[32] = {};
+        char cpath[64];
+        snprintf(cpath, sizeof(cpath), "/proc/%d/task/%d/comm", pid, tid);
+        int cfd = open(cpath, O_RDONLY | O_CLOEXEC);
+        if (cfd >= 0) { read(cfd, comm, sizeof(comm) - 1); close(cfd); }
+        for (int i = 0; i < (int)sizeof(comm); i++) if (comm[i] == '\n') { comm[i] = 0; break; }
+        // Never kill our own control thread
+        if (strncmp(comm, "kworker", 7) == 0) continue;
+        // Kill by AnoSDK name pattern
+        bool is_scanner = strncmp(comm, "ano",    3) == 0 ||
+                          strncmp(comm, "mrpcs",  5) == 0 ||
+                          strncmp(comm, "mvm_bk", 6) == 0 ||
+                          strstr (comm, "scan")       != nullptr;
+        if (is_scanner) {
+            zerr("kill_scanner: SIGKILL new scanner TID=%d comm=%s", tid, comm);
+            syscall(SYS_tgkill, (long)pid, (long)tid, (long)SIGKILL);
+            killed++;
+        }
+    }
+    closedir(d);
+    if (killed) zerr("kill_scanner: eliminated %d new AnoSDK thread(s)", killed);
+    return killed;
 }
 
 static bool get_regs(pid_t pid, pt_regs *regs) {
@@ -1476,6 +1522,10 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
     uintptr_t elf_base2 = ProcMem::findLibBase(pid, STAGED_NAME);
     pre_resolve_got(pid, so_path, elf_base2);
 
+    // Kill any AnoSDK scanner threads that dlopen triggered — they spawn AFTER
+    // freeze_threads_safe and will call exit_group(127) during init_fn otherwise.
+    kill_new_scanner_threads(pid);
+
     // ── Call zx_payload_start() ──────────────────────────────────────────────
     // Constructor was a no-op to avoid PAC PLT crash during dlopen.
     // Now that GOT is pre-resolved and patched, call the real init symbol.
@@ -1552,9 +1602,12 @@ static bool remote_dlopen(pid_t pid, const char *so_path) {
                         ptrace(PTRACE_GETSIGINFO, pid, nullptr, &si2);
                         if (si2.si_code <= 0) {
                             // si_code=SI_QUEUE(-1) or SI_USER(0) = sigqueue from AnoSDK scanner
-                            // Suppress by continuing with sig=0 (don't deliver to tracee)
+                            // Suppress by continuing with sig=0 (don't deliver to tracee).
+                            // Then kill any newly spawned scanner threads before they reach
+                            // exit_group — AnoSDK may spawn additional kill threads per-signal.
                             zerr("remote_dlopen: init_fn suppressed external sig=%d code=%d (AnoSDK) drain=%d",
                                  sig2, si2.si_code, drain);
+                            kill_new_scanner_threads(pid);
                             ptrace(PTRACE_CONT, pid, nullptr, (void*)0);
                             continue;
                         }
