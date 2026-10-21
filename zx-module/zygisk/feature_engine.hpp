@@ -2,16 +2,23 @@
 #include "il2cpp_api.hpp"
 #include "async_worker.hpp"
 
-// Feature command IDs — shared with the Android app's socket client
+// Feature command IDs — must match ZxEngine.Cmd in the Android app exactly
 enum ZxCmd : uint8_t {
     ZX_ANTI_RECOIL    = 1,  ZX_NO_SPREAD      = 2,
     ZX_RAPID_FIRE     = 3,  ZX_WIDE_POV       = 4,
+    ZX_ESP            = 5,
     ZX_SPEED_HACK     = 6,  ZX_HIGH_JUMP      = 7,
     ZX_VEHICLE_SPEED  = 8,  ZX_RAPID_RISK     = 9,
     ZX_NO_GRASS       = 10, ZX_ANTI_DAMAGE    = 11,
     ZX_AIM_ENABLE     = 12, ZX_AIM_BONE       = 13,
     ZX_AIM_FOV        = 14, ZX_AIM_SMOOTH     = 15,
-    ZX_MAX_HEALTH     = 16,
+    ZX_GOD_MODE       = 16,
+    ZX_INFINITE_AMMO  = 17, ZX_NO_RELOAD      = 18,
+    ZX_NOCLIP         = 19, ZX_TELEPORT       = 20,
+    ZX_TELEPORT_SAVE  = 21, ZX_SILENT_AIM     = 22,
+    ZX_AUTO_HEADSHOT  = 23, ZX_FULL_AIMBOT    = 24,
+    ZX_ANTI_AIM       = 25, ZX_AUTO_REVIVE    = 26,
+    ZX_WALL_SHOOT     = 27,
 };
 
 #pragma pack(push, 1)

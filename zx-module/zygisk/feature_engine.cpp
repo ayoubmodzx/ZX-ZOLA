@@ -241,17 +241,47 @@ void FeatureEngine::applyAntiDamage(bool enable) {
 
 void FeatureEngine::dispatch(uint8_t cmd, bool enable, float intensity) {
     switch (cmd) {
+        // ── Weapon ──────────────────────────────────────────────────────────
         case ZX_ANTI_RECOIL:   applyAntiRecoil(enable); break;
         case ZX_NO_SPREAD:     applyNoSpread(enable); break;
-        case ZX_RAPID_FIRE:    applyRapidFire(enable); break;
-        case ZX_AIM_ENABLE:    applyAimAssist(enable); break;
+        case ZX_RAPID_FIRE:
+        case ZX_RAPID_RISK:    applyRapidFire(enable); break;
+
+        // ── Aim ─────────────────────────────────────────────────────────────
+        case ZX_AIM_ENABLE:
+        case ZX_AIM_BONE:
+        case ZX_AIM_FOV:
+        case ZX_AIM_SMOOTH:
+        case ZX_SILENT_AIM:
+        case ZX_AUTO_HEADSHOT:
+        case ZX_FULL_AIMBOT:
+        case ZX_ANTI_AIM:      applyAimAssist(enable); break;
+
+        // ── Movement ────────────────────────────────────────────────────────
         case ZX_SPEED_HACK:    applySpeedHack(enable, intensity > 0.f ? intensity : 1.5f); break;
         case ZX_HIGH_JUMP:     applyHighJump(enable); break;
         case ZX_VEHICLE_SPEED: applyVehicleSpeed(enable, intensity > 0.f ? intensity : 2.0f); break;
+
+        // ── Visual ──────────────────────────────────────────────────────────
         case ZX_WIDE_POV:      applyWidePOV(intensity > 0.f ? intensity : 85.0f); break;
         case ZX_NO_GRASS:      applyNoGrass(enable); break;
-        case ZX_MAX_HEALTH:    applyMaxHealth(enable); break;
+
+        // ── Survival ────────────────────────────────────────────────────────
         case ZX_ANTI_DAMAGE:   applyAntiDamage(enable); break;
+        case ZX_GOD_MODE:      applyAntiDamage(enable); break; // god = block all damage
+
+        // ── Not yet implemented (pending method/offset resolution) ──────────
+        case ZX_ESP:
+        case ZX_INFINITE_AMMO:
+        case ZX_NO_RELOAD:
+        case ZX_NOCLIP:
+        case ZX_TELEPORT:
+        case ZX_TELEPORT_SAVE:
+        case ZX_AUTO_REVIVE:
+        case ZX_WALL_SHOOT:
+            LOGI("cmd %d not yet implemented", (int)cmd);
+            break;
+
         default:
             LOGE("dispatch: unknown cmd %d", (int)cmd);
     }
