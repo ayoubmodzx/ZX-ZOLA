@@ -26,14 +26,12 @@ void FeatureEngine::init(AsyncWorker *worker) {
     m_worker->postDelayed([this] {
         resolveClasses();
         if (m_ready) {
-            applyNoGrass(true);
-            applyWidePOV(85.0f);
             LOGI("Features ready — socket server starting");
         } else {
             LOGE("Class resolution failed — check FF version");
         }
         startServer();
-    }, 3500);
+    }, 5000);
 }
 
 void FeatureEngine::resolveClasses() {
@@ -61,10 +59,20 @@ void FeatureEngine::resolveClasses() {
     if (m_cls.Grass)     m_mth.setGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "set_GrassInstances",        1);
     if (m_cls.Aim)       m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,       "CalculateAimPoint",        -1);
 
+    // Resolve UnityEngine.Camera.set_fieldOfView for WidePOV
+    Il2CppImage *unityImg = Il2CppApi::getImage("UnityEngine.CoreModule");
+    if (!unityImg) unityImg = Il2CppApi::getImage("UnityEngine");
+    if (unityImg) {
+        m_cls.UnityCamera = Il2CppApi::getClass(unityImg, "UnityEngine", "Camera");
+        if (m_cls.UnityCamera)
+            m_mth.setCameraFov = Il2CppApi::getMethod(m_cls.UnityCamera, "set_fieldOfView", 1);
+    }
+
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
-    LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p",
+    LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p cam_fov:%p",
          m_cls.Player, m_cls.Weapon, m_cls.Grass, m_cls.Vehicle,
-         m_mth.takeDamage, m_mth.recoilFormula, m_mth.rateOfFire, m_mth.setSpeedScale);
+         m_mth.takeDamage, m_mth.recoilFormula, m_mth.rateOfFire, m_mth.setSpeedScale,
+         m_mth.setCameraFov);
 }
 
 // ── Shared hook state (file-scope, hooks installed once, toggled via flags) ───
@@ -76,6 +84,12 @@ static bool  s_anti_damage  = false;
 static bool  s_no_grass     = false;
 static bool  s_speed_on     = false;
 static float s_speed_mul    = 1.5f;
+static bool  s_wide_pov     = false;
+static float s_target_fov   = 90.0f;
+static bool  s_high_jump    = false;
+static float s_jump_mul     = 2.5f;
+static bool  s_vehicle_on   = false;
+static float s_vehicle_mul  = 2.0f;
 
 static void *s_orig_recoil  = nullptr;
 static void *s_orig_rof     = nullptr;
@@ -83,6 +97,9 @@ static void *s_orig_dmg     = nullptr;
 static void *s_orig_grass   = nullptr;
 static void *s_orig_speed   = nullptr;
 static void *s_orig_aim     = nullptr;
+static void *s_orig_fov     = nullptr;
+static void *s_orig_jump    = nullptr;
+static void *s_orig_vehicle = nullptr;
 
 // RecoilFormula — returns float; extra void* params absorb any signature variant
 static float hook_recoil(void *self, void *a1, void *a2, void *a3, void *a4) {
@@ -117,6 +134,29 @@ static void hook_speed(void *self, float scale, void *method) {
     float effective = s_speed_on ? scale * s_speed_mul : scale;
     using Fn = void (*)(void *, float, void *);
     reinterpret_cast<Fn>(s_orig_speed)(self, effective, method);
+}
+
+// Camera.set_fieldOfView — enforce target FOV when WidePOV active
+// ARM64 IL2CPP instance setter: x0=this, s0=value (float), x1=MethodInfo*
+static void hook_set_fov(void *cam, float fov, void *method) {
+    using Fn = void (*)(void *, float, void *);
+    reinterpret_cast<Fn>(s_orig_fov)(cam, s_wide_pov ? s_target_fov : fov, method);
+}
+
+// GiveDeltaSpeedScaleByKeyAndValue(int key, float value) — jump speed delta
+// ARM64: x0=this, w1=key, s0=value, x2=MethodInfo*
+static void hook_jump(void *self, int key, float value, void *method) {
+    float effective = (s_high_jump && value > 0.f) ? value * s_jump_mul : value;
+    using Fn = void (*)(void *, int, float, void *);
+    reinterpret_cast<Fn>(s_orig_jump)(self, key, effective, method);
+}
+
+// Vehicle speed multiplier — hooks GetMaxSpeed() return value
+// ARM64: x0=this, x1=MethodInfo* → returns float in s0
+static float hook_vehicle(void *self, void *method) {
+    using Fn = float (*)(void *, void *);
+    float v = reinterpret_cast<Fn>(s_orig_vehicle)(self, method);
+    return s_vehicle_on ? v * s_vehicle_mul : v;
 }
 
 // ── Feature implementations ───────────────────────────────────────────────────
@@ -191,18 +231,95 @@ void FeatureEngine::applySpeedHack(bool enable, float multiplier) {
 }
 
 void FeatureEngine::applyHighJump(bool enable) {
-    // GiveDeltaSpeedScaleByKeyAndValue on PlayerAttributes — pending exact arg sig
-    LOGI("HighJump: %s (pending method sig)", enable ? "ON" : "OFF");
+    s_high_jump = enable;
+    // Try to resolve jump method on first enable
+    if (enable && !s_orig_jump && m_cls.Character) {
+        // Common jump-related method names in COW.GamePlay.PlayerAttributes
+        static const char *kJumpNames[] = {
+            "GiveDeltaSpeedScaleByKeyAndValue",
+            "SetJumpSpeedScale",
+            "AddJumpForce",
+            "DoJump",
+            "Jump",
+            nullptr
+        };
+        for (int i = 0; kJumpNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Character, kJumpNames[i], -1);
+            if (m && m->methodPointer) {
+                m_mth.jumpMethod = m;
+                HookEngine::get().hookAddr(m->methodPointer,
+                    reinterpret_cast<void *>(hook_jump), &s_orig_jump, "HighJump");
+                LOGI("HighJump: hooked via %s", kJumpNames[i]);
+                break;
+            }
+        }
+        if (!s_orig_jump) {
+            // Fallback: try on Player class
+            if (m_cls.Player) {
+                for (int i = 0; kJumpNames[i]; ++i) {
+                    MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kJumpNames[i], -1);
+                    if (m && m->methodPointer) {
+                        m_mth.jumpMethod = m;
+                        HookEngine::get().hookAddr(m->methodPointer,
+                            reinterpret_cast<void *>(hook_jump), &s_orig_jump, "HighJump");
+                        LOGI("HighJump: hooked via Player::%s", kJumpNames[i]);
+                        break;
+                    }
+                }
+            }
+        }
+        if (!s_orig_jump) LOGE("HighJump: no suitable method found in class tree");
+    } else if (!enable && s_orig_jump && m_mth.jumpMethod) {
+        HookEngine::get().unhook(m_mth.jumpMethod->methodPointer);
+        s_orig_jump = nullptr;
+    }
+    LOGI("HighJump: %s (mul=%.2f)", enable ? "ON" : "OFF", s_jump_mul);
 }
 
 void FeatureEngine::applyVehicleSpeed(bool enable, float multiplier) {
-    // Vehicle.get_Speed is a getter only — need to find speed setter/multiplier method
-    LOGI("VehicleSpeed: %s (pending setter method)", enable ? "ON" : "OFF");
+    s_vehicle_on  = enable;
+    s_vehicle_mul = multiplier;
+    if (enable && !s_orig_vehicle && m_cls.Vehicle) {
+        static const char *kVehicleNames[] = {
+            "GetMaxSpeed",
+            "get_MaxSpeed",
+            "get_Speed",
+            "GetSpeed",
+            nullptr
+        };
+        for (int i = 0; kVehicleNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Vehicle, kVehicleNames[i], -1);
+            if (m && m->methodPointer) {
+                m_mth.vehicleAccel = m;
+                HookEngine::get().hookAddr(m->methodPointer,
+                    reinterpret_cast<void *>(hook_vehicle), &s_orig_vehicle, "VehicleSpeed");
+                LOGI("VehicleSpeed: hooked via %s", kVehicleNames[i]);
+                break;
+            }
+        }
+        if (!s_orig_vehicle) LOGE("VehicleSpeed: no suitable method found in Vehicle class");
+    } else if (!enable && s_orig_vehicle && m_mth.vehicleAccel) {
+        HookEngine::get().unhook(m_mth.vehicleAccel->methodPointer);
+        s_orig_vehicle = nullptr;
+    }
+    LOGI("VehicleSpeed: %s (x%.2f)", enable ? "ON" : "OFF", multiplier);
 }
 
 void FeatureEngine::applyWidePOV(float fov) {
-    // CameraPanZoom field names are obfuscated — pending field offset scan
-    LOGI("WidePOV: %.1f (pending field offset)", fov);
+    s_target_fov = fov;
+    s_wide_pov   = (fov > 0.f);
+    if (!m_mth.setCameraFov || !m_mth.setCameraFov->methodPointer) {
+        LOGE("WidePOV: Camera.set_fieldOfView not resolved — UnityEngine image missing?");
+        return;
+    }
+    if (s_wide_pov && !s_orig_fov) {
+        HookEngine::get().hookAddr(m_mth.setCameraFov->methodPointer,
+            reinterpret_cast<void *>(hook_set_fov), &s_orig_fov, "WidePOV");
+    } else if (!s_wide_pov && s_orig_fov) {
+        HookEngine::get().unhook(m_mth.setCameraFov->methodPointer);
+        s_orig_fov = nullptr;
+    }
+    LOGI("WidePOV: %.1f", fov);
 }
 
 void FeatureEngine::applyNoGrass(bool enable) {
@@ -258,9 +375,9 @@ void FeatureEngine::dispatch(uint8_t cmd, bool enable, float intensity) {
         case ZX_ANTI_AIM:      applyAimAssist(enable); break;
 
         // ── Movement ────────────────────────────────────────────────────────
-        case ZX_SPEED_HACK:    applySpeedHack(enable, intensity > 0.f ? intensity : 1.5f); break;
-        case ZX_HIGH_JUMP:     applyHighJump(enable); break;
-        case ZX_VEHICLE_SPEED: applyVehicleSpeed(enable, intensity > 0.f ? intensity : 2.0f); break;
+        case ZX_SPEED_HACK:    applySpeedHack(enable, intensity > 0.f ? intensity / 100.f + 1.f : 1.5f); break;
+        case ZX_HIGH_JUMP:     { s_jump_mul = intensity > 0.f ? intensity / 100.f + 1.f : 2.5f; applyHighJump(enable); } break;
+        case ZX_VEHICLE_SPEED: applyVehicleSpeed(enable, intensity > 0.f ? intensity / 100.f + 1.f : 2.0f); break;
 
         // ── Visual ──────────────────────────────────────────────────────────
         case ZX_WIDE_POV:      applyWidePOV(intensity > 0.f ? intensity : 85.0f); break;

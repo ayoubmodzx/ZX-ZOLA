@@ -2,8 +2,9 @@
 #include <cstddef>
 #include <cstdint>
 
-// Uses libffutil.so's own unmap functions to hide our .so from AnoSDK memory scans
-// libffutil exports: ffutil_UnmapAddr, ffutil_UnmapSize, ffutil_Unmap
+// Hides the module from AnoSDK memory scans via two techniques:
+//   1. Zero ELF header bytes through /proc/self/mem (destroys library signature)
+//   2. prctl(PR_SET_VMA_ANON_NAME) removes .so name from /proc/self/maps
 namespace MemoryGuard {
     bool  init();
     bool  hideSelf();          // hide this module's loaded pages from scanner

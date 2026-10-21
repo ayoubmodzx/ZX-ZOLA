@@ -69,17 +69,18 @@ private:
     bool         m_ready  = false;
 
     struct Classes {
-        Il2CppClass *Player    = nullptr;
-        Il2CppClass *Character = nullptr;
-        Il2CppClass *Health    = nullptr;
-        Il2CppClass *Weapon    = nullptr;
-        Il2CppClass *Bullet    = nullptr;
-        Il2CppClass *Recoil    = nullptr;
-        Il2CppClass *Camera    = nullptr;
-        Il2CppClass *Aim       = nullptr;
-        Il2CppClass *Grass     = nullptr;
-        Il2CppClass *Vehicle   = nullptr;
-        Il2CppClass *Loot      = nullptr;
+        Il2CppClass *Player       = nullptr;
+        Il2CppClass *Character    = nullptr;
+        Il2CppClass *Health       = nullptr;
+        Il2CppClass *Weapon       = nullptr;
+        Il2CppClass *Bullet       = nullptr;
+        Il2CppClass *Recoil       = nullptr;
+        Il2CppClass *Camera       = nullptr;
+        Il2CppClass *Aim          = nullptr;
+        Il2CppClass *Grass        = nullptr;
+        Il2CppClass *Vehicle      = nullptr;
+        Il2CppClass *Loot         = nullptr;
+        Il2CppClass *UnityCamera  = nullptr;  // UnityEngine.Camera — for WidePOV
     } m_cls;
 
     struct Fields {
@@ -102,6 +103,9 @@ private:
         MethodInfo *setSpeedScale  = nullptr;
         MethodInfo *getGrassInst   = nullptr;
         MethodInfo *setGrassInst   = nullptr;
+        MethodInfo *setCameraFov   = nullptr;  // UnityEngine.Camera.set_fieldOfView
+        MethodInfo *jumpMethod     = nullptr;  // resolved at first HighJump enable
+        MethodInfo *vehicleAccel   = nullptr;  // resolved at first VehicleSpeed enable
     } m_mth;
 
     void resolveClasses();
