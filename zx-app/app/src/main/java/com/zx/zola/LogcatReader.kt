@@ -74,7 +74,7 @@ object LogcatReader {
         val s = _status.get()
         val updated = s.copy(
             injected = s.injected || "Free Fire detected" in msg,
-            anosdk1  = s.anosdk1  || ("Phase 1 early hooks" in msg && "exit=1" in msg),
+            anosdk1  = s.anosdk1  || ("Phase 1 early hooks" in msg && "kill=1" in msg),
             anosdk2  = s.anosdk2  || "Phase 2: API hooks installed" in msg,
             il2cpp   = s.il2cpp   || (
                 "resolved Player" in msg &&

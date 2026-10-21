@@ -15,17 +15,19 @@
 #include <sys/types.h>
 #include <android/log.h>
 #include <sys/syscall.h>
+#include <atomic>
 
 #define TAG "ZX-ANO"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // ── Original pointers — Phase 1 (libc.so) ────────────────────────────────────
-static void (*orig_exit)(int)               = nullptr;
-static void (*orig__exit)(int)              = nullptr;
-static void (*orig_abort)()                 = nullptr;
-static int  (*orig_kill)(pid_t, int)        = nullptr;
-static int  (*orig_tgkill)(int, int, int)   = nullptr;
+static void (*orig_exit)(int)                    = nullptr;
+static void (*orig__exit)(int)                   = nullptr;
+static void (*orig_abort)()                      = nullptr;
+static int  (*orig_kill)(pid_t, int)             = nullptr;
+static int  (*orig_tgkill)(int, int, int)        = nullptr;
+static int  (*orig_pthread_kill)(pthread_t, int) = nullptr;
 
 // ── Original pointers — Phase 2 (libanogs.so) ────────────────────────────────
 static int   (*orig_AnoSDKIoctl)(int, void *, int)            = nullptr;
@@ -38,21 +40,27 @@ static int   (*orig_ms_scan_start)(int, void *)               = nullptr;
 // ── Phase 1 hooks ─────────────────────────────────────────────────────────────
 
 // AnoSDK calls exit(1) or exit(127) to terminate the process.
-// Spin on the calling thread forever — that thread is AnoSDK's kill thread,
-// not the main game thread, so the game keeps running.
+// Two detection criteria, either is enough to block:
+//   • code != 0  — normal game shutdown is always exit(0)
+//   • gettid() != getpid() — AnoSDK runs on its own background thread;
+//     the main thread has tid == pid in Android.
 [[noreturn]] static void hook_exit(int code) {
-    if (code != 0) {
-        LOGE("BLOCKED exit(%d) — AnoSDK kill suppressed", code);
+    bool from_bg_thread = (gettid() != getpid());
+    if (code != 0 || from_bg_thread) {
+        LOGE("BLOCKED exit(%d) tid=%d pid=%d — AnoSDK kill suppressed",
+             code, gettid(), getpid());
         for (;;) usleep(2000000);
     }
-    // Normal clean shutdown (code == 0) — allow it
+    // Legitimate clean shutdown from main thread
     if (orig_exit) { orig_exit(0); __builtin_unreachable(); }
     ::_Exit(0);
 }
 
 [[noreturn]] static void hook__exit(int code) {
-    if (code != 0) {
-        LOGE("BLOCKED _exit(%d) — AnoSDK kill suppressed", code);
+    bool from_bg_thread = (gettid() != getpid());
+    if (code != 0 || from_bg_thread) {
+        LOGE("BLOCKED _exit(%d) tid=%d pid=%d — AnoSDK kill suppressed",
+             code, gettid(), getpid());
         for (;;) usleep(2000000);
     }
     if (orig__exit) { orig__exit(0); __builtin_unreachable(); }
@@ -66,7 +74,7 @@ static int   (*orig_ms_scan_start)(int, void *)               = nullptr;
     for (;;) usleep(2000000);
 }
 
-// Block SIGABRT / SIGKILL sent to self — AnoSDK's kill(getpid(), SIGABRT) path
+// Block SIGABRT / SIGKILL / SIGTERM sent to self — AnoSDK's kill(getpid(), sig) path
 static int hook_kill(pid_t pid, int sig) {
     pid_t self = getpid();
     if ((pid == self || pid == 0) &&
@@ -74,8 +82,9 @@ static int hook_kill(pid_t pid, int sig) {
         LOGE("BLOCKED kill(%d, %d) to self — AnoSDK kill suppressed", pid, sig);
         return 0;
     }
+    // Pass through all other kill() calls via syscall to avoid PLT re-entrance
     if (orig_kill) return orig_kill(pid, sig);
-    return 0;
+    return (int)syscall(SYS_kill, pid, sig);
 }
 
 // AnoSDK also uses tgkill(pid, tid, sig) to kill specific threads
@@ -88,6 +97,18 @@ static int hook_tgkill(int tgid, int tid, int sig) {
     }
     // Use raw syscall to avoid infinite recursion through our own hook
     return (int)syscall(SYS_tgkill, tgid, tid, sig);
+}
+
+// pthread_kill(thread, sig) — explicit hook so libanogs.so can't bypass tgkill hook
+// via a different Bionic entry point. We mirror the tgkill logic.
+static int hook_pthread_kill(pthread_t thread, int sig) {
+    // Check if the target thread belongs to our process
+    if (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM) {
+        LOGE("BLOCKED pthread_kill(tid, %d) — AnoSDK kill suppressed", sig);
+        return 0;
+    }
+    if (orig_pthread_kill) return orig_pthread_kill(thread, sig);
+    return 0;
 }
 
 // ── Phase 2 hooks ─────────────────────────────────────────────────────────────
@@ -150,11 +171,11 @@ static void installAnogsApiHooks() {
 }
 
 // ── Watcher thread ────────────────────────────────────────────────────────────
-static volatile bool g_watcher_stop = false;
+static std::atomic<bool> g_watcher_stop{false};
 
 static void *libanos_watcher(void *) {
     // Poll every 100ms for up to 60 seconds
-    for (int i = 0; i < 600 && !g_watcher_stop; ++i) {
+    for (int i = 0; i < 600 && !g_watcher_stop.load(std::memory_order_acquire); ++i) {
         usleep(100000);
         void *h = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
         if (h) {
@@ -183,15 +204,21 @@ void AnoBypass::installEarly() {
                          (void *)hook_kill,    (void **)&orig_kill,    "KillBlock");
     bool e5 = e.hookSym("libc.so", "tgkill",
                          (void *)hook_tgkill,  (void **)&orig_tgkill,  "TgkillBlock");
+    bool e6 = e.hookSym("libc.so", "pthread_kill",
+                         (void *)hook_pthread_kill,
+                         (void **)&orig_pthread_kill, "PthreadKillBlock");
 
-    // Belt-and-suspenders: also ignore SIGABRT at the signal level
+    // Belt-and-suspenders: ignore SIGABRT + SIGTERM at the signal delivery level.
+    // This catches signals delivered before our kill/tgkill hooks are hit,
+    // and covers any delivery path that bypasses those hooks.
     struct sigaction sa{};
     sa.sa_handler = SIG_IGN;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
-    LOGI("Phase 1 early hooks: exit=%d _exit=%d abort=%d kill=%d tgkill=%d",
-         e1, e2, e3, e4, e5);
+    LOGI("Phase 1 early hooks: exit=%d _exit=%d abort=%d kill=%d tgkill=%d pthread_kill=%d",
+         e1, e2, e3, e4, e5, e6);
 }
 
 void AnoBypass::startWatcher() {
@@ -215,6 +242,6 @@ bool AnoBypass::install() {
 }
 
 void AnoBypass::remove() {
-    g_watcher_stop = true;
+    g_watcher_stop.store(true, std::memory_order_release);
     LOGI("AnoSDK bypass removed");
 }
