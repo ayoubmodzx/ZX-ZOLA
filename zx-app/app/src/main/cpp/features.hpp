@@ -23,10 +23,12 @@ enum FeatureCmd {
     CMD_ANTI_AIM         = 25,  // randomise our own aim angles vs enemy aimbots
     CMD_AUTO_REVIVE      = 26,  // auto trigger revive on downed teammate
     CMD_WALL_SHOOT       = 27,  // disable ray-cast line-of-sight check on fire
+    CMD_BULLET_DAMAGE    = 28,  // multiply outgoing bullet damage before each shot
 };
 
 namespace Features {
     void init();
+    bool isReady();   // true once at least one game hook is installed
     void apply(int cmd, bool enable);
     void applyIntensity(int cmd, int intensity); // 0-100 percent
 }

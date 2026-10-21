@@ -1,9 +1,19 @@
 #pragma once
 #include <cstdint>
 
-// AnoSDK bypass — neutralize Free Fire's anti-cheat reporting
-// libanogs.so exports: AnoSDKIoctl, AnoSDKGetReportData(2/3/4), ms_scan_start
 namespace AnoBypass {
-    bool install();    // hook all AnoSDK report functions
-    void remove();     // clean up before app exits
+    // Phase 1 — Hook libc.so: exit/_exit/abort/kill
+    // libc.so is ALWAYS loaded. Call synchronously in postAppSpecialize
+    // before any worker thread, so hooks fire before any game lib loads.
+    void installEarly();
+
+    // Phase 2 — Launch a detached watcher thread that polls for libanogs.so
+    // every 100ms and installs SDK-level API hooks once it appears.
+    // Call from the async worker thread.
+    void startWatcher();
+
+    // Legacy combined entry-point (installEarly + startWatcher).
+    bool install();
+
+    void remove();
 }

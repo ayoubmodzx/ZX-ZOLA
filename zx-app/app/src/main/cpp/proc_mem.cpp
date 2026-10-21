@@ -20,7 +20,13 @@ void ProcMem::close() {
 
 bool ProcMem::read(uintptr_t addr, void *buf, size_t len) {
     if (g_mem_fd < 0) return false;
-    return pread64(g_mem_fd, buf, len, (off64_t)addr) == (ssize_t)len;
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = pread64(g_mem_fd, (char*)buf + done, len - done, (off64_t)(addr + done));
+        if (n <= 0) return false;
+        done += (size_t)n;
+    }
+    return true;
 }
 
 bool ProcMem::write(uintptr_t addr, const void *buf, size_t len) {

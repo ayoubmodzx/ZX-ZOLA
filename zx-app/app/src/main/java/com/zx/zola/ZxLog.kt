@@ -16,6 +16,8 @@ object ZxLog {
     fun i(msg: String) = add('I', msg)
     fun w(msg: String) = add('W', msg)
     fun e(msg: String) = add('E', msg)
+    // Module logcat lines — shown with [MOD] prefix so they're distinct from app events
+    fun module(msg: String, level: Char = 'I') = add(level, "[MOD] $msg")
 
     private fun add(level: Char, msg: String) {
         val ts = synchronized(fmt) { fmt.format(Date()) }

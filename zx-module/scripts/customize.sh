@@ -24,8 +24,8 @@ done
 [ "$support" = "false" ] && abort "! Unsupported ABI: $ARCH"
 
 ui_print "- Extracting module files"
-extract "$ZIPFILE" 'module.prop'   "$MODPATH"
-extract "$ZIPFILE" 'service.sh'    "$MODPATH"
+unzip -o -j "$ZIPFILE" 'module.prop' -d "$MODPATH" >&2 || abort "! Failed to extract module.prop"
+unzip -o -j "$ZIPFILE" 'service.sh'  -d "$MODPATH" >&2 || abort "! Failed to extract service.sh"
 
 mkdir -p "$MODPATH/zygisk"
 
@@ -41,12 +41,14 @@ esac
 
 [ -n "$ABI64" ] && {
     ui_print "- Extracting $ABI64 library"
-    extract "$ZIPFILE" "zygisk/$ABI64.so" "$MODPATH/zygisk"
+    unzip -o -j "$ZIPFILE" "zygisk/$ABI64.so" -d "$MODPATH/zygisk" >&2
+    [ -f "$MODPATH/zygisk/$ABI64.so" ] || abort "! Failed to extract $ABI64 library"
 }
 
-[ -n "$ABI32" ] && {
+# ABI32 is optional — only extract if present in the zip
+[ -n "$ABI32" ] && unzip -l "$ZIPFILE" "zygisk/$ABI32.so" >/dev/null 2>&1 && {
     ui_print "- Extracting $ABI32 library"
-    extract "$ZIPFILE" "zygisk/$ABI32.so" "$MODPATH/zygisk"
+    unzip -o -j "$ZIPFILE" "zygisk/$ABI32.so" -d "$MODPATH/zygisk" >&2
 }
 
 chmod 755 "$MODPATH/service.sh"

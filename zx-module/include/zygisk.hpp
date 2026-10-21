@@ -1,6 +1,6 @@
 #pragma once
-// Official Zygisk API v4 — matches Magisk 24.2+ ABI exactly
-// Stub methods replaced with real api_table function-pointer dispatch.
+// Zygisk API v4 — broadest compatibility (Magisk 26+, KernelSU+ZygiskNext)
+// API v5 is rejected by ZygiskNext whose ZYGISK_API_VERSION ceiling is 4.
 #include <jni.h>
 #include <cstdint>
 #include <sys/types.h>
@@ -15,130 +15,138 @@ enum Option : int {
 };
 
 struct AppSpecializeArgs {
-    jint        &uid;
-    jint        &gid;
-    jintArray   &gids;
-    jint        &runtime_flags;
-    jint        &mount_external;
-    jstring     &se_info;
-    jstring     &nice_name;
-    jstring     &instruction_set;
-    jstring     &app_data_dir;
-    jboolean    *const is_child_zygote;
-    jboolean    *const is_top_app;
+    jint         &uid;
+    jint         &gid;
+    jintArray    &gids;
+    jint         &runtime_flags;
+    jint         &mount_external;
+    jstring      &se_info;
+    jstring      &nice_name;
+    jstring      &instruction_set;
+    jstring      &app_data_dir;
+    jboolean     *const is_child_zygote;
+    jboolean     *const is_top_app;
     jobjectArray *const pkg_data_info_list;
     jobjectArray *const whitelisted_data_info_list;
-    jboolean    *const mount_data_dirs;
-    jboolean    *const mount_storage_dirs;
+    jboolean     *const mount_data_dirs;
+    jboolean     *const mount_storage_dirs;
 };
 
 struct ServerSpecializeArgs {
-    jint  &uid;
-    jint  &gid;
+    jint      &uid;
+    jint      &gid;
     jintArray &gids;
-    jint  &runtime_flags;
-    jlong &permitted_capabilities;
-    jlong &effective_capabilities;
+    jint      &runtime_flags;
+    jlong     &permitted_capabilities;
+    jlong     &effective_capabilities;
 };
 
-namespace internal { struct api_table; struct module_abi; }
-
+// Forward declarations — must be complete before module_abi ctor body
+class Api;
 class ModuleBase;
 
-class Api {
-public:
-    void setOption(Option opt) {
-        if (impl && impl->setOption) impl->setOption(impl, opt);
-    }
-    int connectCompanion() {
-        return (impl && impl->connectCompanion) ? impl->connectCompanion(impl) : -1;
-    }
-    void hookJniNativeMethods(JNIEnv *env, const char *cls,
-                              JNINativeMethod *methods, int count) {
-        if (impl && impl->hookJniNativeMethods)
-            impl->hookJniNativeMethods(env, cls, methods, count);
-    }
-    void pltHookRegister(dev_t dev, ino_t inode,
-                         const char *sym, void *newFn, void **oldFn) {
-        if (impl && impl->pltHookRegister)
-            impl->pltHookRegister(dev, inode, sym, newFn, oldFn);
-    }
-    void pltHookExclude(const char *module, const char *sym) {
-        if (impl && impl->pltHookExclude) impl->pltHookExclude(module, sym);
-    }
-    bool pltHookCommit() {
-        return (impl && impl->pltHookCommit) ? impl->pltHookCommit() : false;
-    }
-private:
-    internal::api_table *impl;
-    Api() = delete;
-    explicit Api(internal::api_table *t) : impl(t) {}
-    friend struct internal::api_table;
-    friend struct internal::module_abi;
-};
-
-class ModuleBase {
-public:
-    virtual void onLoad(Api *api, JNIEnv *env)                           {}
-    virtual void preAppSpecialize(AppSpecializeArgs *args)               {}
-    virtual void postAppSpecialize(const AppSpecializeArgs *args)        {}
-    virtual void preServerSpecialize(ServerSpecializeArgs *args)         {}
-    virtual void postServerSpecialize(const ServerSpecializeArgs *args)  {}
-    virtual ~ModuleBase() = default;
-};
-
-// ── Internal ABI structures ────────────────────────────────────────────────
 namespace internal {
 
 struct api_table {
-    void *_reserved;                    // Magisk-internal use
-    bool (*registerModule)(api_table *, long *);
-    void (*hookJniNativeMethods)(JNIEnv *, const char *, JNINativeMethod *, int);
-    void (*pltHookRegister)(dev_t, ino_t, const char *, void *, void **);
-    void (*pltHookExclude)(const char *, const char *);
-    bool (*pltHookCommit)();
-    int  (*connectCompanion)(api_table *);
-    void (*setOption)(api_table *, Option);
+    void    *impl;
+    bool     (*registerModule)(api_table *, struct module_abi *);
+    void     (*hookJniNativeMethods)(JNIEnv *, const char *, JNINativeMethod *, int);
+    void     (*pltHookRegister)(dev_t, ino_t, const char *, void *, void **);
+    bool     (*exemptFd)(int);
+    bool     (*pltHookCommit)();
+    int      (*connectCompanion)(void *);
+    void     (*setOption)(void *, Option);
+    int      (*getModuleDir)(void *);
+    uint32_t (*getFlags)(void *);
 };
 
 struct module_abi {
-    long         api_version;   // must be first — Magisk reads this to gate compat
-    ModuleBase  *module;
+    long        api_version;
+    ModuleBase *impl;
+
     void (*preAppSpecialize)   (ModuleBase *, AppSpecializeArgs *);
     void (*postAppSpecialize)  (ModuleBase *, const AppSpecializeArgs *);
     void (*preServerSpecialize)(ModuleBase *, ServerSpecializeArgs *);
     void (*postServerSpecialize)(ModuleBase *, const ServerSpecializeArgs *);
+
+    // Defined after ModuleBase is complete (see bottom of this namespace block)
+    explicit module_abi(ModuleBase *module);
 };
 
 } // namespace internal
 
-// ── Module registration macro ──────────────────────────────────────────────
-// Entry point Magisk dlsym-looks for. Takes internal api_table*, calls
-// registerModule so Magisk knows our ABI version and callback table.
-#define REGISTER_ZYGISK_MODULE(clazz)                                            \
-extern "C" __attribute__((visibility("default")))                                \
-void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) {     \
-    static clazz _module;                                                        \
-    static zygisk::internal::module_abi _abi = {                                 \
-        ZYGISK_API_VERSION,                                                      \
-        &_module,                                                                \
-        [](zygisk::ModuleBase *m, zygisk::AppSpecializeArgs *a) {               \
-            m->preAppSpecialize(a);                                              \
-        },                                                                       \
-        [](zygisk::ModuleBase *m, const zygisk::AppSpecializeArgs *a) {         \
-            m->postAppSpecialize(a);                                             \
-        },                                                                       \
-        [](zygisk::ModuleBase *m, zygisk::ServerSpecializeArgs *a) {            \
-            m->preServerSpecialize(a);                                           \
-        },                                                                       \
-        [](zygisk::ModuleBase *m, const zygisk::ServerSpecializeArgs *a) {      \
-            m->postServerSpecialize(a);                                          \
-        },                                                                       \
-    };                                                                           \
-    static zygisk::Api _api(table);  /* static: table ptr is Magisk-owned, lives forever */ \
-    if (table && table->registerModule && table->registerModule(table, (long *)&_abi)) { \
-        _module.onLoad(&_api, env);                                              \
-    }                                                                            \
+// ── Api ── (defined before ModuleBase so ModuleBase can use Api*)
+class Api {
+public:
+    internal::api_table *tbl = nullptr;
+
+    void setOption(Option opt) {
+        if (tbl && tbl->setOption) tbl->setOption(tbl->impl, opt);
+    }
+    int connectCompanion() {
+        return (tbl && tbl->connectCompanion) ? tbl->connectCompanion(tbl->impl) : -1;
+    }
+    int getModuleDir() {
+        return (tbl && tbl->getModuleDir) ? tbl->getModuleDir(tbl->impl) : -1;
+    }
+    uint32_t getFlags() {
+        return (tbl && tbl->getFlags) ? tbl->getFlags(tbl->impl) : 0u;
+    }
+    void hookJniNativeMethods(JNIEnv *env, const char *cls,
+                              JNINativeMethod *methods, int count) {
+        if (tbl && tbl->hookJniNativeMethods)
+            tbl->hookJniNativeMethods(env, cls, methods, count);
+    }
+    void pltHookRegister(dev_t dev, ino_t inode,
+                         const char *sym, void *newFn, void **oldFn) {
+        if (tbl && tbl->pltHookRegister)
+            tbl->pltHookRegister(dev, inode, sym, newFn, oldFn);
+    }
+    bool pltHookCommit() {
+        return (tbl && tbl->pltHookCommit) ? tbl->pltHookCommit() : false;
+    }
+};
+
+// ── ModuleBase ────────────────────────────────────────────────────────────────
+class ModuleBase {
+public:
+    virtual void onLoad(Api *api, JNIEnv *env)                          {}
+    virtual void preAppSpecialize(AppSpecializeArgs *args)              {}
+    virtual void postAppSpecialize(const AppSpecializeArgs *args)       {}
+    virtual void preServerSpecialize(ServerSpecializeArgs *args)        {}
+    virtual void postServerSpecialize(const ServerSpecializeArgs *args) {}
+    virtual ~ModuleBase() = default;
+};
+
+// ── module_abi constructor + entry_impl (ModuleBase now complete) ─────────────
+namespace internal {
+
+inline module_abi::module_abi(ModuleBase *module)
+    : api_version(ZYGISK_API_VERSION), impl(module) {
+    preAppSpecialize     = [](ModuleBase *m, AppSpecializeArgs *a)         { m->preAppSpecialize(a); };
+    postAppSpecialize    = [](ModuleBase *m, const AppSpecializeArgs *a)   { m->postAppSpecialize(a); };
+    preServerSpecialize  = [](ModuleBase *m, ServerSpecializeArgs *a)      { m->preServerSpecialize(a); };
+    postServerSpecialize = [](ModuleBase *m, const ServerSpecializeArgs *a){ m->postServerSpecialize(a); };
+}
+
+template <class T>
+void entry_impl(api_table *table, JNIEnv *env) {
+    static Api api;
+    api.tbl = table;
+    static T module;
+    ModuleBase *m = &module;
+    static module_abi abi(m);
+    if (!table->registerModule(table, &abi)) return;
+    m->onLoad(&api, env);
+}
+
+} // namespace internal
+
+// ── Entry-point macro ─────────────────────────────────────────────────────────
+#define REGISTER_ZYGISK_MODULE(clazz)                                              \
+extern "C" __attribute__((visibility("default")))                                  \
+void zygisk_module_entry(zygisk::internal::api_table *table, JNIEnv *env) {       \
+    zygisk::internal::entry_impl<clazz>(table, env);                               \
 }
 
 } // namespace zygisk

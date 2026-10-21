@@ -12,8 +12,14 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-static constexpr const char *FF_PKG     = "com.dts.freefireth";
-static constexpr const char *FF_PKG_MAX = "com.dts.freefiremax";
+// All known Free Fire package names — must match exactly what Zygote sees
+static constexpr const char *kFfPkgs[] = {
+    "com.dts.freefireth",      // FF global (older)
+    "com.dts.freefiremax",     // FF MAX global
+    "com.garena.game.fftw",    // FF Garena (SEA / most regions)
+    "com.garena.game.kgtw",    // FF Korea
+    nullptr
+};
 
 static AsyncWorker g_worker;
 
@@ -37,7 +43,10 @@ public:
         const char *pkg = m_env->GetStringUTFChars(args->nice_name, nullptr);
         if (!pkg) { m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
 
-        bool is_ff = (strcmp(pkg, FF_PKG) == 0 || strcmp(pkg, FF_PKG_MAX) == 0);
+        bool is_ff = false;
+        for (int i = 0; kFfPkgs[i]; ++i) {
+            if (strcmp(pkg, kFfPkgs[i]) == 0) { is_ff = true; break; }
+        }
         m_env->ReleaseStringUTFChars(args->nice_name, pkg);
 
         if (!is_ff) {
@@ -53,27 +62,33 @@ public:
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!m_target) return;
 
+        // Phase 1: Hook libc.so kill/exit/abort IMMEDIATELY on the main thread.
+        // libc.so is always loaded at this point — hooks succeed before any game
+        // library (including libanogs.so) has a chance to load and call exit().
+        AnoBypass::installEarly();
+
         g_worker.start();
 
         g_worker.post([] {
-            // 1. Hide ourselves from AnoSDK memory scan first
+            // Hide ourselves from AnoSDK memory scan
             if (MemoryGuard::init()) {
                 MemoryGuard::hideSelf();
             }
 
-            // 2. Intercept AnoSDK reporting — BEFORE it initializes
-            AnoBypass::install();
+            // Phase 2: Start watcher thread that polls for libanogs.so and
+            // installs SDK-level API hooks once it appears (~100ms intervals)
+            AnoBypass::startWatcher();
 
-            // 3. Init il2cpp API
+            // Init il2cpp API
             if (!Il2CppApi::init()) {
                 LOGE("Il2Cpp init failed");
                 return;
             }
 
-            // 4. Features — run delayed to let il2cpp stabilize
+            // Features — resolve il2cpp classes + start socket server for app control
             FeatureEngine::get().init(&g_worker);
 
-            LOGI("ZX-ZOLA fully loaded");
+            LOGI("ZX-ZOLA fully loaded — listening on \\0zx_zola");
         });
     }
 

@@ -18,6 +18,12 @@
             android:screenOrientation="portrait"
             android:windowSoftInputMode="adjustResize"/>
 
+        <activity
+            android:name=".LogConsoleActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:label="ZX Console"/>
+
         <!-- Launcher alias — can be disabled to hide the icon from the drawer -->
         <activity-alias
             android:name=".MainLauncher"

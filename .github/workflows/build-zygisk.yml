@@ -1,0 +1,277 @@
+name: Build Zygisk Module ZIP
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── NDK setup ────────────────────────────────────────────────────────
+      - name: Install NDK r27c + CMake
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "y" | "$SDKMANAGER" \
+            "ndk;27.2.12479018" \
+            "cmake;3.22.1" \
+            "platforms;android-35" \
+            --sdk_root="$ANDROID_SDK_ROOT" > /dev/null
+
+      - name: Set NDK path
+        run: echo "NDK=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      # ── Validate committed zygisk.hpp ────────────────────────────────────
+      - name: Validate zygisk.hpp
+        run: |
+          echo "=== zygisk.hpp layout check ==="
+          grep -n "registerModule\|ZYGISK_API_VERSION\|api_table\|module_abi" \
+            zx-module/include/zygisk.hpp
+          echo "OK: header present and contains required symbols"
+
+      # ── Configure arm64-v8a (Dobby is fetched during configure) ──────────
+      - name: Configure arm64-v8a
+        run: |
+          cmake -S zx-module -B build/arm64 \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-28 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_STL=c++_static \
+            -GNinja
+
+      # Dobby master has multiple Android NDK regressions in its C++ source.
+      # Patch all known broken files after configure (source is on disk).
+      - name: Patch Dobby ARM64 (ASM + C++ NDK compat)
+        run: |
+          python3 << 'PYEOF'
+          import re, sys, os
+
+          DOBBY = "build/arm64/_deps/dobby-src"
+
+          def patch_dobby(dobby):
+              # ── 1. ARM64 ASM: @PAGE/@PAGEOFF → ELF :lo12: ──────────────────
+              asm = f"{dobby}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
+              if os.path.exists(asm):
+                  with open(asm) as f:
+                      c = f.read()
+                  hits = [(i+1, l) for i,l in enumerate(c.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+                  print(f"[ASM] @PAGE/@PAGEOFF lines before: {len(hits)}")
+                  for n, l in hits: print(f"  {n}: {repr(l)}")
+                  # adrp REG, SYM@PAGE  →  adrp REG, :got:SYM  (ELF PIC GOT-indirect)
+                  c = re.sub(r'(adrp\s+[^\s,]+,\s*)([^\s,@]+)@PAGE\b', r'\1:got:\2', c)
+                  # add DST, SRC, SYM@PAGEOFF  →  ldr DST, [SRC, :got_lo12:SYM]
+                  c = re.sub(r'add\s+([^\s,]+),\s*([^\s,]+),\s*([^\s,@]+)@PAGEOFF',
+                             r'ldr \1, [\2, :got_lo12:\3]', c)
+                  after = [(i+1, l) for i,l in enumerate(c.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+                  print(f"[ASM] Remaining: {len(after)}  (expect 0)")
+                  for n, l in after: print(f"  {n}: {repr(l)}")
+                  if after: sys.exit(1)
+                  with open(asm, 'w') as f: f.write(c)
+                  print("[ASM] Patched")
+              else:
+                  print("[ASM] Not found — skip")
+
+              # ── 2. os_arch_features.h: OSMemory→POSIX (circular include) ───
+              feat_h = f"{dobby}/common/os_arch_features.h"
+              if os.path.exists(feat_h):
+                  with open(feat_h) as f: c = f.read()
+                  if 'OSMemory' in c:
+                      c = '#include <unistd.h>\n#include <sys/mman.h>\n' + c
+                      c = c.replace('OSMemory::PageSize()', 'getpagesize()')
+                      c = re.sub(
+                          r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
+                          r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)', c)
+                      with open(feat_h, 'w') as f: f.write(c)
+                      print("[C++] os_arch_features.h patched")
+              else:
+                  print(f"[C++] {feat_h} not found — skip")
+
+              # ── 3. core/arch/Cpu.h stub (removed/moved in master) ──────────
+              # code-patch-tool-posix.cc includes "core/arch/Cpu.h" which no
+              # longer exists in the master source tree.  Create a minimal stub
+              # using __builtin___clear_cache (standard Android NDK approach).
+              for cpu_dir in [f"{dobby}/core/arch", f"{dobby}/source/core/arch"]:
+                  cpu_h = f"{cpu_dir}/Cpu.h"
+                  if not os.path.exists(cpu_h):
+                      os.makedirs(cpu_dir, exist_ok=True)
+                      with open(cpu_h, 'w') as f:
+                          f.write('#pragma once\n#include <stddef.h>\n'
+                                  'struct Cpu {\n'
+                                  '  static void FlushCache(void* s, size_t n) {\n'
+                                  '    __builtin___clear_cache((char*)s, (char*)s + n);\n'
+                                  '  }\n'
+                                  '  static void FlushCache(void* s, void* e) {\n'
+                                  '    __builtin___clear_cache((char*)s, (char*)e);\n'
+                                  '  }\n'
+                                  '};\n')
+                      print(f"[Cpu.h] Created stub at {cpu_h}")
+
+              # ── 4. ProcessRuntime.h: add load_address field back ────────────
+              # RuntimeModule struct was refactored; .load_address removed.
+              # ProcessRuntime.cc still assigns to it — add the field back.
+              for rt_h in [
+                  f"{dobby}/source/PlatformUtil/ProcessRuntime.h",
+                  f"{dobby}/source/Backend/UserMode/PlatformUtil/ProcessRuntime.h",
+              ]:
+                  if os.path.exists(rt_h):
+                      with open(rt_h) as f: c = f.read()
+                      print(f"[ProcessRuntime.h] {rt_h}:\n{c[:600]}")
+                      if 'RuntimeModule' in c and 'load_address' not in c:
+                          c = re.sub(r'(struct RuntimeModule\s*\{)',
+                                     r'\1\n  void* load_address = nullptr;', c)
+                          with open(rt_h, 'w') as f: f.write(c)
+                          print("[ProcessRuntime.h] Patched: added load_address")
+                      break
+
+              # ── 5. ProcessRuntime.cc: a.start → a.start() ──────────────────
+              pr_cc = f"{dobby}/source/Backend/UserMode/PlatformUtil/Linux/ProcessRuntime.cc"
+              if os.path.exists(pr_cc):
+                  with open(pr_cc) as f: c = f.read()
+                  if 'a.start < b.start' in c:
+                      c = c.replace('a.start < b.start', 'a.start() < b.start()')
+                      with open(pr_cc, 'w') as f: f.write(c)
+                      print("[ProcessRuntime.cc] Patched: a.start() call")
+              else:
+                  print(f"[ProcessRuntime.cc] Not found — skip")
+
+          patch_dobby(DOBBY)
+          PYEOF
+
+      - name: Build arm64-v8a
+        run: cmake --build build/arm64 --config Release
+
+      # ── Strip libc++_shared from NEEDED (ZygiskNext namespace cannot reach it) ──
+      - name: Strip libc++_shared from NEEDED
+        run: |
+          ARM64_SO="build/arm64/libzx_zola.so"
+          sudo apt-get install -y -q patchelf
+          echo "--- NEEDED before strip ---"
+          patchelf --print-needed "$ARM64_SO"
+          for lib in libc++_shared.so libdobby.so libandroid.so; do
+            if patchelf --print-needed "$ARM64_SO" | grep -qF "$lib"; then
+              patchelf --remove-needed "$lib" "$ARM64_SO"
+              echo "Removed $lib from NEEDED"
+            fi
+          done
+          echo "--- NEEDED after strip ---"
+          patchelf --print-needed "$ARM64_SO"
+
+      # ── Verify symbols ───────────────────────────────────────────────────────
+      - name: Verify symbol export
+        run: |
+          ARM64_SO="build/arm64/libzx_zola.so"
+          READELF="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          NM="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm"
+
+          if ! "$NM" -D "$ARM64_SO" 2>/dev/null | grep -q "zygisk_module_entry"; then
+            echo "ERROR: zygisk_module_entry not exported in $ARM64_SO"
+            "$NM" -D "$ARM64_SO" || true
+            exit 1
+          fi
+          echo "OK: zygisk_module_entry found in $ARM64_SO"
+
+          echo "--- NEEDED libs ---"
+          "$READELF" -d "$ARM64_SO" | grep NEEDED
+          BANNED="libandroid.so libdobby.so libc++_shared.so"
+          FAIL=0
+          for lib in $BANNED; do
+            if "$READELF" -d "$ARM64_SO" | grep NEEDED | grep -q "$lib"; then
+              echo "ERROR: $lib in NEEDED — not available in ZygiskNext linker namespace"
+              FAIL=1
+            fi
+          done
+          [ "$FAIL" = "1" ] && exit 1
+          echo "OK: no banned libs in NEEDED"
+
+          # Critical: all C++ symbols from libc++_shared must be statically absorbed.
+          # @LIBC-versioned symbols (__cxa_atexit@LIBC, __cxa_finalize@LIBC) come from
+          # libc.so (always available in every namespace) — exclude them from the check.
+          UND_CXX=$("$READELF" --dyn-syms "$ARM64_SO" | grep ' UND ' \
+            | grep -E '_ZN|__cxa|_Znw|_Zdl|_ZSt|_ZTI|_ZTV' \
+            | grep -v '@LIBC' \
+            | wc -l || echo 0)
+          echo "UND C++ symbols (libc++_shared): $UND_CXX"
+          if [ "$UND_CXX" -gt "0" ]; then
+            echo "ERROR: $UND_CXX UND C++ symbols remain — static absorption incomplete"
+            "$READELF" --dyn-syms "$ARM64_SO" | grep ' UND ' \
+              | grep -E '_ZN|__cxa|_Znw|_Zdl|_ZSt|_ZTI|_ZTV' | grep -v '@LIBC' | head -30
+            exit 1
+          fi
+          echo "OK: all C++ runtime symbols statically absorbed — zero libc++_shared dependency"
+
+      # ── Compute SHA256 for runtime verification ──────────────────────────
+      - name: Compute library hashes
+        id: hashes
+        run: |
+          ARM64_HASH=$(sha256sum build/arm64/libzx_zola.so | awk '{print $1}')
+          echo "arm64=$ARM64_HASH" >> "$GITHUB_OUTPUT"
+          echo "arm64 SHA256: $ARM64_HASH"
+
+      # ── Stage module ZIP contents ────────────────────────────────────────
+      - name: Stage module structure
+        run: |
+          STAGE="staging/zx_zola_zygisk"
+          mkdir -p "$STAGE/META-INF/com/google/android"
+          mkdir -p "$STAGE/zygisk"
+
+          # Copy pre-committed META-INF files — avoids external URL fragility
+          cp zx-module/META-INF/com/google/android/update-binary  "$STAGE/META-INF/com/google/android/update-binary"
+          cp zx-module/META-INF/com/google/android/updater-script "$STAGE/META-INF/com/google/android/updater-script"
+
+          # Module files
+          cp zx-module/module.prop           "$STAGE/module.prop"
+          cp zx-module/scripts/customize.sh  "$STAGE/customize.sh"
+          cp zx-module/scripts/service.sh    "$STAGE/service.sh"
+
+          # Native library (Zygisk arm64-v8a only — Free Fire is 64-bit on modern Android)
+          cp build/arm64/libzx_zola.so       "$STAGE/zygisk/arm64-v8a.so"
+
+          chmod 755 "$STAGE/META-INF/com/google/android/update-binary"
+          chmod 755 "$STAGE/customize.sh"
+          chmod 755 "$STAGE/service.sh"
+
+      # ── Pack ZIP ─────────────────────────────────────────────────────────
+      - name: Create module ZIP
+        run: |
+          # Fixed name so softprops overwrites the same asset every push
+          ZIPNAME="ZX-ZOLA-module.zip"
+          echo "ZIPNAME=$ZIPNAME" >> "$GITHUB_ENV"
+
+          cd staging/zx_zola_zygisk
+          zip -r9 "../../$ZIPNAME" . -x "*.DS_Store"
+          cd ../..
+
+          echo "ZIP size: $(du -sh "$ZIPNAME" | cut -f1)"
+          echo "ZIP SHA256: $(sha256sum "$ZIPNAME" | awk '{print $1}')"
+
+      # ── Upload artifact ──────────────────────────────────────────────────
+      - name: Upload module ZIP
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        with:
+          name: ZX-ZOLA-module
+          path: ZX-ZOLA-module.zip
+          retention-days: 1
+
+      - name: Release dev build
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          name: "ZX Dev Build (latest)"
+          prerelease: true
+          body: |
+            **arm64-v8a SHA256:** `${{ steps.hashes.outputs.arm64 }}`
+            **Build:** #${{ github.run_number }} — commit `${{ github.sha }}`
+          files: ZX-ZOLA-module.zip
+          generate_release_notes: false
+          overwrite_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

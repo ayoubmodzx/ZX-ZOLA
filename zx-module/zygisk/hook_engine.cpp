@@ -33,7 +33,8 @@ bool HookEngine::hookAddr(void *target, void *replacement,
         return false;
     }
 
-    m_hooks[key] = { .original = *original,
+    // original may be nullptr when caller doesn't need the trampoline
+    m_hooks[key] = { .original    = (original ? *original : nullptr),
                      .replacement = replacement,
                      .trampoline  = original,
                      .installed   = true };
@@ -54,8 +55,8 @@ bool HookEngine::hookSym(const char *lib, const char *symbol,
     dlclose(handle);
 
     if (!sym) {
-        // Try Dobby's resolver as fallback
-        sym = DobbySymbolResolver(lib, symbol);
+        // Fallback: global symbol table
+        sym = dlsym(RTLD_DEFAULT, symbol);
     }
 
     if (!sym) {
