@@ -241,9 +241,8 @@ jobs:
       # ── Pack ZIP ─────────────────────────────────────────────────────────
       - name: Create module ZIP
         run: |
-          VERSION=$(grep '^version=' zx-module/module.prop | cut -d= -f2 | tr -d ' ')
-          BUILD="${{ github.run_number }}"
-          ZIPNAME="ZX-ZOLA-${VERSION}-build${BUILD}.zip"
+          # Fixed name so softprops overwrites the same asset every push
+          ZIPNAME="ZX-ZOLA-module.zip"
           echo "ZIPNAME=$ZIPNAME" >> "$GITHUB_ENV"
 
           cd staging/zx_zola_zygisk
@@ -258,8 +257,8 @@ jobs:
         uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
-          name: ${{ env.ZIPNAME }}
-          path: ${{ env.ZIPNAME }}
+          name: ZX-ZOLA-module
+          path: ZX-ZOLA-module.zip
           retention-days: 1
 
       - name: Release dev build
@@ -268,8 +267,11 @@ jobs:
           tag_name: dev-latest
           name: "ZX Dev Build (latest)"
           prerelease: true
-          body: "arm64-v8a SHA256: `${{ steps.hashes.outputs.arm64 }}`"
-          files: ${{ env.ZIPNAME }}
+          body: |
+            **arm64-v8a SHA256:** `${{ steps.hashes.outputs.arm64 }}`
+            **Build:** #${{ github.run_number }} — commit `${{ github.sha }}`
+          files: ZX-ZOLA-module.zip
           generate_release_notes: false
+          overwrite_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
