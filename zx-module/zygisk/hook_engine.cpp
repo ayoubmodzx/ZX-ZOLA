@@ -33,7 +33,8 @@ bool HookEngine::hookAddr(void *target, void *replacement,
         return false;
     }
 
-    m_hooks[key] = { .original = *original,
+    // original may be nullptr when caller doesn't need the trampoline
+    m_hooks[key] = { .original    = (original ? *original : nullptr),
                      .replacement = replacement,
                      .trampoline  = original,
                      .installed   = true };

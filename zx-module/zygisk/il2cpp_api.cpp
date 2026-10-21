@@ -105,7 +105,7 @@ void Il2CppApi::getStaticValue(FieldInfo *field, void *out) {
         il2cpp_field_static_get_value(field, out);
 }
 
-void Il2CppApi::setStaticValue(MethodInfo *method, FieldInfo *field, void *val) {
+void Il2CppApi::setStaticValue(MethodInfo * /*unused*/, FieldInfo *field, void *val) {
     if (field && il2cpp_field_static_set_value)
         il2cpp_field_static_set_value(field, val);
 }

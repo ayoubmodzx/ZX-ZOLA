@@ -83,7 +83,7 @@ static bool findSelfRange(const char *so_name,
 
 bool MemoryGuard::init() {
     // No external dependency — ELF-zeroing always available
-    LOGI("MemoryGuard ready (ELF-zeroing + VMA-rename mode)");
+    LOGI("MemoryGuard ready (ELF-zeroing + VMA-rename + dl_iterate_phdr hook)");
     return true;
 }
 

@@ -380,7 +380,7 @@ void FeatureEngine::dispatch(uint8_t cmd, bool enable, float intensity) {
         case ZX_VEHICLE_SPEED: applyVehicleSpeed(enable, intensity > 0.f ? intensity / 100.f + 1.f : 2.0f); break;
 
         // ── Visual ──────────────────────────────────────────────────────────
-        case ZX_WIDE_POV:      applyWidePOV(intensity > 0.f ? intensity : 85.0f); break;
+        case ZX_WIDE_POV:      applyWidePOV(enable ? (intensity > 0.f ? intensity : 85.0f) : 0.f); break;
         case ZX_NO_GRASS:      applyNoGrass(enable); break;
 
         // ── Survival ────────────────────────────────────────────────────────
