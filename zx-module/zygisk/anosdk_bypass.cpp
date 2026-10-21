@@ -30,12 +30,15 @@ static int  (*orig_tgkill)(int, int, int)        = nullptr;
 static int  (*orig_pthread_kill)(pthread_t, int) = nullptr;
 
 // ── Original pointers — Phase 2 (libanogs.so) ────────────────────────────────
-static int   (*orig_AnoSDKIoctl)(int, void *, int)            = nullptr;
-static void* (*orig_AnoSDKGetReportData)(int *)               = nullptr;
-static void* (*orig_AnoSDKGetReportData2)(int, int *)         = nullptr;
-static void* (*orig_AnoSDKGetReportData3)(int, int *, int)    = nullptr;
-static void* (*orig_AnoSDKGetReportData4)(int, int *, int, int) = nullptr;
-static int   (*orig_ms_scan_start)(int, void *)               = nullptr;
+static int   (*orig_AnoSDKIoctl)(int, void *, int)               = nullptr;
+static int   (*orig_AnoSDKIoctlOld)(int, void *, int)            = nullptr;
+static void* (*orig_AnoSDKGetReportData)(int *)                  = nullptr;
+static void* (*orig_AnoSDKGetReportData2)(int, int *)            = nullptr;
+static void* (*orig_AnoSDKGetReportData3)(int, int *, int)       = nullptr;
+static void* (*orig_AnoSDKGetReportData4)(int, int *, int, int)  = nullptr;
+static void  (*orig_AnoSDKDelReportData)(void *)                 = nullptr;
+static void  (*orig_AnoSDKDelReportData3)(void *, int)           = nullptr;
+static void  (*orig_AnoSDKDelReportData4)(void *, int, int)      = nullptr;
 
 // ── Phase 1 hooks ─────────────────────────────────────────────────────────────
 
@@ -114,41 +117,68 @@ static int hook_pthread_kill(pthread_t thread, int sig) {
 // ── Phase 2 hooks ─────────────────────────────────────────────────────────────
 
 // Allow init/heartbeat Ioctl (cmd < 0x10) — server must receive heartbeats
-// or the account gets soft-banned. Drop scan/report commands.
+// or the account gets soft-banned. Drop active-scan trigger commands only.
 static int hook_AnoSDKIoctl(int cmd, void *data, int len) {
     if (cmd < 0x10 && orig_AnoSDKIoctl)
         return orig_AnoSDKIoctl(cmd, data, len);
     return 0;
 }
 
+// AnoSDKIoctlOld — legacy API present in this build; same policy as Ioctl.
+static int hook_AnoSDKIoctlOld(int cmd, void *data, int len) {
+    if (cmd < 0x10 && orig_AnoSDKIoctlOld)
+        return orig_AnoSDKIoctlOld(cmd, data, len);
+    return 0;
+}
+
+// GetReportData — pass through to original so the server receives real (clean)
+// scan reports. MemoryGuard already hides us from dl_iterate_phdr and /proc/self/maps,
+// so the real reports contain no trace of our module. Returning null here would
+// produce an empty-report stream that the server flags as a soft-ban signal.
 static void *hook_AnoSDKGetReportData(int *len) {
+    if (orig_AnoSDKGetReportData) return orig_AnoSDKGetReportData(len);
     if (len) *len = 0; return nullptr;
 }
 static void *hook_AnoSDKGetReportData2(int type, int *len) {
-    (void)type; if (len) *len = 0; return nullptr;
+    if (orig_AnoSDKGetReportData2) return orig_AnoSDKGetReportData2(type, len);
+    if (len) *len = 0; return nullptr;
 }
 static void *hook_AnoSDKGetReportData3(int type, int *len, int flag) {
-    (void)type; (void)flag; if (len) *len = 0; return nullptr;
+    if (orig_AnoSDKGetReportData3) return orig_AnoSDKGetReportData3(type, len, flag);
+    if (len) *len = 0; return nullptr;
 }
 static void *hook_AnoSDKGetReportData4(int type, int *len, int flag, int extra) {
-    (void)type; (void)flag; (void)extra; if (len) *len = 0; return nullptr;
+    if (orig_AnoSDKGetReportData4) return orig_AnoSDKGetReportData4(type, len, flag, extra);
+    if (len) *len = 0; return nullptr;
 }
 
-// Inline hook detector — return 0 (pretend: no hooks found)
-static int hook_ms_scan_start(int type, void *param) {
-    (void)type; (void)param; return 0;
+// DelReportData — complements GetReportData; pass through to avoid leaks.
+static void hook_AnoSDKDelReportData(void *data) {
+    if (orig_AnoSDKDelReportData) orig_AnoSDKDelReportData(data);
+}
+static void hook_AnoSDKDelReportData3(void *data, int flag) {
+    if (orig_AnoSDKDelReportData3) orig_AnoSDKDelReportData3(data, flag);
+}
+static void hook_AnoSDKDelReportData4(void *data, int flag, int extra) {
+    if (orig_AnoSDKDelReportData4) orig_AnoSDKDelReportData4(data, flag, extra);
 }
 
 // ── Phase 2 installer — called from watcher thread once libanogs.so loads ────
 static void installAnogsApiHooks() {
     auto &e = HookEngine::get();
 
+    // Ioctl variants — heartbeats (cmd < 0x10) pass through; scan triggers blocked
     e.hookSym("libanogs.so", "AnoSDKIoctl",
               (void *)hook_AnoSDKIoctl,
-              (void **)&orig_AnoSDKIoctl, "AnoIoctl");
+              (void **)&orig_AnoSDKIoctl,    "AnoIoctl");
+    e.hookSym("libanogs.so", "AnoSDKIoctlOld",
+              (void *)hook_AnoSDKIoctlOld,
+              (void **)&orig_AnoSDKIoctlOld, "AnoIoctlOld");
+
+    // GetReportData — pass through (MemoryGuard ensures reports are clean)
     e.hookSym("libanogs.so", "AnoSDKGetReportData",
               (void *)hook_AnoSDKGetReportData,
-              (void **)&orig_AnoSDKGetReportData, "AnoRep1");
+              (void **)&orig_AnoSDKGetReportData,  "AnoRep1");
     e.hookSym("libanogs.so", "AnoSDKGetReportData2",
               (void *)hook_AnoSDKGetReportData2,
               (void **)&orig_AnoSDKGetReportData2, "AnoRep2");
@@ -158,16 +188,19 @@ static void installAnogsApiHooks() {
     e.hookSym("libanogs.so", "AnoSDKGetReportData4",
               (void *)hook_AnoSDKGetReportData4,
               (void **)&orig_AnoSDKGetReportData4, "AnoRep4");
-    e.hookSym("libanogs.so", "ms_scan_start",
-              (void *)hook_ms_scan_start,
-              (void **)&orig_ms_scan_start, "MsScan");
-    // Internal syms — Dobby resolves via DobbySymbolResolver
-    e.hookSym("libanogs.so", "inline_hook_opcode_dismatch",
-              (void *)hook_ms_scan_start, nullptr, "IHookDetect");
-    e.hookSym("libanogs.so", "set_inline_hook_error",
-              (void *)hook_ms_scan_start, nullptr, "HookErrSet");
 
-    LOGI("Phase 2: API hooks installed on libanogs.so");
+    // DelReportData — must pass through to free memory from GetReportData
+    e.hookSym("libanogs.so", "AnoSDKDelReportData",
+              (void *)hook_AnoSDKDelReportData,
+              (void **)&orig_AnoSDKDelReportData,  "AnoDel1");
+    e.hookSym("libanogs.so", "AnoSDKDelReportData3",
+              (void *)hook_AnoSDKDelReportData3,
+              (void **)&orig_AnoSDKDelReportData3, "AnoDel3");
+    e.hookSym("libanogs.so", "AnoSDKDelReportData4",
+              (void *)hook_AnoSDKDelReportData4,
+              (void **)&orig_AnoSDKDelReportData4, "AnoDel4");
+
+    LOGI("Phase 2: API hooks installed on libanogs.so (Ioctl+IoctlOld blocked, reports pass-through)");
 }
 
 // ── Watcher thread ────────────────────────────────────────────────────────────
