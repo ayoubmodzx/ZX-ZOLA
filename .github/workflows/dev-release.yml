@@ -47,7 +47,7 @@ jobs:
           ./gradlew assembleDebug --no-daemon
 
       # ── Zygisk Module ──────────────────────────────────────────────────────────
-      - name: Build Zygisk .so (arm64-v8a)
+      - name: Configure Zygisk .so (arm64-v8a)
         run: |
           cmake \
             -DCMAKE_TOOLCHAIN_FILE=$NDK_PATH/build/cmake/android.toolchain.cmake \
@@ -55,9 +55,98 @@ jobs:
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
+            -GNinja \
             -B zx-module-build \
             zx-module/
-          cmake --build zx-module-build --target zx_zola -j$(nproc)
+
+      - name: Patch Dobby ARM64 (ASM + C++ NDK compat)
+        run: |
+          python3 << 'PYEOF'
+          import re, sys, os
+
+          DOBBY = "zx-module-build/_deps/dobby-src"
+
+          def patch_dobby(dobby):
+              # ── 1. ARM64 ASM: @PAGE/@PAGEOFF → ELF GOT-indirect ────────────
+              asm = f"{dobby}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm"
+              if os.path.exists(asm):
+                  with open(asm) as f:
+                      c = f.read()
+                  hits = [(i+1, l) for i,l in enumerate(c.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+                  print(f"[ASM] @PAGE/@PAGEOFF lines before: {len(hits)}")
+                  for n, l in hits: print(f"  {n}: {repr(l)}")
+                  # adrp REG, SYM@PAGE  →  adrp REG, :got:SYM
+                  c = re.sub(r'(adrp\s+[^\s,]+,\s*)([^\s,@]+)@PAGE\b', r'\1:got:\2', c)
+                  # add DST, SRC, SYM@PAGEOFF  →  ldr DST, [SRC, :got_lo12:SYM]
+                  c = re.sub(r'add\s+([^\s,]+),\s*([^\s,]+),\s*([^\s,@]+)@PAGEOFF',
+                             r'ldr \1, [\2, :got_lo12:\3]', c)
+                  after = [(i+1, l) for i,l in enumerate(c.splitlines()) if '@PAGE' in l or '@PAGEOFF' in l]
+                  print(f"[ASM] Remaining: {len(after)}  (expect 0)")
+                  for n, l in after: print(f"  {n}: {repr(l)}")
+                  if after: sys.exit(1)
+                  with open(asm, 'w') as f: f.write(c)
+                  print("[ASM] Patched OK")
+              else:
+                  print("[ASM] Not found — skip")
+
+              # ── 2. os_arch_features.h: OSMemory→POSIX ──────────────────────
+              feat_h = f"{dobby}/common/os_arch_features.h"
+              if os.path.exists(feat_h):
+                  with open(feat_h) as f: c = f.read()
+                  if 'OSMemory' in c:
+                      c = '#include <unistd.h>\n#include <sys/mman.h>\n' + c
+                      c = c.replace('OSMemory::PageSize()', 'getpagesize()')
+                      c = re.sub(
+                          r'OSMemory::SetPermission\(([^,]+),\s*([^,]+),\s*[^)]+\)',
+                          r'(mprotect(\1, \2, PROT_READ|PROT_EXEC) == 0)', c)
+                      with open(feat_h, 'w') as f: f.write(c)
+                      print("[C++] os_arch_features.h patched")
+
+              # ── 3. Cpu.h stub ───────────────────────────────────────────────
+              for cpu_dir in [f"{dobby}/core/arch", f"{dobby}/source/core/arch"]:
+                  cpu_h = f"{cpu_dir}/Cpu.h"
+                  if not os.path.exists(cpu_h):
+                      os.makedirs(cpu_dir, exist_ok=True)
+                      with open(cpu_h, 'w') as f:
+                          f.write('#pragma once\n#include <stddef.h>\n'
+                                  'struct Cpu {\n'
+                                  '  static void FlushCache(void* s, size_t n) {\n'
+                                  '    __builtin___clear_cache((char*)s, (char*)s + n);\n'
+                                  '  }\n'
+                                  '  static void FlushCache(void* s, void* e) {\n'
+                                  '    __builtin___clear_cache((char*)s, (char*)e);\n'
+                                  '  }\n'
+                                  '};\n')
+                      print(f"[Cpu.h] Created stub at {cpu_h}")
+
+              # ── 4. ProcessRuntime.h: add load_address field ─────────────────
+              for rt_h in [
+                  f"{dobby}/source/PlatformUtil/ProcessRuntime.h",
+                  f"{dobby}/source/Backend/UserMode/PlatformUtil/ProcessRuntime.h",
+              ]:
+                  if os.path.exists(rt_h):
+                      with open(rt_h) as f: c = f.read()
+                      if 'RuntimeModule' in c and 'load_address' not in c:
+                          c = re.sub(r'(struct RuntimeModule\s*\{)',
+                                     r'\1\n  void* load_address = nullptr;', c)
+                          with open(rt_h, 'w') as f: f.write(c)
+                          print("[ProcessRuntime.h] Patched: added load_address")
+                      break
+
+              # ── 5. ProcessRuntime.cc: a.start → a.start() ──────────────────
+              pr_cc = f"{dobby}/source/Backend/UserMode/PlatformUtil/Linux/ProcessRuntime.cc"
+              if os.path.exists(pr_cc):
+                  with open(pr_cc) as f: c = f.read()
+                  if 'a.start < b.start' in c:
+                      c = c.replace('a.start < b.start', 'a.start() < b.start()')
+                      with open(pr_cc, 'w') as f: f.write(c)
+                      print("[ProcessRuntime.cc] Patched: a.start() call")
+
+          patch_dobby(DOBBY)
+          PYEOF
+
+      - name: Build Zygisk .so
+        run: cmake --build zx-module-build --target zx_zola -j$(nproc)
 
       - name: Package Zygisk Module ZIP
         run: |
