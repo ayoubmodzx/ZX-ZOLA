@@ -50,14 +50,15 @@ void FeatureEngine::resolveClasses() {
     m_cls.Grass     = Il2CppApi::getClass(img, "COW.Graphics", "GrassSystem");
     m_cls.Vehicle   = Il2CppApi::getClass(img, "COW.GamePlay", "Vehicle");
 
-    // All field names are obfuscated — resolve via readable method names only
-    if (m_cls.Player)    m_mth.takeDamage    = Il2CppApi::getMethod(m_cls.Player,    "TakeDamage",               2);
+    // Method names verified against IL2CPP v31 global-metadata.dat (Free Fire OB47)
+    if (m_cls.Player)    m_mth.takeDamage    = Il2CppApi::getMethod(m_cls.Player,    "TakeDamage",               -1);
     if (m_cls.Character) m_mth.setSpeedScale = Il2CppApi::getMethod(m_cls.Character, "SetSpecialRunSpeedScale",   1);
-    if (m_cls.Weapon)    m_mth.recoilFormula = Il2CppApi::getMethod(m_cls.Weapon,    "RecoilFormula",            -1);
-    if (m_cls.Weapon)    m_mth.rateOfFire    = Il2CppApi::getMethod(m_cls.Weapon,    "RateOfFireFormula",        -1);
     if (m_cls.Grass)     m_mth.getGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "get_GrassInstances",        0);
     if (m_cls.Grass)     m_mth.setGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "set_GrassInstances",        1);
     if (m_cls.Aim)       m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,       "CalculateAimPoint",        -1);
+    // Recoil / RoF — fully obfuscated in this build; leave null (features degrade gracefully)
+    m_mth.recoilFormula = nullptr;
+    m_mth.rateOfFire    = nullptr;
 
     // Resolve UnityEngine.Camera.set_fieldOfView for WidePOV
     // Also resolve Transform for Teleport
@@ -79,86 +80,35 @@ void FeatureEngine::resolveClasses() {
             m_mth.getTransform = Il2CppApi::getMethod(component, "get_transform", 0);
     }
 
-    // ESP — visibility gate on Player class
-    if (m_cls.Player) {
-        static const char *kVisNames[] = {
-            "GetIsVisible", "IsVisible", "get_IsVisible",
-            "IsInView", "get_IsInView", "UpdateVisible", nullptr
-        };
-        for (int i = 0; kVisNames[i]; ++i) {
-            MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kVisNames[i], -1);
-            if (m && m->methodPointer) { m_mth.isVisible = m; break; }
-        }
-    }
+    // ESP — IsVisible confirmed at method index 210348 in global-metadata.dat
+    if (m_cls.Player)
+        m_mth.isVisible = Il2CppApi::getMethod(m_cls.Player, "IsVisible", 0);
 
-    // InfiniteAmmo — current clip ammo getter
-    if (m_cls.Weapon) {
-        static const char *kAmmoNames[] = {
-            "GetCurrentClipAmmo", "get_CurrentClipAmmo",
-            "GetAmmoCount",       "get_AmmoCount",
-            "get_Ammo",           "GetAmmo",
-            "GetCurrentAmmo",     "get_CurrentAmmo", nullptr
-        };
-        for (int i = 0; kAmmoNames[i]; ++i) {
-            MethodInfo *m = Il2CppApi::getMethod(m_cls.Weapon, kAmmoNames[i], -1);
-            if (m && m->methodPointer) { m_mth.getCurrentAmmo = m; break; }
-        }
-    }
+    // InfiniteAmmo — get_IsAmmoFree (bool) on PlayerAttributes (index 245979)
+    // WeaponPropertyUtil has 0 exposed methods in this build; PlayerAttributes is the right target
+    if (m_cls.Character)
+        m_mth.getCurrentAmmo = Il2CppApi::getMethod(m_cls.Character, "get_IsAmmoFree", 0);
 
-    // NoReload — reload check
-    if (m_cls.Weapon) {
-        static const char *kReloadNames[] = {
-            "IsNeedReload", "NeedReload", "get_IsNeedReload",
-            "CheckNeedReload", "ShouldReload", nullptr
-        };
-        for (int i = 0; kReloadNames[i]; ++i) {
-            MethodInfo *m = Il2CppApi::getMethod(m_cls.Weapon, kReloadNames[i], -1);
-            if (m && m->methodPointer) { m_mth.isNeedReload = m; break; }
-        }
-    }
+    // NoReload — IsReloading on Player (index 210813)
+    if (m_cls.Player)
+        m_mth.isNeedReload = Il2CppApi::getMethod(m_cls.Player, "IsReloading", 0);
 
-    // WallShoot — bullet wall/obstacle hit check
-    if (m_cls.Bullet) {
-        static const char *kWallNames[] = {
-            "CheckWall", "IsHitWall", "CheckObstacle",
-            "IsBlockedByWall", "HitObstacle", "CheckHitWall",
-            "IsHitStatic", nullptr
-        };
-        for (int i = 0; kWallNames[i]; ++i) {
-            MethodInfo *m = Il2CppApi::getMethod(m_cls.Bullet, kWallNames[i], -1);
-            if (m && m->methodPointer) { m_mth.checkWallHit = m; break; }
-        }
-    }
+    // WallShoot — CanFire on VerticleBulletController (index 257403); return 1 = allowed to fire
+    if (m_cls.Bullet)
+        m_mth.checkWallHit = Il2CppApi::getMethod(m_cls.Bullet, "CanFire", 0);
 
-    // AutoRevive — knockdown state getter
-    if (m_cls.Player) {
-        static const char *kKDNames[] = {
-            "get_IsKnockDown", "IsKnockDown", "GetIsKnockDown",
-            "get_IsKnockedDown", "IsKnockedDown", nullptr
-        };
-        for (int i = 0; kKDNames[i]; ++i) {
-            MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kKDNames[i], -1);
-            if (m && m->methodPointer) { m_mth.isKnockDown = m; break; }
-        }
-    }
+    // AutoRevive — get_IsPendingRevive on Player (index 210262); return 1 triggers revive logic
+    if (m_cls.Player)
+        m_mth.isKnockDown = Il2CppApi::getMethod(m_cls.Player, "get_IsPendingRevive", 0);
 
-    // NoClip — CharacterController collision callback
-    if (m_cls.Character) {
-        m_mth.colliderHit = Il2CppApi::getMethod(m_cls.Character, "OnControllerColliderHit", 1);
-        if (!m_mth.colliderHit && m_cls.Player)
-            m_mth.colliderHit = Il2CppApi::getMethod(m_cls.Player, "OnControllerColliderHit", 1);
-    }
+    // NoClip — interface-mangled name on Player (IL2CPP explicit interface implementation)
+    if (m_cls.Player)
+        m_mth.colliderHit = Il2CppApi::getMethod(m_cls.Player,
+            "COW.GamePlay.IPhysicalCharacter.OnControllerColliderHit", 1);
 
-    // Teleport — Player.Update for per-frame tick hook
-    if (m_cls.Player) {
-        static const char *kUpdateNames[] = {
-            "Update", "LateUpdate", "OnUpdate", "Tick", nullptr
-        };
-        for (int i = 0; kUpdateNames[i]; ++i) {
-            MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kUpdateNames[i], -1);
-            if (m && m->methodPointer) { m_mth.playerUpdate = m; break; }
-        }
-    }
+    // Teleport — OnUpdate on Player (index 210551)
+    if (m_cls.Player)
+        m_mth.playerUpdate = Il2CppApi::getMethod(m_cls.Player, "OnUpdate", 0);
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
     LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p cam_fov:%p",
@@ -288,10 +238,10 @@ static uint8_t hook_is_visible(void *self, void *method) {
     return reinterpret_cast<Fn>(s_orig_visible)(self, method);
 }
 
-// InfiniteAmmo: GetCurrentClipAmmo / get_Ammo → 999
-static int hook_get_ammo(void *self, void *method) {
-    if (s_inf_ammo) return 999;
-    using Fn = int (*)(void *, void *);
+// InfiniteAmmo: get_IsAmmoFree (bool) → 1 = ammo is free/unlimited
+static uint8_t hook_get_ammo(void *self, void *method) {
+    if (s_inf_ammo) return 1;
+    using Fn = uint8_t (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_ammo)(self, method);
 }
 
@@ -302,17 +252,16 @@ static uint8_t hook_is_reload(void *self, void *method) {
     return reinterpret_cast<Fn>(s_orig_reload)(self, method);
 }
 
-// WallShoot: CheckHit / IsHitWall / CheckObstacle → 0 (no wall)
-// Extra void* args absorb any signature variant safely in ARM64
-static uint8_t hook_wall_hit(void *self, void *a1, void *a2, void *method) {
-    if (s_wall_shoot) return 0;
-    using Fn = uint8_t (*)(void *, void *, void *, void *);
-    return reinterpret_cast<Fn>(s_orig_wallhit)(self, a1, a2, method);
+// WallShoot: CanFire → 1 (always allowed to fire, bypasses wall/obstacle check)
+static uint8_t hook_wall_hit(void *self, void *method) {
+    if (s_wall_shoot) return 1;
+    using Fn = uint8_t (*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_wallhit)(self, method);
 }
 
-// AutoRevive: get_IsKnockDown → always false (player never knocked)
+// AutoRevive: get_IsPendingRevive → always true so game triggers revive logic immediately
 static uint8_t hook_is_knockdown(void *self, void *method) {
-    if (s_auto_revive) return 0;
+    if (s_auto_revive) return 1;
     using Fn = uint8_t (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_knockdown)(self, method);
 }
