@@ -40,130 +40,199 @@ void FeatureEngine::resolveClasses() {
     Il2CppImage *img = Il2CppApi::getImage("Assembly-CSharp");
     if (!img) { LOGE("Assembly-CSharp not found"); return; }
 
-    m_cls.Player    = Il2CppApi::getClass(img, "", "PlayerMovement");
-    m_cls.Character = Il2CppApi::getClass(img, "", "CharacterController");
-    m_cls.Health    = Il2CppApi::getClass(img, "", "HealthComponent");
-    m_cls.Weapon    = Il2CppApi::getClass(img, "", "WeaponController");
-    m_cls.Bullet    = Il2CppApi::getClass(img, "", "BulletManager");
-    m_cls.Recoil    = Il2CppApi::getClass(img, "", "RecoilController");
-    m_cls.Camera    = Il2CppApi::getClass(img, "", "CameraController");
-    m_cls.Aim       = Il2CppApi::getClass(img, "", "AimController");
-    m_cls.Grass     = Il2CppApi::getClass(img, "", "GrassManager");
-    m_cls.Vehicle   = Il2CppApi::getClass(img, "", "VehicleController");
+    // Real names verified against IL2CPP v31 global-metadata.dat TypeDefinitions
+    m_cls.Player    = Il2CppApi::getClass(img, "COW.GamePlay", "Player");
+    m_cls.Character = Il2CppApi::getClass(img, "COW.GamePlay", "PlayerAttributes");
+    m_cls.Health    = m_cls.Player;
+    m_cls.Weapon    = Il2CppApi::getClass(img, "COW",          "WeaponPropertyUtil");
+    m_cls.Recoil    = m_cls.Weapon;
+    m_cls.Bullet    = Il2CppApi::getClass(img, "COW.GamePlay", "VerticleBulletController");
+    m_cls.Camera    = Il2CppApi::getClass(img, "COW.GamePlay", "CameraPanZoom");
+    m_cls.Aim       = Il2CppApi::getClass(img, "COW.GamePlay", "UGCAimAssistEntity");
+    m_cls.Grass     = Il2CppApi::getClass(img, "COW.Graphics", "GrassSystem");
+    m_cls.Vehicle   = Il2CppApi::getClass(img, "COW.GamePlay", "Vehicle");
 
-    if (m_cls.Player)    m_fld.moveSpeed    = Il2CppApi::getField(m_cls.Player,    "moveSpeed");
-    if (m_cls.Character) m_fld.jumpForce    = Il2CppApi::getField(m_cls.Character, "jumpForce");
-    if (m_cls.Recoil)    m_fld.recoilForce  = Il2CppApi::getField(m_cls.Recoil,   "recoilForce");
-    if (m_cls.Weapon)    m_fld.bulletSpread = Il2CppApi::getField(m_cls.Weapon,    "bulletSpread");
-    if (m_cls.Weapon)    m_fld.fireRate     = Il2CppApi::getField(m_cls.Weapon,    "fireRate");
-    if (m_cls.Camera)    m_fld.fov          = Il2CppApi::getField(m_cls.Camera,    "fieldOfView");
-    if (m_cls.Grass)     m_fld.grassEnable  = Il2CppApi::getField(m_cls.Grass,    "enableGrass");
-    if (m_cls.Health)    m_fld.maxHealth    = Il2CppApi::getField(m_cls.Health,    "maxHealth");
-    if (m_cls.Vehicle)   m_fld.vehicleSpeed = Il2CppApi::getField(m_cls.Vehicle,  "maxSpeed");
+    // All field names are obfuscated — resolve via readable method names only
+    if (m_cls.Player)    m_mth.takeDamage    = Il2CppApi::getMethod(m_cls.Player,    "TakeDamage",               2);
+    if (m_cls.Character) m_mth.setSpeedScale = Il2CppApi::getMethod(m_cls.Character, "SetSpecialRunSpeedScale",   1);
+    if (m_cls.Weapon)    m_mth.recoilFormula = Il2CppApi::getMethod(m_cls.Weapon,    "RecoilFormula",            -1);
+    if (m_cls.Weapon)    m_mth.rateOfFire    = Il2CppApi::getMethod(m_cls.Weapon,    "RateOfFireFormula",        -1);
+    if (m_cls.Grass)     m_mth.getGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "get_GrassInstances",        0);
+    if (m_cls.Grass)     m_mth.setGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "set_GrassInstances",        1);
+    if (m_cls.Aim)       m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,       "CalculateAimPoint",        -1);
 
-    if (m_cls.Aim)    m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,    "CalculateAimTarget", 0);
-    if (m_cls.Weapon) m_mth.onFireWeapon  = Il2CppApi::getMethod(m_cls.Weapon, "OnFireWeapon",       1);
-    if (m_cls.Health) m_mth.takeDamage    = Il2CppApi::getMethod(m_cls.Health, "TakeDamage",         2);
+    m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
+    LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p",
+         m_cls.Player, m_cls.Weapon, m_cls.Grass, m_cls.Vehicle,
+         m_mth.takeDamage, m_mth.recoilFormula, m_mth.rateOfFire, m_mth.setSpeedScale);
+}
 
-    m_ready = (m_cls.Player || m_cls.Weapon || m_cls.Camera);
-    LOGI("Classes resolved — Player:%p Weapon:%p Camera:%p Grass:%p",
-         m_cls.Player, m_cls.Weapon, m_cls.Camera, m_cls.Grass);
+// ── Shared hook state (file-scope, hooks installed once, toggled via flags) ───
+
+static bool  s_anti_recoil  = false;
+static bool  s_no_spread    = false;
+static bool  s_rapid_fire   = false;
+static bool  s_anti_damage  = false;
+static bool  s_no_grass     = false;
+static bool  s_speed_on     = false;
+static float s_speed_mul    = 1.5f;
+
+static void *s_orig_recoil  = nullptr;
+static void *s_orig_rof     = nullptr;
+static void *s_orig_dmg     = nullptr;
+static void *s_orig_grass   = nullptr;
+static void *s_orig_speed   = nullptr;
+static void *s_orig_aim     = nullptr;
+
+// RecoilFormula — returns float; extra void* params absorb any signature variant
+static float hook_recoil(void *self, void *a1, void *a2, void *a3, void *a4) {
+    if (s_anti_recoil || s_no_spread) return 0.0f;
+    using Fn = float (*)(void *, void *, void *, void *, void *);
+    return reinterpret_cast<Fn>(s_orig_recoil)(self, a1, a2, a3, a4);
+}
+
+// RateOfFireFormula — returns float; low value = fast fire rate
+static float hook_rof(void *self, void *a1, void *a2, void *a3, void *a4) {
+    if (s_rapid_fire) return 0.01f;
+    using Fn = float (*)(void *, void *, void *, void *, void *);
+    return reinterpret_cast<Fn>(s_orig_rof)(self, a1, a2, a3, a4);
+}
+
+// TakeDamage — returns void; no-op when anti_damage active
+static void hook_dmg(void *self, void *info, void *a2, void *a3, void *method) {
+    if (s_anti_damage) return;
+    using Fn = void (*)(void *, void *, void *, void *, void *);
+    reinterpret_cast<Fn>(s_orig_dmg)(self, info, a2, a3, method);
+}
+
+// get_GrassInstances — returns collection ptr; nullptr = empty = no grass
+static void *hook_grass(void *self, void *method) {
+    if (s_no_grass) return nullptr;
+    using Fn = void *(*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_grass)(self, method);
+}
+
+// SetSpecialRunSpeedScale — multiplies incoming scale when speed hack active
+static void hook_speed(void *self, float scale, void *method) {
+    float effective = s_speed_on ? scale * s_speed_mul : scale;
+    using Fn = void (*)(void *, float, void *);
+    reinterpret_cast<Fn>(s_orig_speed)(self, effective, method);
 }
 
 // ── Feature implementations ───────────────────────────────────────────────────
 
 void FeatureEngine::applyAntiRecoil(bool enable) {
-    if (!m_fld.recoilForce) return;
-    float val = enable ? 0.0f : 1.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.recoilForce, &val);
+    s_anti_recoil = enable;
+    if (!m_mth.recoilFormula || !m_mth.recoilFormula->methodPointer) return;
+    if (enable && !s_orig_recoil) {
+        HookEngine::get().hookAddr(m_mth.recoilFormula->methodPointer,
+            reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "AntiRecoil");
+    } else if (!enable && !s_no_spread && s_orig_recoil) {
+        HookEngine::get().unhook(m_mth.recoilFormula->methodPointer);
+        s_orig_recoil = nullptr;
+    }
     LOGI("AntiRecoil: %s", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyNoSpread(bool enable) {
-    if (!m_fld.bulletSpread) return;
-    float val = enable ? 0.0f : 1.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.bulletSpread, &val);
+    s_no_spread = enable;
+    if (!m_mth.recoilFormula || !m_mth.recoilFormula->methodPointer) return;
+    if (enable && !s_orig_recoil) {
+        HookEngine::get().hookAddr(m_mth.recoilFormula->methodPointer,
+            reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "NoSpread");
+    } else if (!enable && !s_anti_recoil && s_orig_recoil) {
+        HookEngine::get().unhook(m_mth.recoilFormula->methodPointer);
+        s_orig_recoil = nullptr;
+    }
     LOGI("NoSpread: %s", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyRapidFire(bool enable) {
-    if (!m_fld.fireRate) return;
-    float val = enable ? 0.05f : 0.3f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.fireRate, &val);
+    s_rapid_fire = enable;
+    if (!m_mth.rateOfFire || !m_mth.rateOfFire->methodPointer) return;
+    if (enable && !s_orig_rof) {
+        HookEngine::get().hookAddr(m_mth.rateOfFire->methodPointer,
+            reinterpret_cast<void *>(hook_rof), &s_orig_rof, "RapidFire");
+    } else if (!enable && s_orig_rof) {
+        HookEngine::get().unhook(m_mth.rateOfFire->methodPointer);
+        s_orig_rof = nullptr;
+    }
     LOGI("RapidFire: %s", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyAimAssist(bool enable) {
     if (!m_mth.calcAimTarget || !m_mth.calcAimTarget->methodPointer) return;
-    static void *orig_calc = nullptr;
-    if (enable && !orig_calc) {
-        static auto hook_fn = [](void *instance) -> void * {
-            using Fn = void *(*)(void *);
-            return reinterpret_cast<Fn>(orig_calc)(instance);
-        };
+    if (enable && !s_orig_aim) {
+        // Pass-through hook — future: bend aim vector toward nearest player
         HookEngine::get().hookAddr(m_mth.calcAimTarget->methodPointer,
-            (void *)static_cast<void *(*)(void *)>(hook_fn), &orig_calc, "AimAssist");
-    } else if (!enable && orig_calc) {
+            reinterpret_cast<void *>(+[](void *self, void *a1, void *a2, void *a3) -> void * {
+                using Fn = void *(*)(void *, void *, void *, void *);
+                return reinterpret_cast<Fn>(s_orig_aim)(self, a1, a2, a3);
+            }), &s_orig_aim, "AimAssist");
+    } else if (!enable && s_orig_aim) {
         HookEngine::get().unhook(m_mth.calcAimTarget->methodPointer);
-        orig_calc = nullptr;
+        s_orig_aim = nullptr;
     }
     LOGI("AimAssist: %s", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applySpeedHack(bool enable, float multiplier) {
-    if (!m_fld.moveSpeed) return;
-    float val = enable ? 6.0f * multiplier : 6.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.moveSpeed, &val);
+    s_speed_on  = enable;
+    s_speed_mul = multiplier;
+    if (!m_mth.setSpeedScale || !m_mth.setSpeedScale->methodPointer) return;
+    if (enable && !s_orig_speed) {
+        HookEngine::get().hookAddr(m_mth.setSpeedScale->methodPointer,
+            reinterpret_cast<void *>(hook_speed), &s_orig_speed, "SpeedHack");
+    } else if (!enable && s_orig_speed) {
+        HookEngine::get().unhook(m_mth.setSpeedScale->methodPointer);
+        s_orig_speed = nullptr;
+    }
     LOGI("SpeedHack: %s (x%.2f)", enable ? "ON" : "OFF", multiplier);
 }
 
 void FeatureEngine::applyHighJump(bool enable) {
-    if (!m_fld.jumpForce) return;
-    float val = enable ? 18.0f : 8.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.jumpForce, &val);
-    LOGI("HighJump: %s", enable ? "ON" : "OFF");
+    // GiveDeltaSpeedScaleByKeyAndValue on PlayerAttributes — pending exact arg sig
+    LOGI("HighJump: %s (pending method sig)", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyVehicleSpeed(bool enable, float multiplier) {
-    if (!m_fld.vehicleSpeed) return;
-    float val = enable ? 100.0f * multiplier : 100.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.vehicleSpeed, &val);
-    LOGI("VehicleSpeed: %s", enable ? "ON" : "OFF");
+    // Vehicle.get_Speed is a getter only — need to find speed setter/multiplier method
+    LOGI("VehicleSpeed: %s (pending setter method)", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyWidePOV(float fov) {
-    if (!m_fld.fov) return;
-    Il2CppApi::setStaticValue(nullptr, m_fld.fov, &fov);
-    LOGI("WidePOV: %.1f", fov);
+    // CameraPanZoom field names are obfuscated — pending field offset scan
+    LOGI("WidePOV: %.1f (pending field offset)", fov);
 }
 
 void FeatureEngine::applyNoGrass(bool enable) {
-    if (!m_fld.grassEnable) return;
-    bool val = !enable;
-    Il2CppApi::setStaticValue(nullptr, m_fld.grassEnable, &val);
+    s_no_grass = enable;
+    if (!m_mth.getGrassInst || !m_mth.getGrassInst->methodPointer) return;
+    if (enable && !s_orig_grass) {
+        HookEngine::get().hookAddr(m_mth.getGrassInst->methodPointer,
+            reinterpret_cast<void *>(hook_grass), &s_orig_grass, "NoGrass");
+    } else if (!enable && s_orig_grass) {
+        HookEngine::get().unhook(m_mth.getGrassInst->methodPointer);
+        s_orig_grass = nullptr;
+    }
     LOGI("NoGrass: %s", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyMaxHealth(bool enable) {
-    if (!m_fld.maxHealth) return;
-    float val = enable ? 9999.0f : 200.0f;
-    Il2CppApi::setStaticValue(nullptr, m_fld.maxHealth, &val);
-    LOGI("MaxHealth: %s", enable ? "ON" : "OFF");
+    // TakeDamage hook already caps damage to 0; MaxHealth kept as separate toggle
+    // pending actual HP field offset from obfuscated PlayerAttributes fields
+    LOGI("MaxHealth: %s (pending obfuscated field offset)", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applyAntiDamage(bool enable) {
+    s_anti_damage = enable;
     if (!m_mth.takeDamage || !m_mth.takeDamage->methodPointer) return;
-    static void *orig_take_dmg = nullptr;
-    if (enable && !orig_take_dmg) {
-        static auto hook_dmg = [](void *self, float dmg, void *src) -> void {
-            (void)self; (void)dmg; (void)src;
-        };
+    if (enable && !s_orig_dmg) {
         HookEngine::get().hookAddr(m_mth.takeDamage->methodPointer,
-            (void *)static_cast<void(*)(void*, float, void*)>(hook_dmg),
-            &orig_take_dmg, "AntiDamage");
-    } else if (!enable && orig_take_dmg) {
+            reinterpret_cast<void *>(hook_dmg), &s_orig_dmg, "AntiDamage");
+    } else if (!enable && s_orig_dmg) {
         HookEngine::get().unhook(m_mth.takeDamage->methodPointer);
-        orig_take_dmg = nullptr;
+        s_orig_dmg = nullptr;
     }
     LOGI("AntiDamage: %s", enable ? "ON" : "OFF");
 }

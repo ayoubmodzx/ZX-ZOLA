@@ -88,9 +88,13 @@ private:
     } m_fld;
 
     struct Methods {
-        MethodInfo *calcAimTarget = nullptr;
-        MethodInfo *onFireWeapon  = nullptr;
-        MethodInfo *takeDamage    = nullptr;
+        MethodInfo *calcAimTarget  = nullptr;
+        MethodInfo *takeDamage     = nullptr;
+        MethodInfo *recoilFormula  = nullptr;
+        MethodInfo *rateOfFire     = nullptr;
+        MethodInfo *setSpeedScale  = nullptr;
+        MethodInfo *getGrassInst   = nullptr;
+        MethodInfo *setGrassInst   = nullptr;
     } m_mth;
 
     void resolveClasses();
