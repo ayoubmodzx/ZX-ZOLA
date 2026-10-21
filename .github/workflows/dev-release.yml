@@ -1,0 +1,80 @@
+name: Dev Release (APK + Module)
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Install NDK r27c and tools
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "y" | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-35"
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > zx-app/local.properties
+          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> $GITHUB_ENV
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: Build Debug APK
+        working-directory: zx-app
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      # ── Zygisk Module ──────────────────────────────────────────────────────────
+      - name: Build Zygisk .so (arm64-v8a)
+        run: |
+          cmake \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-26 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release \
+            -B zx-module-build \
+            zx-module/
+          cmake --build zx-module-build --target zx_zola -j$(nproc)
+
+      - name: Package Zygisk Module ZIP
+        run: |
+          mkdir -p module_out/zygisk
+          cp zx-module-build/libzx_zola.so module_out/zygisk/arm64-v8a.so
+          cp -r zx-module/META-INF module_out/
+          cp zx-module/module.prop module_out/
+          cd module_out
+          zip -r9 ../ZX-ZOLA-module.zip .
+          echo "Module ZIP size: $(du -sh ../ZX-ZOLA-module.zip | cut -f1)"
+
+      # ── Upload to dev-latest release ───────────────────────────────────────────
+      - name: Update dev-latest Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev-latest
+          name: "ZX Dev Build (latest)"
+          prerelease: true
+          fail_on_unmatched_files: false
+          files: |
+            zx-app/app/build/outputs/apk/debug/app-debug.apk
+            ZX-ZOLA-module.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
