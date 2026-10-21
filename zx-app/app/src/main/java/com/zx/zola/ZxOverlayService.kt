@@ -227,6 +227,7 @@ class ZxOverlayService : Service() {
         panelH = dp(DEF_H_DP)
         createFab()
         createPanel()
+        LogcatReader.start()
         uiHandler.post(pollTask)
     }
 
@@ -262,6 +263,7 @@ class ZxOverlayService : Service() {
         super.onDestroy()
         uiHandler.removeCallbacks(pollTask)
         stopLogRefresher()
+        LogcatReader.stop()
         fabView  ?.let { if (it.parent != null) wm.removeView(it) }
         panelRoot?.let { if (it.parent != null) wm.removeView(it) }
     }
@@ -626,6 +628,40 @@ class ZxOverlayService : Service() {
         })
         contentList.addView(hdr)
 
+        // ── Module status panel ───────────────────────────────────────────────
+        val statusPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(Color.parseColor("#0D0D1A"))
+            setPadding(dp(8), dp(6), dp(8), dp(6))
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.bottomMargin = dp(6) }
+        }
+        statusPanel.addView(TextView(this).apply {
+            text = "▸  MODULE STATUS"
+            setTextColor(Color.parseColor("#7C4DFF"))
+            textSize = 8f; letterSpacing = 0.2f
+            typeface = android.graphics.Typeface.MONOSPACE
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).also { it.bottomMargin = dp(4) }
+        })
+        val statusRows = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val statusTv = TextView(this).apply {
+            setTextColor(Color.parseColor("#B0C8B0"))
+            textSize = 8.5f
+            typeface = android.graphics.Typeface.MONOSPACE
+            text = buildStatusText()
+        }
+        statusRows.addView(statusTv)
+        statusPanel.addView(statusRows)
+        contentList.addView(statusPanel)
+
         val tv = TextView(this).apply {
             setTextColor(Color.parseColor("#B0C8B0"))
             textSize = 9f
@@ -637,7 +673,37 @@ class ZxOverlayService : Service() {
         }
         logTv = tv
         contentList.addView(tv)
-        startLogRefresher()
+        startLogRefresherWithStatus(statusTv)
+    }
+
+    private fun startLogRefresherWithStatus(statusTv: TextView) {
+        logRefreshActive = true
+        val r = object : Runnable {
+            override fun run() {
+                val tv = logTv
+                if (tv != null && tv.parent != null) {
+                    tv.text = buildLogText()
+                    statusTv.text = buildStatusText()
+                    if (::contentScroll.isInitialized)
+                        contentScroll.post { contentScroll.fullScroll(ScrollView.FOCUS_DOWN) }
+                }
+                if (logRefreshActive) uiHandler.postDelayed(this, 1000L)
+            }
+        }
+        uiHandler.postDelayed(r, 800L)
+    }
+
+    private fun buildStatusText(): String {
+        val s = LogcatReader.status
+        fun dot(ok: Boolean) = if (ok) "●" else "○"
+        return buildString {
+            append("${dot(s.injected)} Injected   ")
+            append("${dot(s.anosdk1)} AnoP1   ")
+            append("${dot(s.anosdk2)} AnoP2\n")
+            append("${dot(s.il2cpp)}  IL2CPP    ")
+            append("${dot(s.socket)} Socket")
+            if (s.allGood) append("   ✓ ALL OK")
+        }
     }
 
     private fun buildLogText(): String {
