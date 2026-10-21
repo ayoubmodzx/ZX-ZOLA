@@ -30,17 +30,24 @@ foreach(_t dobby_static dobby c++_static c++abi c++)
 endforeach()
 
 # Patch macOS-only @PAGE/@PAGEOFF ARM64 ASM relocations → ELF :lo12: syntax.
-# Dobby master ships Mach-O style relocations in the closure bridge ASM; the
-# Android NDK clang (Linux host, ELF target) rejects them at assemble time.
-set(_dobby_asm
-    "${dobby_SOURCE_DIR}/source/TrampolineBridge/ClosureTrampolineBridge/arm64/closure_bridge_arm64.asm")
-if(EXISTS "${_dobby_asm}")
-    file(READ "${_dobby_asm}" _asm)
-    string(REPLACE "common_closure_bridge_handler@PAGEOFF"
-                   ":lo12:common_closure_bridge_handler" _asm "${_asm}")
-    string(REPLACE "common_closure_bridge_handler@PAGE"
-                   "common_closure_bridge_handler" _asm "${_asm}")
-    file(WRITE "${_dobby_asm}" "${_asm}")
+# cmake string(REPLACE) misses occurrences when symbol names differ; use sed
+# across ALL .asm/.S files under dobby_SOURCE_DIR for reliability.
+execute_process(
+    COMMAND find "${dobby_SOURCE_DIR}" "(" -name "*.asm" -o -name "*.S" ")"
+    OUTPUT_VARIABLE _dobby_asm_files
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(_dobby_asm_files)
+    string(REPLACE "\n" ";" _dobby_asm_files "${_dobby_asm_files}")
+    foreach(_f IN LISTS _dobby_asm_files)
+        execute_process(COMMAND sed -i
+            "s/\\([A-Za-z_][A-Za-z0-9_]*\\)@PAGEOFF/:lo12:\\1/g"
+            "${_f}")
+        execute_process(COMMAND sed -i
+            "s/\\([A-Za-z_][A-Za-z0-9_]*\\)@PAGE/\\1/g"
+            "${_f}")
+        message(STATUS "Dobby @PAGE patch: ${_f}")
+    endforeach()
 endif()
 
 # ── Global flags ──────────────────────────────────────────────────────────────
