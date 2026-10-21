@@ -12,8 +12,14 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-static constexpr const char *FF_PKG     = "com.dts.freefireth";
-static constexpr const char *FF_PKG_MAX = "com.dts.freefiremax";
+// All known Free Fire package names — must match exactly what Zygote sees
+static constexpr const char *kFfPkgs[] = {
+    "com.dts.freefireth",      // FF global (older)
+    "com.dts.freefiremax",     // FF MAX global
+    "com.garena.game.fftw",    // FF Garena (SEA / most regions)
+    "com.garena.game.kgtw",    // FF Korea
+    nullptr
+};
 
 static AsyncWorker g_worker;
 
@@ -37,7 +43,10 @@ public:
         const char *pkg = m_env->GetStringUTFChars(args->nice_name, nullptr);
         if (!pkg) { m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
 
-        bool is_ff = (strcmp(pkg, FF_PKG) == 0 || strcmp(pkg, FF_PKG_MAX) == 0);
+        bool is_ff = false;
+        for (int i = 0; kFfPkgs[i]; ++i) {
+            if (strcmp(pkg, kFfPkgs[i]) == 0) { is_ff = true; break; }
+        }
         m_env->ReleaseStringUTFChars(args->nice_name, pkg);
 
         if (!is_ff) {

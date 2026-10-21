@@ -75,7 +75,10 @@ object ZxEngine {
     fun isFfRunning(): Boolean = try {
         val proc = Runtime.getRuntime().exec(
             arrayOf("su", "-c",
-                "pidof com.dts.freefireth 2>/dev/null || pidof com.garena.game.fftw 2>/dev/null"))
+                "pidof com.dts.freefireth 2>/dev/null || " +
+                "pidof com.dts.freefiremax 2>/dev/null || " +
+                "pidof com.garena.game.fftw 2>/dev/null || " +
+                "pidof com.garena.game.kgtw 2>/dev/null"))
         val out = proc.inputStream.bufferedReader().readText().trim()
         proc.waitFor()
         if (out.isNotEmpty()) targetPid = out.trim().split(" ")[0].toIntOrNull() ?: -1

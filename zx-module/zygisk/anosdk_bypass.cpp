@@ -14,16 +14,18 @@
 #include <pthread.h>
 #include <sys/types.h>
 #include <android/log.h>
+#include <sys/syscall.h>
 
 #define TAG "ZX-ANO"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // ── Original pointers — Phase 1 (libc.so) ────────────────────────────────────
-static void (*orig_exit)(int)        = nullptr;
-static void (*orig__exit)(int)       = nullptr;
-static void (*orig_abort)()          = nullptr;
-static int  (*orig_kill)(pid_t, int) = nullptr;
+static void (*orig_exit)(int)               = nullptr;
+static void (*orig__exit)(int)              = nullptr;
+static void (*orig_abort)()                 = nullptr;
+static int  (*orig_kill)(pid_t, int)        = nullptr;
+static int  (*orig_tgkill)(int, int, int)   = nullptr;
 
 // ── Original pointers — Phase 2 (libanogs.so) ────────────────────────────────
 static int   (*orig_AnoSDKIoctl)(int, void *, int)            = nullptr;
@@ -57,10 +59,11 @@ static int   (*orig_ms_scan_start)(int, void *)               = nullptr;
     ::_Exit(0);
 }
 
-// abort() → raises SIGABRT internally; just return to suppress it
-static void hook_abort() {
+// abort() is [[noreturn]] — returning causes UB and detectable crashes.
+// Spin forever like hook_exit so the calling thread stalls harmlessly.
+[[noreturn]] static void hook_abort() {
     LOGE("BLOCKED abort() — AnoSDK kill suppressed");
-    // Return silently — caller's stack unwinds normally
+    for (;;) usleep(2000000);
 }
 
 // Block SIGABRT / SIGKILL sent to self — AnoSDK's kill(getpid(), SIGABRT) path
@@ -73,6 +76,18 @@ static int hook_kill(pid_t pid, int sig) {
     }
     if (orig_kill) return orig_kill(pid, sig);
     return 0;
+}
+
+// AnoSDK also uses tgkill(pid, tid, sig) to kill specific threads
+static int hook_tgkill(int tgid, int tid, int sig) {
+    int self = (int)getpid();
+    if (tgid == self &&
+        (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM)) {
+        LOGE("BLOCKED tgkill(%d, %d, %d) — AnoSDK kill suppressed", tgid, tid, sig);
+        return 0;
+    }
+    // Use raw syscall to avoid infinite recursion through our own hook
+    return (int)syscall(SYS_tgkill, tgid, tid, sig);
 }
 
 // ── Phase 2 hooks ─────────────────────────────────────────────────────────────
@@ -165,7 +180,9 @@ void AnoBypass::installEarly() {
     bool e3 = e.hookSym("libc.so", "abort",
                          (void *)hook_abort, nullptr,               "AbortBlock");
     bool e4 = e.hookSym("libc.so", "kill",
-                         (void *)hook_kill,  (void **)&orig_kill,   "KillBlock");
+                         (void *)hook_kill,    (void **)&orig_kill,    "KillBlock");
+    bool e5 = e.hookSym("libc.so", "tgkill",
+                         (void *)hook_tgkill,  (void **)&orig_tgkill,  "TgkillBlock");
 
     // Belt-and-suspenders: also ignore SIGABRT at the signal level
     struct sigaction sa{};
@@ -173,7 +190,8 @@ void AnoBypass::installEarly() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
 
-    LOGI("Phase 1 early hooks: exit=%d _exit=%d abort=%d kill=%d", e1, e2, e3, e4);
+    LOGI("Phase 1 early hooks: exit=%d _exit=%d abort=%d kill=%d tgkill=%d",
+         e1, e2, e3, e4, e5);
 }
 
 void AnoBypass::startWatcher() {
