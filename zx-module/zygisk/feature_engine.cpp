@@ -60,12 +60,104 @@ void FeatureEngine::resolveClasses() {
     if (m_cls.Aim)       m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,       "CalculateAimPoint",        -1);
 
     // Resolve UnityEngine.Camera.set_fieldOfView for WidePOV
+    // Also resolve Transform for Teleport
     Il2CppImage *unityImg = Il2CppApi::getImage("UnityEngine.CoreModule");
     if (!unityImg) unityImg = Il2CppApi::getImage("UnityEngine");
     if (unityImg) {
         m_cls.UnityCamera = Il2CppApi::getClass(unityImg, "UnityEngine", "Camera");
         if (m_cls.UnityCamera)
             m_mth.setCameraFov = Il2CppApi::getMethod(m_cls.UnityCamera, "set_fieldOfView", 1);
+
+        m_cls.UnityTransform = Il2CppApi::getClass(unityImg, "UnityEngine", "Transform");
+        if (m_cls.UnityTransform) {
+            m_mth.setPosition = Il2CppApi::getMethod(m_cls.UnityTransform, "set_position", 1);
+            m_mth.getPosition = Il2CppApi::getMethod(m_cls.UnityTransform, "get_position", 0);
+        }
+        // Component.get_transform (base of every MonoBehaviour)
+        Il2CppClass *component = Il2CppApi::getClass(unityImg, "UnityEngine", "Component");
+        if (component)
+            m_mth.getTransform = Il2CppApi::getMethod(component, "get_transform", 0);
+    }
+
+    // ESP — visibility gate on Player class
+    if (m_cls.Player) {
+        static const char *kVisNames[] = {
+            "GetIsVisible", "IsVisible", "get_IsVisible",
+            "IsInView", "get_IsInView", "UpdateVisible", nullptr
+        };
+        for (int i = 0; kVisNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kVisNames[i], -1);
+            if (m && m->methodPointer) { m_mth.isVisible = m; break; }
+        }
+    }
+
+    // InfiniteAmmo — current clip ammo getter
+    if (m_cls.Weapon) {
+        static const char *kAmmoNames[] = {
+            "GetCurrentClipAmmo", "get_CurrentClipAmmo",
+            "GetAmmoCount",       "get_AmmoCount",
+            "get_Ammo",           "GetAmmo",
+            "GetCurrentAmmo",     "get_CurrentAmmo", nullptr
+        };
+        for (int i = 0; kAmmoNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Weapon, kAmmoNames[i], -1);
+            if (m && m->methodPointer) { m_mth.getCurrentAmmo = m; break; }
+        }
+    }
+
+    // NoReload — reload check
+    if (m_cls.Weapon) {
+        static const char *kReloadNames[] = {
+            "IsNeedReload", "NeedReload", "get_IsNeedReload",
+            "CheckNeedReload", "ShouldReload", nullptr
+        };
+        for (int i = 0; kReloadNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Weapon, kReloadNames[i], -1);
+            if (m && m->methodPointer) { m_mth.isNeedReload = m; break; }
+        }
+    }
+
+    // WallShoot — bullet wall/obstacle hit check
+    if (m_cls.Bullet) {
+        static const char *kWallNames[] = {
+            "CheckWall", "IsHitWall", "CheckObstacle",
+            "IsBlockedByWall", "HitObstacle", "CheckHitWall",
+            "IsHitStatic", nullptr
+        };
+        for (int i = 0; kWallNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Bullet, kWallNames[i], -1);
+            if (m && m->methodPointer) { m_mth.checkWallHit = m; break; }
+        }
+    }
+
+    // AutoRevive — knockdown state getter
+    if (m_cls.Player) {
+        static const char *kKDNames[] = {
+            "get_IsKnockDown", "IsKnockDown", "GetIsKnockDown",
+            "get_IsKnockedDown", "IsKnockedDown", nullptr
+        };
+        for (int i = 0; kKDNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kKDNames[i], -1);
+            if (m && m->methodPointer) { m_mth.isKnockDown = m; break; }
+        }
+    }
+
+    // NoClip — CharacterController collision callback
+    if (m_cls.Character) {
+        m_mth.colliderHit = Il2CppApi::getMethod(m_cls.Character, "OnControllerColliderHit", 1);
+        if (!m_mth.colliderHit && m_cls.Player)
+            m_mth.colliderHit = Il2CppApi::getMethod(m_cls.Player, "OnControllerColliderHit", 1);
+    }
+
+    // Teleport — Player.Update for per-frame tick hook
+    if (m_cls.Player) {
+        static const char *kUpdateNames[] = {
+            "Update", "LateUpdate", "OnUpdate", "Tick", nullptr
+        };
+        for (int i = 0; kUpdateNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kUpdateNames[i], -1);
+            if (m && m->methodPointer) { m_mth.playerUpdate = m; break; }
+        }
     }
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
@@ -73,6 +165,10 @@ void FeatureEngine::resolveClasses() {
          m_cls.Player, m_cls.Weapon, m_cls.Grass, m_cls.Vehicle,
          m_mth.takeDamage, m_mth.recoilFormula, m_mth.rateOfFire, m_mth.setSpeedScale,
          m_mth.setCameraFov);
+    LOGI("resolved esp:%p ammo:%p reload:%p wallhit:%p knockdown:%p collider:%p setpos:%p update:%p",
+         m_mth.isVisible, m_mth.getCurrentAmmo, m_mth.isNeedReload,
+         m_mth.checkWallHit, m_mth.isKnockDown, m_mth.colliderHit,
+         m_mth.setPosition, m_mth.playerUpdate);
 }
 
 // ── Shared hook state (file-scope, hooks installed once, toggled via flags) ───
@@ -90,16 +186,39 @@ static bool  s_high_jump    = false;
 static float s_jump_mul     = 2.5f;
 static bool  s_vehicle_on   = false;
 static float s_vehicle_mul  = 2.0f;
+// ── New feature flags ─────────────────────────────────────────────────────────
+static bool  s_esp           = false;
+static bool  s_inf_ammo      = false;
+static bool  s_no_reload     = false;
+static bool  s_wall_shoot    = false;
+static bool  s_auto_revive   = false;
+static bool  s_noclip        = false;
+// Teleport saved position (Vec3 stored as plain floats — no Unity dep)
+struct Vec3 { float x, y, z; };
+static Vec3  s_tp_saved      = {0, 0, 0};
+static bool  s_tp_has_save   = false;
+static bool  s_tp_pending    = false;  // set by applyTeleport, cleared by tick hook
 
-static void *s_orig_recoil  = nullptr;
-static void *s_orig_rof     = nullptr;
-static void *s_orig_dmg     = nullptr;
-static void *s_orig_grass   = nullptr;
-static void *s_orig_speed   = nullptr;
-static void *s_orig_aim     = nullptr;
-static void *s_orig_fov     = nullptr;
-static void *s_orig_jump    = nullptr;
-static void *s_orig_vehicle = nullptr;
+static void *s_orig_recoil   = nullptr;
+static void *s_orig_rof      = nullptr;
+static void *s_orig_dmg      = nullptr;
+static void *s_orig_grass    = nullptr;
+static void *s_orig_speed    = nullptr;
+static void *s_orig_aim      = nullptr;
+static void *s_orig_fov      = nullptr;
+static void *s_orig_jump     = nullptr;
+static void *s_orig_vehicle  = nullptr;
+// ── New orig pointers ─────────────────────────────────────────────────────────
+static void *s_orig_visible   = nullptr;
+static void *s_orig_ammo      = nullptr;
+static void *s_orig_reload    = nullptr;
+static void *s_orig_wallhit   = nullptr;
+static void *s_orig_knockdown = nullptr;
+static void *s_orig_collider  = nullptr;
+static void *s_orig_setpos    = nullptr;  // Transform.set_position
+static void *s_orig_getpos    = nullptr;  // Transform.get_position
+static void *s_orig_gettrans  = nullptr;  // Component.get_transform
+static void *s_orig_update    = nullptr;  // Player.Update (teleport tick)
 
 // RecoilFormula — returns float; extra void* params absorb any signature variant
 static float hook_recoil(void *self, void *a1, void *a2, void *a3, void *a4) {
@@ -157,6 +276,81 @@ static float hook_vehicle(void *self, void *method) {
     using Fn = float (*)(void *, void *);
     float v = reinterpret_cast<Fn>(s_orig_vehicle)(self, method);
     return s_vehicle_on ? v * s_vehicle_mul : v;
+}
+
+// ── New hooks ────────────────────────────────────────────────────────────────
+
+// ESP: IsVisible / GetIsVisible / get_IsVisible → always true when active
+// IL2CPP bool = uint8_t (0/1), ARM64: x0=this, x1=MethodInfo* → w0
+static uint8_t hook_is_visible(void *self, void *method) {
+    if (s_esp) return 1;
+    using Fn = uint8_t (*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_visible)(self, method);
+}
+
+// InfiniteAmmo: GetCurrentClipAmmo / get_Ammo → 999
+static int hook_get_ammo(void *self, void *method) {
+    if (s_inf_ammo) return 999;
+    using Fn = int (*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_ammo)(self, method);
+}
+
+// NoReload: IsNeedReload / NeedReload → false
+static uint8_t hook_is_reload(void *self, void *method) {
+    if (s_no_reload) return 0;
+    using Fn = uint8_t (*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_reload)(self, method);
+}
+
+// WallShoot: CheckHit / IsHitWall / CheckObstacle → 0 (no wall)
+// Extra void* args absorb any signature variant safely in ARM64
+static uint8_t hook_wall_hit(void *self, void *a1, void *a2, void *method) {
+    if (s_wall_shoot) return 0;
+    using Fn = uint8_t (*)(void *, void *, void *, void *);
+    return reinterpret_cast<Fn>(s_orig_wallhit)(self, a1, a2, method);
+}
+
+// AutoRevive: get_IsKnockDown → always false (player never knocked)
+static uint8_t hook_is_knockdown(void *self, void *method) {
+    if (s_auto_revive) return 0;
+    using Fn = uint8_t (*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_knockdown)(self, method);
+}
+
+// NoClip: OnControllerColliderHit → no-op so physics obstacles are ignored
+static void hook_collider_hit(void *self, void *hit, void *method) {
+    if (s_noclip) return;
+    using Fn = void (*)(void *, void *, void *);
+    reinterpret_cast<Fn>(s_orig_collider)(self, hit, method);
+}
+
+// Teleport tick: hooked onto Player.Update.
+// ARM64 Vector3 HFA: set_position(Transform* x0, float s0,s1,s2, MethodInfo* x1)
+//                    get_position returns floats in s0/s1/s2
+static void hook_player_update(void *self, void *method) {
+    if (s_orig_gettrans && s_orig_setpos && s_orig_getpos) {
+        using GetTransFn = void *(*)(void *, void *);
+        void *tr = reinterpret_cast<GetTransFn>(s_orig_gettrans)(self, nullptr);
+        if (tr) {
+            // Save current position when requested
+            if (!s_tp_has_save) {
+                using GetPosFn = Vec3 (*)(void *, void *);
+                s_tp_saved   = reinterpret_cast<GetPosFn>(s_orig_getpos)(tr, nullptr);
+                s_tp_has_save = true;
+                LOGI("TeleportSave: pos=(%.2f,%.2f,%.2f)",
+                     s_tp_saved.x, s_tp_saved.y, s_tp_saved.z);
+            }
+            // Teleport to saved position when requested
+            if (s_tp_pending) {
+                using SetPosFn = void (*)(void *, float, float, float, void *);
+                reinterpret_cast<SetPosFn>(s_orig_setpos)(
+                    tr, s_tp_saved.x, s_tp_saved.y, s_tp_saved.z, nullptr);
+                s_tp_pending = false;
+            }
+        }
+    }
+    using Fn = void (*)(void *, void *);
+    reinterpret_cast<Fn>(s_orig_update)(self, method);
 }
 
 // ── Feature implementations ───────────────────────────────────────────────────
@@ -354,6 +548,146 @@ void FeatureEngine::applyAntiDamage(bool enable) {
     LOGI("AntiDamage: %s", enable ? "ON" : "OFF");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ── New feature implementations ──────────────────────────────────────────────
+
+void FeatureEngine::applyESP(bool enable) {
+    s_esp = enable;
+    if (!m_mth.isVisible || !m_mth.isVisible->methodPointer) {
+        LOGE("ESP: visibility method not resolved — unable to hook");
+        return;
+    }
+    if (enable && !s_orig_visible) {
+        HookEngine::get().hookAddr(m_mth.isVisible->methodPointer,
+            reinterpret_cast<void *>(hook_is_visible), &s_orig_visible, "ESP");
+    } else if (!enable && s_orig_visible) {
+        HookEngine::get().unhook(m_mth.isVisible->methodPointer);
+        s_orig_visible = nullptr;
+    }
+    LOGI("ESP: %s", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyInfiniteAmmo(bool enable) {
+    s_inf_ammo = enable;
+    if (!m_mth.getCurrentAmmo || !m_mth.getCurrentAmmo->methodPointer) {
+        LOGE("InfiniteAmmo: ammo getter not resolved");
+        return;
+    }
+    if (enable && !s_orig_ammo) {
+        HookEngine::get().hookAddr(m_mth.getCurrentAmmo->methodPointer,
+            reinterpret_cast<void *>(hook_get_ammo), &s_orig_ammo, "InfAmmo");
+    } else if (!enable && s_orig_ammo) {
+        HookEngine::get().unhook(m_mth.getCurrentAmmo->methodPointer);
+        s_orig_ammo = nullptr;
+    }
+    LOGI("InfiniteAmmo: %s", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyNoReload(bool enable) {
+    s_no_reload = enable;
+    if (!m_mth.isNeedReload || !m_mth.isNeedReload->methodPointer) {
+        LOGE("NoReload: reload check not resolved");
+        return;
+    }
+    if (enable && !s_orig_reload) {
+        HookEngine::get().hookAddr(m_mth.isNeedReload->methodPointer,
+            reinterpret_cast<void *>(hook_is_reload), &s_orig_reload, "NoReload");
+    } else if (!enable && s_orig_reload) {
+        HookEngine::get().unhook(m_mth.isNeedReload->methodPointer);
+        s_orig_reload = nullptr;
+    }
+    LOGI("NoReload: %s", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyWallShoot(bool enable) {
+    s_wall_shoot = enable;
+    if (!m_mth.checkWallHit || !m_mth.checkWallHit->methodPointer) {
+        LOGE("WallShoot: wall-hit check not resolved");
+        return;
+    }
+    if (enable && !s_orig_wallhit) {
+        HookEngine::get().hookAddr(m_mth.checkWallHit->methodPointer,
+            reinterpret_cast<void *>(hook_wall_hit), &s_orig_wallhit, "WallShoot");
+    } else if (!enable && s_orig_wallhit) {
+        HookEngine::get().unhook(m_mth.checkWallHit->methodPointer);
+        s_orig_wallhit = nullptr;
+    }
+    LOGI("WallShoot: %s", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyAutoRevive(bool enable) {
+    s_auto_revive = enable;
+    if (!m_mth.isKnockDown || !m_mth.isKnockDown->methodPointer) {
+        LOGE("AutoRevive: knockdown getter not resolved");
+        return;
+    }
+    if (enable && !s_orig_knockdown) {
+        HookEngine::get().hookAddr(m_mth.isKnockDown->methodPointer,
+            reinterpret_cast<void *>(hook_is_knockdown), &s_orig_knockdown, "AutoRevive");
+    } else if (!enable && s_orig_knockdown) {
+        HookEngine::get().unhook(m_mth.isKnockDown->methodPointer);
+        s_orig_knockdown = nullptr;
+    }
+    LOGI("AutoRevive: %s", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyNoClip(bool enable) {
+    s_noclip = enable;
+    if (!m_mth.colliderHit || !m_mth.colliderHit->methodPointer) {
+        LOGE("NoClip: OnControllerColliderHit not resolved");
+        return;
+    }
+    if (enable && !s_orig_collider) {
+        HookEngine::get().hookAddr(m_mth.colliderHit->methodPointer,
+            reinterpret_cast<void *>(hook_collider_hit), &s_orig_collider, "NoClip");
+    } else if (!enable && s_orig_collider) {
+        HookEngine::get().unhook(m_mth.colliderHit->methodPointer);
+        s_orig_collider = nullptr;
+    }
+    LOGI("NoClip: %s", enable ? "ON" : "OFF");
+}
+
+void FeatureEngine::applyTeleportSave() {
+    if (!m_mth.playerUpdate || !m_mth.playerUpdate->methodPointer) {
+        LOGE("TeleportSave: Player.Update not resolved");
+        return;
+    }
+    // Cache orig pointers for the tick hook
+    if (m_mth.setPosition) s_orig_setpos  = m_mth.setPosition->methodPointer;
+    if (m_mth.getPosition) s_orig_getpos  = m_mth.getPosition->methodPointer;
+    if (m_mth.getTransform) s_orig_gettrans = m_mth.getTransform->methodPointer;
+    // Signal tick hook to capture position on next Player.Update call
+    s_tp_has_save = false;
+    // Install tick hook if not already there
+    if (!s_orig_update) {
+        HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+            reinterpret_cast<void *>(hook_player_update), &s_orig_update, "TpTick");
+    }
+    LOGI("TeleportSave: capturing position on next Update");
+}
+
+void FeatureEngine::applyTeleport() {
+    if (!s_tp_has_save) {
+        LOGE("Teleport: no saved position — call TeleportSave first");
+        return;
+    }
+    if (!m_mth.playerUpdate || !m_mth.playerUpdate->methodPointer) {
+        LOGE("Teleport: Player.Update not resolved");
+        return;
+    }
+    // Cache orig pointers
+    if (m_mth.setPosition)  s_orig_setpos   = m_mth.setPosition->methodPointer;
+    if (m_mth.getPosition)  s_orig_getpos   = m_mth.getPosition->methodPointer;
+    if (m_mth.getTransform) s_orig_gettrans = m_mth.getTransform->methodPointer;
+    s_tp_pending = true;
+    if (!s_orig_update) {
+        HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+            reinterpret_cast<void *>(hook_player_update), &s_orig_update, "TpTick");
+    }
+    LOGI("Teleport: will move to (%.2f,%.2f,%.2f) on next Update",
+         s_tp_saved.x, s_tp_saved.y, s_tp_saved.z);
+}
+
 // ── Command dispatch ──────────────────────────────────────────────────────────
 
 void FeatureEngine::dispatch(uint8_t cmd, bool enable, float intensity) {
@@ -387,17 +721,15 @@ void FeatureEngine::dispatch(uint8_t cmd, bool enable, float intensity) {
         case ZX_ANTI_DAMAGE:   applyAntiDamage(enable); break;
         case ZX_GOD_MODE:      applyAntiDamage(enable); break; // god = block all damage
 
-        // ── Not yet implemented (pending method/offset resolution) ──────────
-        case ZX_ESP:
-        case ZX_INFINITE_AMMO:
-        case ZX_NO_RELOAD:
-        case ZX_NOCLIP:
-        case ZX_TELEPORT:
-        case ZX_TELEPORT_SAVE:
-        case ZX_AUTO_REVIVE:
-        case ZX_WALL_SHOOT:
-            LOGI("cmd %d not yet implemented", (int)cmd);
-            break;
+        // ── New features ─────────────────────────────────────────────────────
+        case ZX_ESP:           applyESP(enable); break;
+        case ZX_INFINITE_AMMO: applyInfiniteAmmo(enable); break;
+        case ZX_NO_RELOAD:     applyNoReload(enable); break;
+        case ZX_WALL_SHOOT:    applyWallShoot(enable); break;
+        case ZX_AUTO_REVIVE:   applyAutoRevive(enable); break;
+        case ZX_NOCLIP:        applyNoClip(enable); break;
+        case ZX_TELEPORT_SAVE: applyTeleportSave(); break;
+        case ZX_TELEPORT:      applyTeleport(); break;
 
         default:
             LOGE("dispatch: unknown cmd %d", (int)cmd);

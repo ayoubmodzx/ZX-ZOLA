@@ -55,10 +55,22 @@ public:
     // ── VISUAL ────────────────────────────────────────────────────
     void applyWidePOV(float fov = 85.0f);
     void applyNoGrass(bool enable = true);
+    void applyESP(bool enable = true);
 
     // ── SURVIVAL ─────────────────────────────────────────────────
     void applyMaxHealth(bool enable = true);
     void applyAntiDamage(bool enable = true);
+    void applyAutoRevive(bool enable = true);
+
+    // ── WEAPON ────────────────────────────────────────────────────
+    void applyInfiniteAmmo(bool enable = true);
+    void applyNoReload(bool enable = true);
+    void applyWallShoot(bool enable = true);
+
+    // ── MOBILITY ──────────────────────────────────────────────────
+    void applyNoClip(bool enable = true);
+    void applyTeleportSave();
+    void applyTeleport();
 
     bool isReady() const { return m_ready; }
 
@@ -81,6 +93,7 @@ private:
         Il2CppClass *Vehicle      = nullptr;
         Il2CppClass *Loot         = nullptr;
         Il2CppClass *UnityCamera  = nullptr;  // UnityEngine.Camera — for WidePOV
+        Il2CppClass *UnityTransform = nullptr; // UnityEngine.Transform — for Teleport
     } m_cls;
 
     struct Fields {
@@ -106,6 +119,21 @@ private:
         MethodInfo *setCameraFov   = nullptr;  // UnityEngine.Camera.set_fieldOfView
         MethodInfo *jumpMethod     = nullptr;  // resolved at first HighJump enable
         MethodInfo *vehicleAccel   = nullptr;  // resolved at first VehicleSpeed enable
+        // ESP
+        MethodInfo *isVisible      = nullptr;  // Player visibility gate
+        // InfiniteAmmo / NoReload
+        MethodInfo *getCurrentAmmo = nullptr;  // WeaponPropertyUtil ammo getter
+        MethodInfo *isNeedReload   = nullptr;  // WeaponPropertyUtil reload check
+        // WallShoot
+        MethodInfo *checkWallHit   = nullptr;  // VerticleBulletController wall detect
+        // AutoRevive
+        MethodInfo *isKnockDown    = nullptr;  // Player knockdown state getter
+        // Teleport / NoClip — resolved lazily at first enable
+        MethodInfo *setPosition    = nullptr;  // UnityEngine.Transform.set_position
+        MethodInfo *getPosition    = nullptr;  // UnityEngine.Transform.get_position
+        MethodInfo *getTransform   = nullptr;  // Component.get_transform
+        MethodInfo *colliderHit    = nullptr;  // OnControllerColliderHit (NoClip)
+        MethodInfo *playerUpdate   = nullptr;  // Player.Update (Teleport tick)
     } m_mth;
 
     void resolveClasses();
