@@ -5,6 +5,9 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
@@ -25,7 +28,8 @@ jobs:
           echo "y" | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" "ndk;27.2.12479018" "cmake;3.22.1" "platforms;android-35"
           echo "sdk.dir=$ANDROID_SDK_ROOT" > zx-app/local.properties
-          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/27.2.12479018" >> $GITHUB_ENV
+          NDK_PATH="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          echo "NDK_PATH=$NDK_PATH" >> $GITHUB_ENV
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -46,7 +50,7 @@ jobs:
       - name: Build Zygisk .so (arm64-v8a)
         run: |
           cmake \
-            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \
+            -DCMAKE_TOOLCHAIN_FILE=$NDK_PATH/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-26 \
             -DANDROID_STL=c++_static \
@@ -67,12 +71,11 @@ jobs:
 
       # ── Upload to dev-latest release ───────────────────────────────────────────
       - name: Update dev-latest Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v1
         with:
           tag_name: dev-latest
           name: "ZX Dev Build (latest)"
           prerelease: true
-          fail_on_unmatched_files: false
           files: |
             zx-app/app/build/outputs/apk/debug/app-debug.apk
             ZX-ZOLA-module.zip
