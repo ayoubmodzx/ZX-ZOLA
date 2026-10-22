@@ -320,8 +320,16 @@ void AnoBypass::startWatcher() {
     if (pthread_create(&tid, &attr, libanos_watcher, nullptr) == 0) {
         LOGI("Phase 2: libanogs.so watcher thread started");
     } else {
-        LOGE("Phase 2: failed to create watcher thread — installing now (may fail)");
-        installAnogsApiHooks();
+        LOGE("Phase 2: failed to create watcher thread — trying inline install");
+        char full_path[512] = {};
+        if (getMapsLibPath("libanogs.so", full_path, sizeof(full_path))) {
+            void *h = dlopen(full_path, RTLD_LAZY);
+            if (!h) h = dlopen("libanogs.so", RTLD_LAZY);
+            if (h) { installAnogsApiHooks(h); dlclose(h); }
+            else LOGE("Phase 2 inline: dlopen failed: %s", dlerror());
+        } else {
+            LOGE("Phase 2 inline: libanogs.so not in maps yet");
+        }
     }
     pthread_attr_destroy(&attr);
 }
