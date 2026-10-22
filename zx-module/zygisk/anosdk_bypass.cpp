@@ -9,6 +9,7 @@
 #include "hook_engine.hpp"
 #include <dlfcn.h>
 #include <cstring>
+#include <cstdio>
 #include <unistd.h>
 #include <signal.h>
 #include <pthread.h>
@@ -131,25 +132,49 @@ static int hook_AnoSDKIoctlOld(int cmd, void *data, int len) {
     return 0;
 }
 
-// GetReportData — pass through to original so the server receives real (clean)
-// scan reports. MemoryGuard already hides us from dl_iterate_phdr and /proc/self/maps,
-// so the real reports contain no trace of our module. Returning null here would
-// produce an empty-report stream that the server flags as a soft-ban signal.
+// GetReportData — consume real scan data and discard it so detection reports
+// never reach the game caller (which would forward them to the server).
+// Dobby patches in libil2cpp.so ARE detected by AnoSDK code integrity scans;
+// passing real reports through would immediately trigger a server-side ban.
 static void *hook_AnoSDKGetReportData(int *len) {
-    if (orig_AnoSDKGetReportData) return orig_AnoSDKGetReportData(len);
-    if (len) *len = 0; return nullptr;
+    if (orig_AnoSDKGetReportData) {
+        int real_len = 0;
+        void *real_data = orig_AnoSDKGetReportData(&real_len);
+        if (real_data && orig_AnoSDKDelReportData)
+            orig_AnoSDKDelReportData(real_data);
+    }
+    if (len) *len = 0;
+    return nullptr;
 }
 static void *hook_AnoSDKGetReportData2(int type, int *len) {
-    if (orig_AnoSDKGetReportData2) return orig_AnoSDKGetReportData2(type, len);
-    if (len) *len = 0; return nullptr;
+    if (orig_AnoSDKGetReportData2) {
+        int real_len = 0;
+        void *real_data = orig_AnoSDKGetReportData2(type, &real_len);
+        if (real_data && orig_AnoSDKDelReportData)
+            orig_AnoSDKDelReportData(real_data);
+    }
+    if (len) *len = 0;
+    return nullptr;
 }
 static void *hook_AnoSDKGetReportData3(int type, int *len, int flag) {
-    if (orig_AnoSDKGetReportData3) return orig_AnoSDKGetReportData3(type, len, flag);
-    if (len) *len = 0; return nullptr;
+    if (orig_AnoSDKGetReportData3) {
+        int real_len = 0;
+        void *real_data = orig_AnoSDKGetReportData3(type, &real_len, flag);
+        if (real_data && orig_AnoSDKDelReportData3)
+            orig_AnoSDKDelReportData3(real_data, flag);
+    }
+    if (len) *len = 0;
+    return nullptr;
 }
 static void *hook_AnoSDKGetReportData4(int type, int *len, int flag, int extra) {
-    if (orig_AnoSDKGetReportData4) return orig_AnoSDKGetReportData4(type, len, flag, extra);
-    if (len) *len = 0; return nullptr;
+    if (orig_AnoSDKGetReportData4) {
+        int real_len = 0;
+        void *real_data = orig_AnoSDKGetReportData4(type, &real_len, flag, extra);
+        if (real_data && orig_AnoSDKDelReportData4)
+            orig_AnoSDKDelReportData4(real_data, flag, extra);
+    }
+    if (len) *len = 0;
+    return nullptr;
 }
 
 // DelReportData — complements GetReportData; pass through to avoid leaks.
@@ -163,44 +188,62 @@ static void hook_AnoSDKDelReportData4(void *data, int flag, int extra) {
     if (orig_AnoSDKDelReportData4) orig_AnoSDKDelReportData4(data, flag, extra);
 }
 
+// ── /proc/self/maps helper — finds full path of a loaded library ──────────────
+// Android 11+ linker namespace isolation makes dlopen("libanogs.so", RTLD_NOLOAD)
+// return NULL from Zygisk's namespace even when the library is loaded in the app's
+// namespace. Parsing /proc/self/maps gives us the real on-disk path which can then
+// be dlopen'd with RTLD_LAZY to obtain a valid handle for dlsym lookups.
+static bool getMapsLibPath(const char *libname, char *path_out, size_t plen) {
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (!fp) return false;
+    char line[512];
+    bool found = false;
+    while (fgets(line, sizeof(line), fp)) {
+        if (!strstr(line, libname)) continue;
+        char *slash = strchr(line, '/');
+        if (!slash) continue;
+        size_t slen = strlen(slash);
+        if (slen > 0 && slash[slen - 1] == '\n') slash[slen - 1] = '\0';
+        // Skip anonymous or deleted mappings
+        if (strstr(slash, " (deleted)")) continue;
+        if (path_out) { strncpy(path_out, slash, plen - 1); path_out[plen - 1] = '\0'; }
+        found = true;
+        break;
+    }
+    fclose(fp);
+    return found;
+}
+
 // ── Phase 2 installer — called from watcher thread once libanogs.so loads ────
-static void installAnogsApiHooks() {
+// Accepts the already-open handle so dlsym resolves into the correct namespace.
+static void installAnogsApiHooks(void *h) {
     auto &e = HookEngine::get();
 
+    auto resolve = [&](const char *sym_name, void *hook_fn, void **orig_out, const char *tag) {
+        void *sym = dlsym(h, sym_name);
+        if (!sym) {
+            LOGE("[%s] %s not found in handle", tag, sym_name);
+            return;
+        }
+        e.hookAddr(sym, hook_fn, orig_out, tag);
+    };
+
     // Ioctl variants — heartbeats (cmd < 0x10) pass through; scan triggers blocked
-    e.hookSym("libanogs.so", "AnoSDKIoctl",
-              (void *)hook_AnoSDKIoctl,
-              (void **)&orig_AnoSDKIoctl,    "AnoIoctl");
-    e.hookSym("libanogs.so", "AnoSDKIoctlOld",
-              (void *)hook_AnoSDKIoctlOld,
-              (void **)&orig_AnoSDKIoctlOld, "AnoIoctlOld");
+    resolve("AnoSDKIoctl",    (void *)hook_AnoSDKIoctl,    (void **)&orig_AnoSDKIoctl,    "AnoIoctl");
+    resolve("AnoSDKIoctlOld", (void *)hook_AnoSDKIoctlOld, (void **)&orig_AnoSDKIoctlOld, "AnoIoctlOld");
 
-    // GetReportData — pass through (MemoryGuard ensures reports are clean)
-    e.hookSym("libanogs.so", "AnoSDKGetReportData",
-              (void *)hook_AnoSDKGetReportData,
-              (void **)&orig_AnoSDKGetReportData,  "AnoRep1");
-    e.hookSym("libanogs.so", "AnoSDKGetReportData2",
-              (void *)hook_AnoSDKGetReportData2,
-              (void **)&orig_AnoSDKGetReportData2, "AnoRep2");
-    e.hookSym("libanogs.so", "AnoSDKGetReportData3",
-              (void *)hook_AnoSDKGetReportData3,
-              (void **)&orig_AnoSDKGetReportData3, "AnoRep3");
-    e.hookSym("libanogs.so", "AnoSDKGetReportData4",
-              (void *)hook_AnoSDKGetReportData4,
-              (void **)&orig_AnoSDKGetReportData4, "AnoRep4");
+    // GetReportData — consume real scan reports; return nullptr so caller sends nothing
+    resolve("AnoSDKGetReportData",  (void *)hook_AnoSDKGetReportData,  (void **)&orig_AnoSDKGetReportData,  "AnoRep1");
+    resolve("AnoSDKGetReportData2", (void *)hook_AnoSDKGetReportData2, (void **)&orig_AnoSDKGetReportData2, "AnoRep2");
+    resolve("AnoSDKGetReportData3", (void *)hook_AnoSDKGetReportData3, (void **)&orig_AnoSDKGetReportData3, "AnoRep3");
+    resolve("AnoSDKGetReportData4", (void *)hook_AnoSDKGetReportData4, (void **)&orig_AnoSDKGetReportData4, "AnoRep4");
 
-    // DelReportData — must pass through to free memory from GetReportData
-    e.hookSym("libanogs.so", "AnoSDKDelReportData",
-              (void *)hook_AnoSDKDelReportData,
-              (void **)&orig_AnoSDKDelReportData,  "AnoDel1");
-    e.hookSym("libanogs.so", "AnoSDKDelReportData3",
-              (void *)hook_AnoSDKDelReportData3,
-              (void **)&orig_AnoSDKDelReportData3, "AnoDel3");
-    e.hookSym("libanogs.so", "AnoSDKDelReportData4",
-              (void *)hook_AnoSDKDelReportData4,
-              (void **)&orig_AnoSDKDelReportData4, "AnoDel4");
+    // DelReportData — pass through; needed by GetReportData hooks to free memory
+    resolve("AnoSDKDelReportData",  (void *)hook_AnoSDKDelReportData,  (void **)&orig_AnoSDKDelReportData,  "AnoDel1");
+    resolve("AnoSDKDelReportData3", (void *)hook_AnoSDKDelReportData3, (void **)&orig_AnoSDKDelReportData3, "AnoDel3");
+    resolve("AnoSDKDelReportData4", (void *)hook_AnoSDKDelReportData4, (void **)&orig_AnoSDKDelReportData4, "AnoDel4");
 
-    LOGI("Phase 2: API hooks installed on libanogs.so (Ioctl+IoctlOld blocked, reports pass-through)");
+    LOGI("Phase 2: API hooks installed on libanogs.so (Ioctl blocked, reports consumed+discarded)");
 }
 
 // ── Watcher thread ────────────────────────────────────────────────────────────
@@ -210,13 +253,28 @@ static void *libanos_watcher(void *) {
     // Poll every 100ms for up to 60 seconds
     for (int i = 0; i < 600 && !g_watcher_stop.load(std::memory_order_acquire); ++i) {
         usleep(100000);
-        void *h = dlopen("libanogs.so", RTLD_LAZY | RTLD_NOLOAD);
-        if (h) {
-            dlclose(h);
-            LOGI("Watcher: libanogs.so appeared at %dms — hooking API", (i + 1) * 100);
-            installAnogsApiHooks();
-            return nullptr;
+
+        // Try /proc/self/maps first — works across Android 11+ namespace boundaries
+        char full_path[512] = {};
+        bool in_maps = getMapsLibPath("libanogs.so", full_path, sizeof(full_path));
+        if (!in_maps) continue;
+
+        // dlopen via full path bypasses the linker namespace restriction
+        void *h = dlopen(full_path, RTLD_LAZY);
+        if (!h) {
+            // Rare: maps entry exists but dlopen fails — try bare name as fallback
+            h = dlopen("libanogs.so", RTLD_LAZY);
         }
+        if (!h) {
+            LOGE("Watcher: libanogs.so in maps but dlopen failed: %s", dlerror());
+            continue;
+        }
+
+        LOGI("Watcher: libanogs.so appeared at %dms (path=%s) — hooking API",
+             (i + 1) * 100, full_path);
+        installAnogsApiHooks(h);
+        dlclose(h);
+        return nullptr;
     }
     LOGE("Watcher: libanogs.so never appeared in 60s");
     return nullptr;
