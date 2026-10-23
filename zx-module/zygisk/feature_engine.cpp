@@ -630,18 +630,12 @@ void FeatureEngine::applyESP(bool enable) {
     s_esp     = enable;
     s_esp_hud = enable;
 
-    // Layer 1: IsVisible culling gate
-    if (m_mth.isVisible && m_mth.isVisible->methodPointer) {
-        if (enable && !s_orig_visible)
-            HookEngine::get().hookAddr(m_mth.isVisible->methodPointer,
-                reinterpret_cast<void *>(hook_is_visible), &s_orig_visible, "ESP-vis");
-        else if (!enable && s_orig_visible) {
-            HookEngine::get().unhook(m_mth.isVisible->methodPointer);
-            s_orig_visible = nullptr;
-        }
-    } else {
-        LOGE("ESP: IsVisible not resolved");
-    }
+    // Layer 1 (DISABLED): IsVisible() in Free Fire is a stealth-state getter, not a
+    // renderer culling check. Forcing it true marks ALL players as cloaked/invisible,
+    // which is the opposite of what we want — bodies disappear, only weapons remain.
+    // Outline layers (3+4) render through walls via the game's depth-ignore outline
+    // shader without touching this method.
+    (void)s_orig_visible;
 
     // Layer 2: HUD SetVisible — forces enemy health bars / name plates to render
     if (m_mth.hudSetVisible && m_mth.hudSetVisible->methodPointer) {
