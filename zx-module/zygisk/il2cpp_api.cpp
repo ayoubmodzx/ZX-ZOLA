@@ -2,6 +2,7 @@
 #include <dlfcn.h>
 #include <android/log.h>
 #include <cstring>
+#include <cstdio>
 
 #define TAG "ZX-IL2CPP"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
