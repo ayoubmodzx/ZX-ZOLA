@@ -29,10 +29,43 @@ il2cpp_array_new_t                   il2cpp_array_new                   = nullpt
     name = reinterpret_cast<name##_t>(dlsym(g_il2cpp_handle, #name)); \
     if (!name) { LOGE("Failed to resolve " #name); return false; }
 
+// Android linker namespace isolation means dlopen("libil2cpp.so") fails from a Zygisk
+// module even when the library is already mapped — our namespace ≠ app namespace.
+// Fix: read the full absolute path from /proc/self/maps and dlopen that directly.
+static bool findLibPath(const char *libname, char *out, size_t outsz) {
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return false;
+    char line[1024];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, libname)) continue;
+        char *slash = strchr(line, '/');
+        if (!slash) continue;
+        size_t len = strlen(slash);
+        if (len > 0 && slash[len - 1] == '\n') slash[--len] = '\0';
+        strncpy(out, slash, outsz - 1);
+        out[outsz - 1] = '\0';
+        found = true;
+        break;
+    }
+    fclose(f);
+    return found;
+}
+
 bool Il2CppApi::init() {
-    g_il2cpp_handle = dlopen("libil2cpp.so", RTLD_LAZY | RTLD_GLOBAL);
+    char il2cpp_path[512] = {};
+    if (!findLibPath("libil2cpp.so", il2cpp_path, sizeof(il2cpp_path))) {
+        LOGE("libil2cpp.so not in /proc/self/maps yet");
+        return false;
+    }
+    LOGI("libil2cpp.so found at: %s", il2cpp_path);
+
+    // RTLD_NOLOAD: get handle to already-mapped lib without re-loading
+    g_il2cpp_handle = dlopen(il2cpp_path, RTLD_LAZY | RTLD_NOLOAD);
+    if (!g_il2cpp_handle)
+        g_il2cpp_handle = dlopen(il2cpp_path, RTLD_LAZY | RTLD_GLOBAL);
     if (!g_il2cpp_handle) {
-        LOGE("dlopen libil2cpp.so failed: %s", dlerror());
+        LOGE("dlopen %s failed: %s", il2cpp_path, dlerror());
         return false;
     }
 
