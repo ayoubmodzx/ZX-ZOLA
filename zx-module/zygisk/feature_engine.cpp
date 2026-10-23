@@ -118,9 +118,44 @@ void FeatureEngine::resolveClasses() {
             m_mth.getTransform = Il2CppApi::getMethod(component, "get_transform", 0);
     }
 
-    // ESP — IsVisible confirmed at method index 210348 in global-metadata.dat
+    // ESP — hook the HUD/UI draw methods that render enemy indicators
+    // IsVisible gate is also hooked for culling, but the real visual effect
+    // requires forcing the enemy health bar / name plate to always render.
     if (m_cls.Player)
         m_mth.isVisible = Il2CppApi::getMethod(m_cls.Player, "IsVisible", 0);
+
+    // Search for the HUD class that renders enemy name/health plates
+    static const char *kHudClasses[] = {
+        "PlayerHUD", "EnemyHUD", "EnemyIndicator", "PlayerIndicator",
+        "PlayerNamePlate", "HUDPlayerItem", "PlayerInfoHUD", nullptr
+    };
+    static const char *kHudNamespaces[] = {
+        "COW.GamePlay", "COW.UI", "COW", "COW.HUD", nullptr
+    };
+    Il2CppClass *hudCls = nullptr;
+    for (int ns = 0; !hudCls && kHudNamespaces[ns]; ++ns)
+        for (int c = 0; kHudClasses[c]; ++c) {
+            hudCls = Il2CppApi::getClass(img, kHudNamespaces[ns], kHudClasses[c]);
+            if (hudCls) { LOGI("ESP HUD class: %s::%s", kHudNamespaces[ns], kHudClasses[c]); break; }
+        }
+
+    if (hudCls) {
+        // Force enemy health bar / name plate to always be visible
+        static const char *kShowNames[] = {
+            "SetVisible","Show","OnShow","SetActive","SetEnemyVisible",
+            "UpdateVisible","RefreshVisible","ForceShow","SetShowState", nullptr
+        };
+        for (int i = 0; kShowNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(hudCls, kShowNames[i], -1);
+            if (m && m->methodPointer) {
+                m_mth.hudSetVisible = m;
+                LOGI("ESP HUD method: %s", kShowNames[i]);
+                break;
+            }
+        }
+    }
+    if (!hudCls || !m_mth.hudSetVisible)
+        LOGE("ESP: HUD class/method not found — IsVisible-only mode (no visible boxes)");
 
     // InfiniteAmmo — get_IsAmmoFree (bool) on PlayerAttributes (index 245979)
     // WeaponPropertyUtil has 0 exposed methods in this build; PlayerAttributes is the right target
@@ -215,6 +250,8 @@ static void *s_orig_jump     = nullptr;
 static void *s_orig_vehicle  = nullptr;
 // ── New orig pointers ─────────────────────────────────────────────────────────
 static void *s_orig_visible   = nullptr;
+static void *s_orig_hud_show  = nullptr;
+static bool  s_esp_hud        = false;
 static void *s_orig_ammo      = nullptr;
 static void *s_orig_reload    = nullptr;
 static void *s_orig_wallhit   = nullptr;
@@ -285,12 +322,18 @@ static float hook_vehicle(void *self, void *method) {
 
 // ── New hooks ────────────────────────────────────────────────────────────────
 
-// ESP: IsVisible / GetIsVisible / get_IsVisible → always true when active
-// IL2CPP bool = uint8_t (0/1), ARM64: x0=this, x1=MethodInfo* → w0
+// ESP: IsVisible gate — always true (culling bypass)
 static uint8_t hook_is_visible(void *self, void *method) {
     if (s_esp) return 1;
     using Fn = uint8_t (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_visible)(self, method);
+}
+
+// ESP: HUD SetVisible(bool) — force true so enemy plates always render
+// ARM64: x0=this, w1=visible(bool), x2=MethodInfo*
+static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
+    using Fn = void (*)(void *, uint8_t, void *);
+    reinterpret_cast<Fn>(s_orig_hud_show)(self, s_esp_hud ? 1 : visible, method);
 }
 
 // InfiniteAmmo: get_IsAmmoFree (bool) → 1 = ammo is free/unlimited
@@ -556,19 +599,37 @@ void FeatureEngine::applyAntiDamage(bool enable) {
 // ── New feature implementations ──────────────────────────────────────────────
 
 void FeatureEngine::applyESP(bool enable) {
-    s_esp = enable;
-    if (!m_mth.isVisible || !m_mth.isVisible->methodPointer) {
-        LOGE("ESP: visibility method not resolved — unable to hook");
-        return;
+    s_esp     = enable;
+    s_esp_hud = enable;
+
+    // Layer 1: IsVisible culling gate
+    if (m_mth.isVisible && m_mth.isVisible->methodPointer) {
+        if (enable && !s_orig_visible)
+            HookEngine::get().hookAddr(m_mth.isVisible->methodPointer,
+                reinterpret_cast<void *>(hook_is_visible), &s_orig_visible, "ESP-vis");
+        else if (!enable && s_orig_visible) {
+            HookEngine::get().unhook(m_mth.isVisible->methodPointer);
+            s_orig_visible = nullptr;
+        }
+    } else {
+        LOGE("ESP: IsVisible not resolved");
     }
-    if (enable && !s_orig_visible) {
-        HookEngine::get().hookAddr(m_mth.isVisible->methodPointer,
-            reinterpret_cast<void *>(hook_is_visible), &s_orig_visible, "ESP");
-    } else if (!enable && s_orig_visible) {
-        HookEngine::get().unhook(m_mth.isVisible->methodPointer);
-        s_orig_visible = nullptr;
+
+    // Layer 2: HUD SetVisible — forces enemy health bars / name plates to render
+    if (m_mth.hudSetVisible && m_mth.hudSetVisible->methodPointer) {
+        if (enable && !s_orig_hud_show)
+            HookEngine::get().hookAddr(m_mth.hudSetVisible->methodPointer,
+                reinterpret_cast<void *>(hook_hud_set_visible), &s_orig_hud_show, "ESP-hud");
+        else if (!enable && s_orig_hud_show) {
+            HookEngine::get().unhook(m_mth.hudSetVisible->methodPointer);
+            s_orig_hud_show = nullptr;
+        }
+    } else {
+        LOGE("ESP: HUD method not resolved — enemies visible in culling only, no boxes");
     }
-    LOGI("ESP: %s", enable ? "ON" : "OFF");
+
+    LOGI("ESP: %s (vis=%p hud=%p)", enable ? "ON" : "OFF",
+         s_orig_visible, s_orig_hud_show);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {

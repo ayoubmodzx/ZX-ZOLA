@@ -134,6 +134,7 @@ private:
         MethodInfo *getTransform   = nullptr;  // Component.get_transform
         MethodInfo *colliderHit    = nullptr;  // OnControllerColliderHit (NoClip)
         MethodInfo *playerUpdate   = nullptr;  // Player.Update (Teleport tick)
+        MethodInfo *hudSetVisible  = nullptr;  // PlayerHUD.SetVisible (ESP visual)
     } m_mth;
 
     void resolveClasses();
