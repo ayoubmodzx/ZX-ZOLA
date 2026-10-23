@@ -72,16 +72,26 @@ public:
             // installs SDK-level API hooks once it appears (~100ms intervals)
             AnoBypass::startWatcher();
 
-            // Init il2cpp API
-            if (!Il2CppApi::init()) {
-                LOGE("Il2Cpp init failed");
-                return;
-            }
-
-            // Features — resolve il2cpp classes + start socket server for app control
-            FeatureEngine::get().init(&g_worker);
-
-            LOGI("ZX-ZOLA fully loaded — listening on \\0zx_zola");
+            // Il2cpp init with retry — libil2cpp.so may not be mapped yet.
+            // Poll every 300ms for up to 15s before giving up.
+            struct Il2CppInitRetry {
+                static void attempt(AsyncWorker *worker, int tries_left) {
+                    if (Il2CppApi::init()) {
+                        FeatureEngine::get().init(worker);
+                        LOGI("ZX-ZOLA fully loaded — listening on \\0zx_zola");
+                        return;
+                    }
+                    if (tries_left <= 0) {
+                        LOGE("Il2Cpp init failed after all retries — libil2cpp.so not found");
+                        return;
+                    }
+                    LOGI("Il2Cpp not ready yet, retrying (%d left)", tries_left);
+                    worker->postDelayed([worker, tries_left] {
+                        attempt(worker, tries_left - 1);
+                    }, 300);
+                }
+            };
+            Il2CppInitRetry::attempt(&g_worker, 50);
         });
     }
 
