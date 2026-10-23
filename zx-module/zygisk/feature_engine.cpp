@@ -54,7 +54,7 @@ void FeatureEngine::resolveClasses() {
     if (m_cls.Player)    m_mth.takeDamage    = Il2CppApi::getMethod(m_cls.Player,    "TakeDamage",               -1);
     if (m_cls.Grass)     m_mth.getGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "get_GrassInstances",        0);
     if (m_cls.Grass)     m_mth.setGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "set_GrassInstances",        1);
-    if (m_cls.Aim)       m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,       "CalculateAimPoint",        -1);
+    if (m_cls.Aim)       m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,       "GetAttackableCenterWS",     0);
 
     // SpeedHack — search multiple names across PlayerAttributes then Player
     {
@@ -73,11 +73,13 @@ void FeatureEngine::resolveClasses() {
     // Recoil / RoF — obfuscated; try common patterns across Weapon / Player / Character
     {
         static const char *kRecoilNames[] = {
+            "RecoilFormula",
             "GetRecoilScale","CalcRecoil","GetRecoil","ComputeRecoil",
             "GetRecoilValue","OnRecoil","ApplyRecoil","CalcSpread",
             "GetVerticalRecoil","GetHorizontalRecoil", nullptr
         };
         static const char *kRofNames[] = {
+            "RateOfFireFormula",
             "GetFireRate","CalcFireRate","GetRateOfFire","GetFireInterval",
             "ComputeFireRate","GetShootInterval","GetFireDelay", nullptr
         };
@@ -522,6 +524,7 @@ void FeatureEngine::applyVehicleSpeed(bool enable, float multiplier) {
     s_vehicle_mul = multiplier;
     if (enable && !s_orig_vehicle && m_cls.Vehicle) {
         static const char *kVehicleNames[] = {
+            "GetCurrentMaxSpeed",
             "GetMaxSpeed",
             "get_MaxSpeed",
             "get_Speed",
