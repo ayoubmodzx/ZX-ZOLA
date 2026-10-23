@@ -429,10 +429,12 @@ static void *s_orig_update_aiming   = nullptr;  // Player.UpdateAiming
 static void *s_orig_has_heuristic   = nullptr;  // Player.HasHeuristicTarget
 static void *s_orig_get_heuristic   = nullptr;  // Player.GetHeuristicTarget
 // ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
-static void        *s_res_id_get_inst  = nullptr;  // ResourceIDDef.GetInstance()
-static void        *s_res_id_try_init  = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
-static void        *s_res_id_show      = nullptr;  // ResourceIDDef.ShowPlayerOutline(bool)
-static Il2CppClass *s_res_id_cls       = nullptr;  // ResourceIDDef class (for field scan)
+static void        *s_res_id_get_inst      = nullptr;  // ResourceIDDef.GetInstance()
+static void        *s_res_id_try_init      = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
+static void        *s_res_id_show          = nullptr;  // ResourceIDDef.ShowPlayerOutline(bool)
+static void        *s_res_id_only_headshot = nullptr;  // ResourceIDDef.set_OnlyHeadshot(bool)
+static Il2CppClass *s_res_id_cls           = nullptr;  // ResourceIDDef class (for field scan)
+static void        *s_res_id_inst          = nullptr;  // cached singleton instance (set after lazy-init)
 
 // RecoilFormula — returns float; extra void* params absorb any signature variant
 static float hook_recoil(void *self, void *a1, void *a2, void *a3, void *a4) {
@@ -690,18 +692,13 @@ void FeatureEngine::applyRapidFire(bool enable) {
 // GetAttackableCenterWS — redirect aim center to head bone when auto-hs / silent-aim / aimbot on
 // Returns Vec3 by value (ARM64 HFA convention: s0/s1/s2)
 static Vec3 hook_get_attackable_center(void *self, void *method) {
-    // ESP side-effect: apply rendering to this enemy while we have their pointer.
-    // GetAttackableCenterWS fires for every enemy the game's aim system processes —
-    // more reliable than Player.Update which may not run for remote players.
-    if (s_esp) {
-        static bool s_esp_ac_first = true;
-        if (s_esp_ac_first) { s_esp_ac_first = false; LOGI("[ESP-DIAG] ESP via GetAttackableCenterWS: self=%p", self); }
-
-        // Lazy-init ResourceIDDef outline pipeline — singleton only exists inside a match,
-        // not at lobby time when ESP is first toggled.
+    // Lazy-init ResourceIDDef singleton — only exists inside a match, not at lobby time.
+    // Shared by both ESP outline pipeline and set_OnlyHeadshot gate.
+    {
         static bool s_res_init_done = false;
         static int  s_res_retry     = 0;
-        if (!s_res_init_done && (++s_res_retry % 30 == 1)) {
+        const bool  need_init = (s_esp || s_auto_headshot || s_silent_aim || s_full_aimbot);
+        if (need_init && !s_res_init_done && (++s_res_retry % 30 == 1)) {
             void *inst = nullptr;
             if (s_res_id_get_inst) {
                 using GetFn = void *(*)(void *);
@@ -718,11 +715,27 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
             }
             if (inst) {
                 s_res_init_done = true;
+                s_res_id_inst   = inst;
+                // ESP outline pipeline
                 if (s_res_id_try_init) { using Fn = void(*)(void*,void*); reinterpret_cast<Fn>(s_res_id_try_init)(inst,nullptr); }
-                if (s_res_id_show)     { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
+                if (s_res_id_show && s_esp) { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
+                // Headshot engine-gate — set_OnlyHeadshot(true) so ALL hits use headshot multiplier
+                if (s_res_id_only_headshot && (s_auto_headshot || s_silent_aim || s_full_aimbot)) {
+                    using SetFn = void(*)(void*,uint8_t,void*);
+                    reinterpret_cast<SetFn>(s_res_id_only_headshot)(inst, 1, nullptr);
+                    LOGI("[AIM] lazy set_OnlyHeadshot(1) on ResIDDef inst=%p", inst);
+                }
                 LOGI("[ESP-DIAG] ResIDDef in-game init OK: inst=%p", inst);
             }
         }
+    }
+
+    // ESP side-effect: apply rendering to this enemy while we have their pointer.
+    // GetAttackableCenterWS fires for every enemy the game's aim system processes —
+    // more reliable than Player.Update which may not run for remote players.
+    if (s_esp) {
+        static bool s_esp_ac_first = true;
+        if (s_esp_ac_first) { s_esp_ac_first = false; LOGI("[ESP-DIAG] ESP via GetAttackableCenterWS: self=%p", self); }
 
         if (s_orig_set_render_q) {
             using SetRQFn = void (*)(void *, int, void *);
@@ -818,21 +831,34 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
+        // Cache set_OnlyHeadshot fn pointer for lazy-init path inside the hook
+        if (!s_res_id_only_headshot && m_mth.setOnlyHeadshot)
+            s_res_id_only_headshot = m_mth.setOnlyHeadshot->methodPointer;
+        // Also populate class/getter for singleton resolution if not yet populated by ESP
+        if (!s_res_id_cls)       s_res_id_cls       = m_cls.ResIdDef;
+        if (!s_res_id_get_inst && m_mth.resIdGetInstance)
+            s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
     }
 
     // Hook GetAttackableCenterWS → head position
     if (enable) installAimCenterHook(m_mth.calcAimTarget);
     else        removeAimCenterHook(m_mth.calcAimTarget);
 
-    // ResourceIDDef.set_OnlyHeadshot(true) — engine-level headshot-only gate
-    if (m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer &&
-        m_mth.setOnlyHeadshot  && m_mth.setOnlyHeadshot->methodPointer) {
-        using GetInstFn = void *(*)(void *);
-        void *inst = reinterpret_cast<GetInstFn>(m_mth.resIdGetInstance->methodPointer)(nullptr);
+    // If the singleton is already live (e.g. toggled mid-match), call immediately.
+    // Otherwise hook_get_attackable_center will call it lazily on next enemy tick.
+    if (m_mth.setOnlyHeadshot && m_mth.setOnlyHeadshot->methodPointer) {
+        void *inst = s_res_id_inst;
+        if (!inst && m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer) {
+            using GetInstFn = void *(*)(void *);
+            inst = reinterpret_cast<GetInstFn>(m_mth.resIdGetInstance->methodPointer)(nullptr);
+        }
         if (inst) {
             using SetFn = void (*)(void *, uint8_t, void *);
             reinterpret_cast<SetFn>(m_mth.setOnlyHeadshot->methodPointer)(inst, enable ? 1 : 0, nullptr);
-            LOGI("[AIM] set_OnlyHeadshot(%d) on ResourceIDDef inst=%p", (int)enable, inst);
+            LOGI("[AIM] set_OnlyHeadshot(%d) on ResIDDef inst=%p (immediate)", (int)enable, inst);
+        } else {
+            if (enable) LOGI("[AIM] set_OnlyHeadshot deferred — ResIDDef not yet live (lobby)");
+            else        LOGI("[AIM] set_OnlyHeadshot(0) skipped — no inst (feature was never active in-match)");
         }
     }
     LOGI("AutoHeadshot: %s  center_hook=%p head_bone=%p",
@@ -847,6 +873,11 @@ void FeatureEngine::applySilentAim(bool enable) {
             s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
+        if (!s_res_id_only_headshot && m_mth.setOnlyHeadshot)
+            s_res_id_only_headshot = m_mth.setOnlyHeadshot->methodPointer;
+        if (!s_res_id_cls)      s_res_id_cls      = m_cls.ResIdDef;
+        if (!s_res_id_get_inst && m_mth.resIdGetInstance)
+            s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
     }
 
     if (enable) installAimCenterHook(m_mth.calcAimTarget);
@@ -871,6 +902,11 @@ void FeatureEngine::applyFullAimbot(bool enable) {
             s_orig_has_heuristic = m_mth.hasHeuristicTarget->methodPointer;
         if (!s_orig_get_heuristic && m_mth.getHeuristicTarget)
             s_orig_get_heuristic = m_mth.getHeuristicTarget->methodPointer;
+        if (!s_res_id_only_headshot && m_mth.setOnlyHeadshot)
+            s_res_id_only_headshot = m_mth.setOnlyHeadshot->methodPointer;
+        if (!s_res_id_cls)      s_res_id_cls      = m_cls.ResIdDef;
+        if (!s_res_id_get_inst && m_mth.resIdGetInstance)
+            s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
     }
 
     if (enable) installAimCenterHook(m_mth.calcAimTarget);
