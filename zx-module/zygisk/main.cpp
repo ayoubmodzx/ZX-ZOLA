@@ -26,12 +26,10 @@ static AsyncWorker g_worker;
 class ZxZolaModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
-        // api is only valid for the duration of onLoad; preAppSpecialize
-        // receives its own per-call api implicitly via Magisk callbacks.
-        // We store it here only because preAppSpecialize calls setOption
-        // on the same object — Magisk keeps it alive for the module lifetime.
         m_api = api;
-        m_env = env;
+        // Store JavaVM instead of JNIEnv — JNIEnv is thread-local and becomes
+        // invalid in the child process after fork; JavaVM is process-wide and safe.
+        env->GetJavaVM(&m_jvm);
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
@@ -40,14 +38,22 @@ public:
             return;
         }
 
-        const char *pkg = m_env->GetStringUTFChars(args->nice_name, nullptr);
+        // Get a fresh JNIEnv for this thread — required after fork()
+        JNIEnv *env = nullptr;
+        if (m_jvm) {
+            if (m_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED)
+                m_jvm->AttachCurrentThread(&env, nullptr);
+        }
+        if (!env) { m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
+
+        const char *pkg = env->GetStringUTFChars(args->nice_name, nullptr);
         if (!pkg) { m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
 
         bool is_ff = false;
         for (int i = 0; kFfPkgs[i]; ++i) {
             if (strcmp(pkg, kFfPkgs[i]) == 0) { is_ff = true; break; }
         }
-        m_env->ReleaseStringUTFChars(args->nice_name, pkg);
+        env->ReleaseStringUTFChars(args->nice_name, pkg);
 
         if (!is_ff) {
             // Unload from every non-FF process — zero overhead everywhere else
@@ -94,7 +100,7 @@ public:
 
 private:
     zygisk::Api *m_api    = nullptr;
-    JNIEnv      *m_env    = nullptr;
+    JavaVM      *m_jvm    = nullptr;
     bool         m_target = false;
 };
 
