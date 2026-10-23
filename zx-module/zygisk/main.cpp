@@ -30,20 +30,21 @@ public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         m_api = api;
         m_env = env;
+        LOGI("onLoad — ZygiskNext attached this module");
     }
 
     void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        // Read nice_name here — JNI is valid in Zygote before fork.
-        // postAppSpecialize runs in the child where /proc/self/cmdline is
-        // still "zygote64" until ActivityThread sets it much later.
         m_is_ff = false;
-        if (!m_env || !args->nice_name) return;
+        if (!m_env || !args->nice_name) {
+            LOGI("preAppSpecialize: env=%p nice_name=%p — skipped", m_env, args->nice_name);
+            return;
+        }
         const char *name = m_env->GetStringUTFChars(args->nice_name, nullptr);
         if (!name) return;
+        LOGI("preAppSpecialize: [%s]", name);
         for (int i = 0; kFfPkgs[i]; ++i) {
             if (strcmp(name, kFfPkgs[i]) == 0) { m_is_ff = true; break; }
         }
-        if (m_is_ff) LOGI("preAppSpecialize: FF detected [%s]", name);
         m_env->ReleaseStringUTFChars(args->nice_name, name);
     }
 
