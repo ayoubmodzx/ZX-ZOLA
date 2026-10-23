@@ -7,10 +7,9 @@ namespace AnoBypass {
     // before any worker thread, so hooks fire before any game lib loads.
     void installEarly();
 
-    // Phase 2 — Launch a detached watcher thread that polls for libanogs.so
-    // every 100ms and installs SDK-level API hooks once it appears.
-    // Call from the async worker thread.
-    void startWatcher();
+    // Phase 2 removed: Dobby hooks on libanogs.so exports trigger AnoSDK
+    // code-integrity self-check → heartbeat carries detection → server ban.
+    void startWatcher(); // no-op kept for ABI compat
 
     // Legacy combined entry-point (installEarly + startWatcher).
     bool install();
