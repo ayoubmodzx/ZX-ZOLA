@@ -34,6 +34,10 @@ void FeatureEngine::init(AsyncWorker *worker) {
     }, 5000);
 }
 
+// Global outline enable — declared here so resolveClasses() can write them
+static void     *s_match_show_outline_fn = nullptr;
+static FieldInfo *s_enable_outline_field = nullptr;
+
 void FeatureEngine::resolveClasses() {
     Il2CppImage *img = Il2CppApi::getImage("Assembly-CSharp");
     if (!img) { LOGE("Assembly-CSharp not found"); return; }
@@ -240,6 +244,53 @@ void FeatureEngine::resolveClasses() {
             if (m && m->methodPointer) { m_mth.playerUpdate = m; break; }
         }
         if (!m_mth.playerUpdate) LOGE("Teleport: no Update method found on Player");
+    }
+
+    // ESP global switches — COW::MatchGame.ShowPlayerOutline enables the outline system
+    // for all players globally (used in kill cam / spectator mode in Free Fire).
+    // COW::GameSettingData.EnableShowPlayerOutline is the static bool gate.
+    {
+        Il2CppClass *matchGame = Il2CppApi::getClass(img, "COW", "MatchGame");
+        if (matchGame) {
+            static const char *kShowOutline[] = {
+                "ShowPlayerOutline","SetPlayerOutlineVisible","EnablePlayerOutline",
+                "SetOutlineForAllPlayers","ShowOutline", nullptr
+            };
+            for (int i = 0; kShowOutline[i]; ++i) {
+                MethodInfo *m = Il2CppApi::getMethod(matchGame, kShowOutline[i], -1);
+                if (m && m->methodPointer) {
+                    s_match_show_outline_fn = m->methodPointer;
+                    LOGI("[ESP] MatchGame.%s found", kShowOutline[i]);
+                    break;
+                }
+            }
+        } else LOGE("[ESP] MatchGame class not found");
+
+        static const char *kSettingsNS[] = { "COW", "COW.GamePlay", "COW.Data", nullptr };
+        static const char *kSettingsCls[] = {
+            "GameSettingData","GameSettings","GameSetting",
+            "PlayerSettings","GameConfig", nullptr
+        };
+        for (int ns = 0; !s_enable_outline_field && kSettingsNS[ns]; ++ns)
+            for (int c = 0; kSettingsCls[c]; ++c) {
+                Il2CppClass *sc = Il2CppApi::getClass(img, kSettingsNS[ns], kSettingsCls[c]);
+                if (!sc) continue;
+                static const char *kFieldNames[] = {
+                    "EnableShowPlayerOutline","ShowPlayerOutline",
+                    "enableOutline","m_enableOutline","outlineEnabled", nullptr
+                };
+                for (int f = 0; kFieldNames[f]; ++f) {
+                    FieldInfo *fi = Il2CppApi::getField(sc, kFieldNames[f]);
+                    if (fi) {
+                        s_enable_outline_field = fi;
+                        LOGI("[ESP] %s::%s.%s field found",
+                             kSettingsNS[ns], kSettingsCls[c], kFieldNames[f]);
+                        break;
+                    }
+                }
+                if (s_enable_outline_field) break;
+            }
+        if (!s_enable_outline_field) LOGE("[ESP] EnableShowPlayerOutline field not found");
     }
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
@@ -453,12 +504,17 @@ static thread_local uint8_t s_outline_tick = 0;
 //                    get_position returns floats in s0/s1/s2
 static void hook_player_update(void *self, void *method) {
     // ── ESP proactive outline injection ──────────────────────────────────────
-    // SetOutlineVisible / InitOutline are NEVER called by the game on existing
-    // players after they spawn, so we force the call ourselves each ~30 frames.
+    // InitOutline MUST be called before SetOutlineVisible — it sets up the
+    // outline renderer component. Without it SetOutlineVisible does nothing
+    // (renderer ptr is null). Call both every 30 frames.
     if (s_esp && s_orig_set_outline_vis) {
         ++s_outline_tick;
         if (s_outline_tick >= 30) {
             s_outline_tick = 0;
+            if (s_orig_init_outline) {
+                using InitFn = void (*)(void *, void *);
+                reinterpret_cast<InitFn>(s_orig_init_outline)(self, nullptr);
+            }
             using ShowFn = void (*)(void *, uint8_t, void *);
             reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
         }
@@ -767,8 +823,24 @@ void FeatureEngine::applyESP(bool enable) {
         }
     }
 
-    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p update=%p",
-         (int)enable, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline, s_orig_update);
+    // Global outline enable switches — these unlock the outline system for ALL players.
+    // GameSettingData.EnableShowPlayerOutline = true: lifts the engine-level gate.
+    // MatchGame.ShowPlayerOutline(true): activates the depth-ignore outline shader
+    // used in kill cam / spectating that renders through walls.
+    if (s_enable_outline_field) {
+        uint8_t val = enable ? 1 : 0;
+        Il2CppApi::setStaticValue(nullptr, s_enable_outline_field, &val);
+        LOGI("[ESP-DIAG] GameSettingData.EnableShowPlayerOutline = %d", (int)val);
+    }
+    if (s_match_show_outline_fn && enable) {
+        using ShowAllFn = void (*)(uint8_t, void *);
+        reinterpret_cast<ShowAllFn>(s_match_show_outline_fn)(1, nullptr);
+        LOGI("[ESP-DIAG] MatchGame.ShowPlayerOutline(true) called");
+    }
+
+    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p update=%p matchfn=%p fieldfound=%d",
+         (int)enable, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline,
+         s_orig_update, s_match_show_outline_fn, s_enable_outline_field != nullptr);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {
