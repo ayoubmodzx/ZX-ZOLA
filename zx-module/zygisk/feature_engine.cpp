@@ -124,16 +124,37 @@ void FeatureEngine::resolveClasses() {
     // IsVisible gate is also hooked for culling, but the real visual effect
     // requires forcing the enemy health bar / name plate to always render.
     if (m_cls.Player) {
-        m_mth.isVisible         = Il2CppApi::getMethod(m_cls.Player, "IsVisible", 0);
-        // Try -1 first (any param count), then specific counts
-        m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible", -1);
-        if (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer)
-            m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible", 1);
-        if (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer)
-            m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible", 2);
-        m_mth.initOutline       = Il2CppApi::getMethod(m_cls.Player, "InitOutline", -1);
-        if (!m_mth.initOutline || !m_mth.initOutline->methodPointer)
-            m_mth.initOutline   = Il2CppApi::getMethod(m_cls.Player, "InitOutline", 0);
+        m_mth.isVisible = Il2CppApi::getMethod(m_cls.Player, "IsVisible", 0);
+
+        // Scan ALL Player methods first — dumps exact names/params to logcat so we know
+        // what the runtime actually exposes (SetOutlineVisible may be named differently or
+        // on a subcomponent).
+        LOGI("[ESP-DIAG] === Scanning Player methods for 'utline' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "utline");
+        LOGI("[ESP-DIAG] === Scanning Player methods for 'Outline' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "Outline");
+        LOGI("[ESP-DIAG] === Scanning Player methods for 'outline' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "outline");
+        LOGI("[ESP-DIAG] === Scanning Player methods for 'Visible' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "Visible");
+        LOGI("[ESP-DIAG] === Scanning Player methods for 'Color' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "Color");
+        LOGI("[ESP-DIAG] === Scanning Player methods for 'Render' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "Render");
+
+        // Try to resolve via iterator first; fall back to name lookup
+        m_mth.setOutlineVisible = Il2CppApi::scanMethods(m_cls.Player, "SetOutlineVisible");
+        if (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer) {
+            m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible", -1);
+            if (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer)
+                m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible", 1);
+        }
+        m_mth.initOutline = Il2CppApi::scanMethods(m_cls.Player, "InitOutline");
+        if (!m_mth.initOutline || !m_mth.initOutline->methodPointer) {
+            m_mth.initOutline = Il2CppApi::getMethod(m_cls.Player, "InitOutline", -1);
+            if (!m_mth.initOutline || !m_mth.initOutline->methodPointer)
+                m_mth.initOutline = Il2CppApi::getMethod(m_cls.Player, "InitOutline", 0);
+        }
     }
     LOGI("[ESP-DIAG] resolve: Player=%p isVisible=%p setOutlineVisible=%p initOutline=%p",
          (void*)m_cls.Player,
@@ -141,9 +162,9 @@ void FeatureEngine::resolveClasses() {
          m_mth.setOutlineVisible ? m_mth.setOutlineVisible->methodPointer : nullptr,
          m_mth.initOutline       ? m_mth.initOutline->methodPointer       : nullptr);
     if (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer)
-        LOGE("[ESP-DIAG] SetOutlineVisible NOT found on Player (tried -1,1,2 params)");
+        LOGE("[ESP-DIAG] SetOutlineVisible NOT found even via iterator scan");
     if (!m_mth.initOutline || !m_mth.initOutline->methodPointer)
-        LOGE("[ESP-DIAG] InitOutline NOT found on Player (tried -1,0 params)");
+        LOGE("[ESP-DIAG] InitOutline NOT found even via iterator scan");
 
     // Search for the HUD class that renders enemy name/health plates
     static const char *kHudClasses[] = {

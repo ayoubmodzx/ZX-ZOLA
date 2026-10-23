@@ -12,4 +12,9 @@ namespace Il2CppApi {
     size_t       fieldOffset(FieldInfo *field);
     void         getStaticValue(FieldInfo *field, void *out);
     void         setStaticValue(MethodInfo *method, FieldInfo *field, void *val);
+    // Scans all methods of klass; logs every method whose name contains filter (case-sensitive).
+    // Returns the first matching MethodInfo* or nullptr.
+    MethodInfo  *scanMethods(Il2CppClass *klass, const char *filter);
+    // Iterates every method on klass; calls cb(name, info) for each — returns false from cb to stop.
+    void         forEachMethod(Il2CppClass *klass, void (*cb)(const char *name, MethodInfo *info, void *ctx), void *ctx);
 }

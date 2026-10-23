@@ -26,6 +26,10 @@ il2cpp_string_chars_t                il2cpp_string_chars                = nullpt
 il2cpp_object_new_t                  il2cpp_object_new                  = nullptr;
 il2cpp_array_new_t                   il2cpp_array_new                   = nullptr;
 
+// Method iterator — not critical if absent; checked before use
+using il2cpp_class_get_methods_t = MethodInfo *(*)(Il2CppClass *, void **);
+static il2cpp_class_get_methods_t il2cpp_class_get_methods_fn = nullptr;
+
 // ── /proc/self/maps scanner ───────────────────────────────────────────────────
 // Returns the runtime load bias (first mapped address) of libname, or 0.
 static uintptr_t findLibBase(const char *libname) {
@@ -183,6 +187,14 @@ bool Il2CppApi::init() {
     RESOLVE(il2cpp_object_new)
     RESOLVE(il2cpp_array_new)
 
+    // Optional — don't fail init if absent
+    il2cpp_class_get_methods_fn = reinterpret_cast<il2cpp_class_get_methods_t>(
+        resolveSymbol(base, "il2cpp_class_get_methods"));
+    if (il2cpp_class_get_methods_fn)
+        LOGI("il2cpp_class_get_methods resolved");
+    else
+        LOGI("il2cpp_class_get_methods NOT found — method scanner disabled");
+
     LOGI("Il2Cpp API resolved successfully (no dlopen)");
     return true;
 }
@@ -239,4 +251,42 @@ void Il2CppApi::getStaticValue(FieldInfo *field, void *out) {
 void Il2CppApi::setStaticValue(MethodInfo * /*unused*/, FieldInfo *field, void *val) {
     if (field && il2cpp_field_static_set_value)
         il2cpp_field_static_set_value(field, val);
+}
+
+void Il2CppApi::forEachMethod(Il2CppClass *klass,
+                               void (*cb)(const char *name, MethodInfo *info, void *ctx),
+                               void *ctx) {
+    if (!klass || !il2cpp_class_get_methods_fn || !cb) return;
+    void *iter = nullptr;
+    MethodInfo *mth = nullptr;
+    while ((mth = il2cpp_class_get_methods_fn(klass, &iter)) != nullptr) {
+        if (!mth->name) continue;
+        cb(mth->name, mth, ctx);
+    }
+}
+
+MethodInfo *Il2CppApi::scanMethods(Il2CppClass *klass, const char *filter) {
+    if (!klass || !filter) return nullptr;
+    if (!il2cpp_class_get_methods_fn) {
+        LOGE("[SCAN] il2cpp_class_get_methods not available — cannot scan");
+        return nullptr;
+    }
+    MethodInfo *found = nullptr;
+    void *iter = nullptr;
+    MethodInfo *mth = nullptr;
+    int total = 0;
+    while ((mth = il2cpp_class_get_methods_fn(klass, &iter)) != nullptr) {
+        total++;
+        if (!mth->name) continue;
+        if (strstr(mth->name, filter)) {
+            LOGI("[SCAN] MATCH '%s' params=%d ptr=%p",
+                 mth->name,
+                 mth->parameters_count,
+                 mth->methodPointer);
+            if (!found) found = mth;
+        }
+    }
+    LOGI("[SCAN] scan done: filter='%s' total_methods=%d found=%s",
+         filter, total, found ? found->name : "NONE");
+    return found;
 }
