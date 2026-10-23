@@ -7,6 +7,8 @@
 #include "memory_guard.hpp"
 #include <android/log.h>
 #include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
 
 #define TAG "ZX-ZOLA"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -25,48 +27,33 @@ static AsyncWorker g_worker;
 
 class ZxZolaModule : public zygisk::ModuleBase {
 public:
-    void onLoad(zygisk::Api *api, JNIEnv *env) override {
+    void onLoad(zygisk::Api *api, JNIEnv *) override {
         m_api = api;
-        // Store JavaVM instead of JNIEnv — JNIEnv is thread-local and becomes
-        // invalid in the child process after fork; JavaVM is process-wide and safe.
-        env->GetJavaVM(&m_jvm);
     }
 
-    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
-        if (!args->nice_name) {
-            m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        // Get a fresh JNIEnv for this thread — required after fork()
-        JNIEnv *env = nullptr;
-        if (m_jvm) {
-            if (m_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED)
-                m_jvm->AttachCurrentThread(&env, nullptr);
-        }
-        if (!env) { m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
-
-        const char *pkg = env->GetStringUTFChars(args->nice_name, nullptr);
-        if (!pkg) { m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY); return; }
-
-        bool is_ff = false;
-        for (int i = 0; kFfPkgs[i]; ++i) {
-            if (strcmp(pkg, kFfPkgs[i]) == 0) { is_ff = true; break; }
-        }
-        env->ReleaseStringUTFChars(args->nice_name, pkg);
-
-        if (!is_ff) {
-            // Unload from every non-FF process — zero overhead everywhere else
-            m_api->setOption(zygisk::DLCLOSE_MODULE_LIBRARY);
-            return;
-        }
-
-        m_target = true;
-        LOGI("Free Fire detected");
+    void preAppSpecialize(zygisk::AppSpecializeArgs *) override {
+        // Do NOT call DLCLOSE here — JNI jstring access via ZygiskNext is
+        // unreliable across fork boundaries. Package check happens in
+        // postAppSpecialize via /proc/self/cmdline which is always valid.
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        if (!m_target) return;
+        // Read the process name — reliable after specialization is complete
+        char cmdline[256] = {};
+        int fd = open("/proc/self/cmdline", O_RDONLY);
+        if (fd >= 0) {
+            read(fd, cmdline, sizeof(cmdline) - 1);
+            close(fd);
+        }
+
+        bool is_ff = false;
+        for (int i = 0; kFfPkgs[i]; ++i) {
+            if (strcmp(cmdline, kFfPkgs[i]) == 0) { is_ff = true; break; }
+        }
+
+        if (!is_ff) return;
+
+        LOGI("Free Fire detected (cmdline=%s)", cmdline);
 
         // Phase 1: Hook libc.so kill/exit/abort IMMEDIATELY on the main thread.
         // libc.so is always loaded at this point — hooks succeed before any game
@@ -99,9 +86,7 @@ public:
     }
 
 private:
-    zygisk::Api *m_api    = nullptr;
-    JavaVM      *m_jvm    = nullptr;
-    bool         m_target = false;
+    zygisk::Api *m_api = nullptr;
 };
 
 REGISTER_ZYGISK_MODULE(ZxZolaModule)
