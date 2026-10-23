@@ -19,6 +19,7 @@ struct AppSpecializeArgs {
     jint         &gid;
     jintArray    &gids;
     jint         &runtime_flags;
+    jintArray    &rlimits;        // missing in old header — shifts every field after runtime_flags
     jint         &mount_external;
     jstring      &se_info;
     jstring      &nice_name;
