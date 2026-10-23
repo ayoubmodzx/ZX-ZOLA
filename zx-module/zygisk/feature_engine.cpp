@@ -685,6 +685,21 @@ void FeatureEngine::applyRapidFire(bool enable) {
 // GetAttackableCenterWS — redirect aim center to head bone when auto-hs / silent-aim / aimbot on
 // Returns Vec3 by value (ARM64 HFA convention: s0/s1/s2)
 static Vec3 hook_get_attackable_center(void *self, void *method) {
+    // ESP side-effect: apply rendering to this enemy while we have their pointer.
+    // GetAttackableCenterWS fires for every enemy the game's aim system processes —
+    // more reliable than Player.Update which may not run for remote players.
+    if (s_esp) {
+        static bool s_esp_ac_first = true;
+        if (s_esp_ac_first) { s_esp_ac_first = false; LOGI("[ESP-DIAG] ESP via GetAttackableCenterWS: self=%p", self); }
+        if (s_orig_set_render_q) {
+            using SetRQFn = void (*)(void *, int, void *);
+            reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
+        }
+        if (s_orig_set_outline_vis) {
+            using ShowFn = void (*)(void *, uint8_t, void *);
+            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, nullptr);
+        }
+    }
     if ((s_auto_headshot || s_silent_aim || s_full_aimbot) && s_orig_get_head_bone) {
         using GetBoneFn = void *(*)(void *, void *);
         void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, nullptr);
@@ -749,7 +764,7 @@ static void installAimCenterHook(MethodInfo *mth) {
 }
 static void removeAimCenterHook(MethodInfo *mth) {
     if (!mth || !mth->methodPointer || !s_orig_attackable_ctr) return;
-    if (s_auto_headshot || s_silent_aim || s_full_aimbot) return; // another feature still needs it
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot || s_esp) return; // another feature still needs it
     HookEngine::get().unhook(mth->methodPointer);
     s_orig_attackable_ctr = nullptr;
     LOGI("[AIM] GetAttackableCenterWS unhooked");
@@ -1146,6 +1161,18 @@ void FeatureEngine::applyESP(bool enable) {
         using EnableFn = void (*)(uint8_t, void *);
         reinterpret_cast<EnableFn>(m_mth.enableOutlineMth->methodPointer)(enable ? 1 : 0, nullptr);
         LOGI("[ESP-DIAG] EnableShowPlayerOutline(%d) called", (int)enable);
+    }
+
+    // Layer 7: GetAttackableCenterWS hook — fires on each enemy the aim system processes.
+    // Guarantees SetRenderQ + SetOutlineVisible reach enemy instances even when
+    // Player.Update only runs for the local player. Shared with headshot/aimbot hooks.
+    if (m_mth.calcAimTarget) {
+        if (enable) installAimCenterHook(m_mth.calcAimTarget);
+        else        removeAimCenterHook(m_mth.calcAimTarget);
+        LOGI("[ESP-DIAG] Layer7 aim-center hook: %s trampoline=%p",
+             enable ? "ON" : "OFF", s_orig_attackable_ctr);
+    } else {
+        LOGE("[ESP-DIAG] Layer7 SKIP — calcAimTarget ptr null");
     }
 
     LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p update=%p renderQ=%p",
