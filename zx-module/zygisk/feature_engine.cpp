@@ -79,6 +79,12 @@ void FeatureEngine::resolveClasses() {
              m_mth.updateAiming       ? m_mth.updateAiming->methodPointer       : nullptr,
              m_mth.hasHeuristicTarget ? m_mth.hasHeuristicTarget->methodPointer : nullptr,
              m_mth.getHeuristicTarget ? m_mth.getHeuristicTarget->methodPointer : nullptr);
+        // Headshot gate hooks — override at the damage-hit-check level
+        m_mth.checkDamageHitHead  = Il2CppApi::getMethod(m_cls.Player, "CheckDamageHitHead",  -1);
+        m_mth.isInNoHeadShotState = Il2CppApi::getMethod(m_cls.Player, "IsInNoHeadShotState", -1);
+        LOGI("[AIM] CheckDamageHitHead=%p IsInNoHeadShotState=%p",
+             m_mth.checkDamageHitHead  ? m_mth.checkDamageHitHead->methodPointer  : nullptr,
+             m_mth.isInNoHeadShotState ? m_mth.isInNoHeadShotState->methodPointer : nullptr);
     }
 
     // SpeedHack — search multiple names across PlayerAttributes then Player
@@ -422,12 +428,14 @@ static void *s_orig_getpos    = nullptr;  // Transform.get_position
 static void *s_orig_gettrans  = nullptr;  // Component.get_transform
 static void *s_orig_update    = nullptr;  // Player.Update (teleport tick)
 // Headshot / aimbot orig pointers
-static void *s_orig_attackable_ctr  = nullptr;  // Player.GetAttackableCenterWS
-static void *s_orig_get_head_bone   = nullptr;  // Player.get_HeadBoneTransform
-static void *s_orig_set_aim_rot     = nullptr;  // Player.SetAimRotation
-static void *s_orig_update_aiming   = nullptr;  // Player.UpdateAiming
-static void *s_orig_has_heuristic   = nullptr;  // Player.HasHeuristicTarget
-static void *s_orig_get_heuristic   = nullptr;  // Player.GetHeuristicTarget
+static void *s_orig_attackable_ctr      = nullptr;  // Player.GetAttackableCenterWS
+static void *s_orig_get_head_bone       = nullptr;  // Player.get_HeadBoneTransform
+static void *s_orig_set_aim_rot         = nullptr;  // Player.SetAimRotation
+static void *s_orig_update_aiming       = nullptr;  // Player.UpdateAiming
+static void *s_orig_has_heuristic       = nullptr;  // Player.HasHeuristicTarget
+static void *s_orig_get_heuristic       = nullptr;  // Player.GetHeuristicTarget
+static void *s_orig_check_dmg_hithead   = nullptr;  // Player.CheckDamageHitHead
+static void *s_orig_no_headshot_state   = nullptr;  // Player.IsInNoHeadShotState
 // ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
 static void        *s_res_id_get_inst      = nullptr;  // ResourceIDDef.GetInstance()
 static void        *s_res_id_try_init      = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
@@ -587,6 +595,34 @@ static void hook_player_update(void *self, void *method) {
     //   1. SetRenderQ(5000) — render queue 5000 = overlay, draws above all geometry
     //      This is the through-wall mechanism (no shader swap needed).
     //   2. InitOutline + SetOutlineVisible(true) — neon line around body
+    // ResIDDef lazy-init fallback via Player.Update (fires for local player every frame,
+    // guaranteed in-match — catches cases where no enemies triggered GetAttackableCenterWS yet)
+    if (s_esp && s_res_id_cls && !s_res_id_inst) {
+        static int s_upd_retry = 0;
+        if (++s_upd_retry % 60 == 1) {  // every 60 frames (~1 sec)
+            void *inst = nullptr;
+            if (s_res_id_get_inst) {
+                using GetFn = void *(*)(void *);
+                inst = reinterpret_cast<GetFn>(s_res_id_get_inst)(nullptr);
+            }
+            if (!inst && s_res_id_cls) {
+                static const char *kF[] = {
+                    "s_Instance","m_Instance","s_instance","m_instance",
+                    "instance","Instance","_instance","<Instance>k__BackingField",nullptr};
+                for (int i = 0; kF[i]; ++i) {
+                    FieldInfo *f = Il2CppApi::getField(s_res_id_cls, kF[i]);
+                    if (f) { Il2CppApi::getStaticValue(f, &inst); if (inst) break; inst = nullptr; }
+                }
+            }
+            if (inst) {
+                s_res_id_inst = inst;
+                if (s_res_id_try_init) { using Fn = void(*)(void*,void*); reinterpret_cast<Fn>(s_res_id_try_init)(inst,nullptr); }
+                if (s_res_id_show)     { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
+                LOGI("[ESP-DIAG] ResIDDef init via Player.Update: inst=%p", inst);
+            }
+        }
+    }
+
     if (s_esp) {
         // Diagnostic: confirm hook fires for multiple player instances (enemies, not just local)
         static void  *s_esp_first_self = nullptr;
@@ -688,6 +724,23 @@ void FeatureEngine::applyRapidFire(bool enable) {
 }
 
 // ── Headshot / Aimbot hooks ────────────────────────────────────────────────────
+
+// CheckDamageHitHead — client-side gate that decides if a hit registers as headshot.
+// Force-return true when any headshot feature is active so every bullet counts.
+// Signature: bool CheckDamageHitHead(DamageInfo* info) — we pass through `info` unchanged.
+static uint8_t hook_check_dmg_hithead(void *self, void *info, void *method) {
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot) return 1;
+    using Fn = uint8_t (*)(void *, void *, void *);
+    return reinterpret_cast<Fn>(s_orig_check_dmg_hithead)(self, info, method);
+}
+
+// IsInNoHeadShotState — returns true when player is in a state where headshots are blocked
+// (e.g. special armor, skill effects). Force-return false so the block is bypassed.
+static uint8_t hook_no_headshot_state(void *self, void *method) {
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot) return 0;
+    using Fn = uint8_t (*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_no_headshot_state)(self, method);
+}
 
 // GetAttackableCenterWS — redirect aim center to head bone when auto-hs / silent-aim / aimbot on
 // Returns Vec3 by value (ARM64 HFA convention: s0/s1/s2)
@@ -861,8 +914,31 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             else        LOGI("[AIM] set_OnlyHeadshot(0) skipped — no inst (feature was never active in-match)");
         }
     }
-    LOGI("AutoHeadshot: %s  center_hook=%p head_bone=%p",
-         enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone);
+    // CheckDamageHitHead / IsInNoHeadShotState — direct damage-gate hooks
+    if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer) {
+        if (enable && !s_orig_check_dmg_hithead) {
+            HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,
+                reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
+            LOGI("[AIM] CheckDamageHitHead hooked: trampoline=%p", s_orig_check_dmg_hithead);
+        } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_check_dmg_hithead) {
+            HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
+            s_orig_check_dmg_hithead = nullptr;
+        }
+    } else { LOGE("[AIM] CheckDamageHitHead ptr null — fallback to aim-center only"); }
+
+    if (m_mth.isInNoHeadShotState && m_mth.isInNoHeadShotState->methodPointer) {
+        if (enable && !s_orig_no_headshot_state) {
+            HookEngine::get().hookAddr(m_mth.isInNoHeadShotState->methodPointer,
+                reinterpret_cast<void *>(hook_no_headshot_state), &s_orig_no_headshot_state, "IsInNoHeadShotState");
+            LOGI("[AIM] IsInNoHeadShotState hooked: trampoline=%p", s_orig_no_headshot_state);
+        } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_no_headshot_state) {
+            HookEngine::get().unhook(m_mth.isInNoHeadShotState->methodPointer);
+            s_orig_no_headshot_state = nullptr;
+        }
+    }
+
+    LOGI("AutoHeadshot: %s  center_hook=%p head_bone=%p hithead=%p",
+         enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone, s_orig_check_dmg_hithead);
 }
 
 void FeatureEngine::applySilentAim(bool enable) {
@@ -878,12 +954,35 @@ void FeatureEngine::applySilentAim(bool enable) {
         if (!s_res_id_cls)      s_res_id_cls      = m_cls.ResIdDef;
         if (!s_res_id_get_inst && m_mth.resIdGetInstance)
             s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
+        // Share the damage-gate hooks with AutoHeadshot
+        if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer
+                && !s_orig_check_dmg_hithead) {
+            HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,
+                reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
+            LOGI("[AIM] CheckDamageHitHead hooked (SilentAim): trampoline=%p", s_orig_check_dmg_hithead);
+        }
+        if (m_mth.isInNoHeadShotState && m_mth.isInNoHeadShotState->methodPointer
+                && !s_orig_no_headshot_state) {
+            HookEngine::get().hookAddr(m_mth.isInNoHeadShotState->methodPointer,
+                reinterpret_cast<void *>(hook_no_headshot_state), &s_orig_no_headshot_state, "IsInNoHeadShotState");
+        }
+    } else {
+        if (!s_auto_headshot && !s_full_aimbot) {
+            if (s_orig_check_dmg_hithead && m_mth.checkDamageHitHead) {
+                HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
+                s_orig_check_dmg_hithead = nullptr;
+            }
+            if (s_orig_no_headshot_state && m_mth.isInNoHeadShotState) {
+                HookEngine::get().unhook(m_mth.isInNoHeadShotState->methodPointer);
+                s_orig_no_headshot_state = nullptr;
+            }
+        }
     }
 
     if (enable) installAimCenterHook(m_mth.calcAimTarget);
     else        removeAimCenterHook(m_mth.calcAimTarget);
 
-    LOGI("SilentAim: %s  center_hook=%p", enable ? "ON" : "OFF", s_orig_attackable_ctr);
+    LOGI("SilentAim: %s  center_hook=%p hithead=%p", enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_check_dmg_hithead);
 }
 
 void FeatureEngine::applyFullAimbot(bool enable) {

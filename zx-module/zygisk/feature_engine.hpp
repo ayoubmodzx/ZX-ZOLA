@@ -161,6 +161,9 @@ private:
         MethodInfo *getHeuristicTarget   = nullptr; // Player.GetHeuristicTarget() → Player*
         // ResourceIDDef — headshot-only mode gate
         MethodInfo *setOnlyHeadshot      = nullptr; // ResourceIDDef.set_OnlyHeadshot(bool)
+        // Headshot damage gate — direct hooks (more reliable than set_OnlyHeadshot)
+        MethodInfo *checkDamageHitHead   = nullptr; // Player.CheckDamageHitHead(DamageInfo) → bool
+        MethodInfo *isInNoHeadShotState  = nullptr; // Player.IsInNoHeadShotState() → bool
     } m_mth;
 
     void resolveClasses();
