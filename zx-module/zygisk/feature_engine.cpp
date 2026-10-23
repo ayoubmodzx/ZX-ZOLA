@@ -504,12 +504,12 @@ static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
     reinterpret_cast<Fn>(s_orig_hud_show)(self, forced, method);
 }
 
-// ESP: SetOutlineVisible(bool) — keep neon outline on for every player when ESP active
-// ARM64 IL2CPP: x0=this, w1=visible(bool), x2=MethodInfo*
+// ESP: SetOutlineVisible — keep neon outline on for every player when ESP active.
+// The game passes 16 (0x10) for full enemy outline mode, not a plain bool.
+// Rule: if ESP is ON and game tries to HIDE (visible==0), force to 16 instead.
+//       If game passes any non-zero mode, let it through unchanged.
 static void hook_set_outline_vis(void *self, uint8_t visible, void *method) {
-    uint8_t forced = s_esp ? 1 : visible;
-    LOGI("[ESP-DIAG] SetOutlineVisible called: player=%p orig_visible=%d forced=%d esp_on=%d",
-         self, (int)visible, (int)forced, (int)s_esp);
+    uint8_t forced = (s_esp && visible == 0) ? 16 : visible;
     using Fn = void (*)(void *, uint8_t, void *);
     reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, method);
 }
@@ -522,9 +522,9 @@ static void hook_init_outline(void *self, void *method) {
     using Fn = void (*)(void *, void *);
     reinterpret_cast<Fn>(s_orig_init_outline)(self, method);
     if (s_esp && s_orig_set_outline_vis) {
-        LOGI("[ESP-DIAG] InitOutline: injecting SetOutlineVisible(true) on player=%p", self);
+        LOGI("[ESP-DIAG] InitOutline: injecting SetOutlineVisible(16) on player=%p", self);
         using ShowFn = void (*)(void *, uint8_t, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, nullptr);
     } else {
         LOGI("[ESP-DIAG] InitOutline: skipped inject — esp=%d trampoline=%p",
              (int)s_esp, s_orig_set_outline_vis);
@@ -595,7 +595,7 @@ static void hook_player_update(void *self, void *method) {
             }
             if (s_orig_set_outline_vis) {
                 using ShowFn = void (*)(void *, uint8_t, void *);
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, nullptr);
             }
         }
     } else if (!s_esp && s_orig_revert_render_q) {
