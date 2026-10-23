@@ -594,7 +594,7 @@ static void hook_player_update(void *self, void *method) {
             }
             if (s_orig_set_outline_vis) {
                 using ShowFn = void (*)(void *, uint8_t, void *);
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, nullptr);
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
             }
         }
     } else if (!s_esp && s_orig_revert_render_q) {
@@ -726,7 +726,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         }
         if (s_orig_set_outline_vis) {
             using ShowFn = void (*)(void *, uint8_t, void *);
-            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, nullptr);
+            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
         }
     }
     if ((s_auto_headshot || s_silent_aim || s_full_aimbot) && s_orig_get_head_bone) {
@@ -735,7 +735,13 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         if (headT && s_orig_getpos) {
             using GetPosFn = Vec3 (*)(void *, void *);
             Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
-            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) return hp;
+            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
+                // Head bone is at the top of the head mesh.
+                // Head hitbox center is ~0.12m lower — offset so bullet hits
+                // the hitbox reliably even against standing (no lag-compensation) targets.
+                hp.y -= 0.12f;
+                return hp;
+            }
         }
     }
     using Fn = Vec3 (*)(void *, void *);
@@ -1136,38 +1142,27 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("ESP: HUD method not resolved — enemies visible in culling only, no boxes");
     }
 
-    // Layer 3: SetOutlineVisible — force neon outline on every player instance
-    LOGI("[ESP-DIAG] Layer3 setup: method=%p already_hooked=%d",
-         m_mth.setOutlineVisible ? m_mth.setOutlineVisible->methodPointer : nullptr,
-         s_orig_set_outline_vis != nullptr);
+    // Layer 3: SetOutlineVisible — store pointer for direct calls in per-frame hooks.
+    // We do NOT hook the function (interception caused crashes via mode enum mismatch).
+    // Instead we call it directly with value=1 from GetAttackableCenterWS / Player.Update.
     if (m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
-        if (enable && !s_orig_set_outline_vis) {
-            HookEngine::get().hookAddr(m_mth.setOutlineVisible->methodPointer,
-                reinterpret_cast<void *>(hook_set_outline_vis), &s_orig_set_outline_vis, "ESP-outline");
-            LOGI("[ESP-DIAG] Layer3 hooked: trampoline=%p", s_orig_set_outline_vis);
-        } else if (!enable && s_orig_set_outline_vis) {
-            HookEngine::get().unhook(m_mth.setOutlineVisible->methodPointer);
+        if (enable)
+            s_orig_set_outline_vis = m_mth.setOutlineVisible->methodPointer;
+        else
             s_orig_set_outline_vis = nullptr;
-            LOGI("[ESP-DIAG] Layer3 unhooked");
-        }
+        LOGI("[ESP-DIAG] Layer3 ptr=%p (direct-call mode, no hook)", s_orig_set_outline_vis);
     } else {
         LOGE("[ESP-DIAG] Layer3 SKIP — SetOutlineVisible ptr null");
     }
 
-    // Layer 4: InitOutline — inject SetOutlineVisible(true) after each player's outline init
-    LOGI("[ESP-DIAG] Layer4 setup: method=%p already_hooked=%d",
-         m_mth.initOutline ? m_mth.initOutline->methodPointer : nullptr,
-         s_orig_init_outline != nullptr);
+    // Layer 4: InitOutline — store pointer for direct calls in per-frame hooks.
+    // Not hooked for the same reason as Layer3 — direct call after SetRenderQ is safer.
     if (m_mth.initOutline && m_mth.initOutline->methodPointer) {
-        if (enable && !s_orig_init_outline) {
-            HookEngine::get().hookAddr(m_mth.initOutline->methodPointer,
-                reinterpret_cast<void *>(hook_init_outline), &s_orig_init_outline, "ESP-initoutline");
-            LOGI("[ESP-DIAG] Layer4 hooked: trampoline=%p", s_orig_init_outline);
-        } else if (!enable && s_orig_init_outline) {
-            HookEngine::get().unhook(m_mth.initOutline->methodPointer);
+        if (enable)
+            s_orig_init_outline = m_mth.initOutline->methodPointer;
+        else
             s_orig_init_outline = nullptr;
-            LOGI("[ESP-DIAG] Layer4 unhooked");
-        }
+        LOGI("[ESP-DIAG] Layer4 ptr=%p (direct-call mode, no hook)", s_orig_init_outline);
     } else {
         LOGE("[ESP-DIAG] Layer4 SKIP — InitOutline ptr null");
     }
