@@ -926,17 +926,6 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         }
     } else { LOGE("[AIM] CheckDamageHitHead ptr null — fallback to aim-center only"); }
 
-    if (m_mth.isInNoHeadShotState && m_mth.isInNoHeadShotState->methodPointer) {
-        if (enable && !s_orig_no_headshot_state) {
-            HookEngine::get().hookAddr(m_mth.isInNoHeadShotState->methodPointer,
-                reinterpret_cast<void *>(hook_no_headshot_state), &s_orig_no_headshot_state, "IsInNoHeadShotState");
-            LOGI("[AIM] IsInNoHeadShotState hooked: trampoline=%p", s_orig_no_headshot_state);
-        } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_no_headshot_state) {
-            HookEngine::get().unhook(m_mth.isInNoHeadShotState->methodPointer);
-            s_orig_no_headshot_state = nullptr;
-        }
-    }
-
     LOGI("AutoHeadshot: %s  center_hook=%p head_bone=%p hithead=%p",
          enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone, s_orig_check_dmg_hithead);
 }
@@ -961,20 +950,11 @@ void FeatureEngine::applySilentAim(bool enable) {
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
             LOGI("[AIM] CheckDamageHitHead hooked (SilentAim): trampoline=%p", s_orig_check_dmg_hithead);
         }
-        if (m_mth.isInNoHeadShotState && m_mth.isInNoHeadShotState->methodPointer
-                && !s_orig_no_headshot_state) {
-            HookEngine::get().hookAddr(m_mth.isInNoHeadShotState->methodPointer,
-                reinterpret_cast<void *>(hook_no_headshot_state), &s_orig_no_headshot_state, "IsInNoHeadShotState");
-        }
     } else {
         if (!s_auto_headshot && !s_full_aimbot) {
             if (s_orig_check_dmg_hithead && m_mth.checkDamageHitHead) {
                 HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
                 s_orig_check_dmg_hithead = nullptr;
-            }
-            if (s_orig_no_headshot_state && m_mth.isInNoHeadShotState) {
-                HookEngine::get().unhook(m_mth.isInNoHeadShotState->methodPointer);
-                s_orig_no_headshot_state = nullptr;
             }
         }
     }
