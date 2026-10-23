@@ -128,8 +128,12 @@ void FeatureEngine::resolveClasses() {
         m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible",  1);
         m_mth.initOutline       = Il2CppApi::getMethod(m_cls.Player, "InitOutline",        0);
     }
-    if (!m_mth.setOutlineVisible) LOGE("ESP: SetOutlineVisible not found on Player");
-    if (!m_mth.initOutline)       LOGE("ESP: InitOutline not found on Player");
+    LOGI("[ESP-DIAG] resolve: isVisible=%p setOutlineVisible=%p initOutline=%p",
+         m_mth.isVisible       ? m_mth.isVisible->methodPointer       : nullptr,
+         m_mth.setOutlineVisible ? m_mth.setOutlineVisible->methodPointer : nullptr,
+         m_mth.initOutline       ? m_mth.initOutline->methodPointer       : nullptr);
+    if (!m_mth.setOutlineVisible) LOGE("[ESP-DIAG] SetOutlineVisible NOT found on Player — outline layer disabled");
+    if (!m_mth.initOutline)       LOGE("[ESP-DIAG] InitOutline NOT found on Player — spawn inject disabled");
 
     // Search for the HUD class that renders enemy name/health plates
     static const char *kHudClasses[] = {
@@ -341,25 +345,36 @@ static uint8_t hook_is_visible(void *self, void *method) {
 // ESP: HUD SetVisible(bool) — force true so enemy plates always render
 // ARM64: x0=this, w1=visible(bool), x2=MethodInfo*
 static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
+    uint8_t forced = s_esp_hud ? 1 : visible;
+    LOGI("[ESP-DIAG] HUD SetVisible: hud=%p orig=%d forced=%d", self, (int)visible, (int)forced);
     using Fn = void (*)(void *, uint8_t, void *);
-    reinterpret_cast<Fn>(s_orig_hud_show)(self, s_esp_hud ? 1 : visible, method);
+    reinterpret_cast<Fn>(s_orig_hud_show)(self, forced, method);
 }
 
 // ESP: SetOutlineVisible(bool) — keep neon outline on for every player when ESP active
 // ARM64 IL2CPP: x0=this, w1=visible(bool), x2=MethodInfo*
 static void hook_set_outline_vis(void *self, uint8_t visible, void *method) {
+    uint8_t forced = s_esp ? 1 : visible;
+    LOGI("[ESP-DIAG] SetOutlineVisible called: player=%p orig_visible=%d forced=%d esp_on=%d",
+         self, (int)visible, (int)forced, (int)s_esp);
     using Fn = void (*)(void *, uint8_t, void *);
-    reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, s_esp ? 1 : visible, method);
+    reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, method);
 }
 
 // ESP: InitOutline() — inject SetOutlineVisible(true) right after each player's outline init
 // Handles enemies spawning after ESP is toggled (game never calls SetOutlineVisible on them)
 static void hook_init_outline(void *self, void *method) {
+    LOGI("[ESP-DIAG] InitOutline called: player=%p esp_on=%d outline_trampoline=%p",
+         self, (int)s_esp, s_orig_set_outline_vis);
     using Fn = void (*)(void *, void *);
     reinterpret_cast<Fn>(s_orig_init_outline)(self, method);
     if (s_esp && s_orig_set_outline_vis) {
+        LOGI("[ESP-DIAG] InitOutline: injecting SetOutlineVisible(true) on player=%p", self);
         using ShowFn = void (*)(void *, uint8_t, void *);
         reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
+    } else {
+        LOGI("[ESP-DIAG] InitOutline: skipped inject — esp=%d trampoline=%p",
+             (int)s_esp, s_orig_set_outline_vis);
     }
 }
 
@@ -651,32 +666,43 @@ void FeatureEngine::applyESP(bool enable) {
     }
 
     // Layer 3: SetOutlineVisible — force neon outline on every player instance
+    LOGI("[ESP-DIAG] Layer3 setup: method=%p already_hooked=%d",
+         m_mth.setOutlineVisible ? m_mth.setOutlineVisible->methodPointer : nullptr,
+         s_orig_set_outline_vis != nullptr);
     if (m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
-        if (enable && !s_orig_set_outline_vis)
+        if (enable && !s_orig_set_outline_vis) {
             HookEngine::get().hookAddr(m_mth.setOutlineVisible->methodPointer,
                 reinterpret_cast<void *>(hook_set_outline_vis), &s_orig_set_outline_vis, "ESP-outline");
-        else if (!enable && s_orig_set_outline_vis) {
+            LOGI("[ESP-DIAG] Layer3 hooked: trampoline=%p", s_orig_set_outline_vis);
+        } else if (!enable && s_orig_set_outline_vis) {
             HookEngine::get().unhook(m_mth.setOutlineVisible->methodPointer);
             s_orig_set_outline_vis = nullptr;
+            LOGI("[ESP-DIAG] Layer3 unhooked");
         }
     } else {
-        LOGE("ESP: SetOutlineVisible not resolved — no neon outline layer");
+        LOGE("[ESP-DIAG] Layer3 SKIP — SetOutlineVisible ptr null");
     }
 
     // Layer 4: InitOutline — inject SetOutlineVisible(true) after each player's outline init
-    // Covers enemies that spawn after ESP is toggled on
+    LOGI("[ESP-DIAG] Layer4 setup: method=%p already_hooked=%d",
+         m_mth.initOutline ? m_mth.initOutline->methodPointer : nullptr,
+         s_orig_init_outline != nullptr);
     if (m_mth.initOutline && m_mth.initOutline->methodPointer) {
-        if (enable && !s_orig_init_outline)
+        if (enable && !s_orig_init_outline) {
             HookEngine::get().hookAddr(m_mth.initOutline->methodPointer,
                 reinterpret_cast<void *>(hook_init_outline), &s_orig_init_outline, "ESP-initoutline");
-        else if (!enable && s_orig_init_outline) {
+            LOGI("[ESP-DIAG] Layer4 hooked: trampoline=%p", s_orig_init_outline);
+        } else if (!enable && s_orig_init_outline) {
             HookEngine::get().unhook(m_mth.initOutline->methodPointer);
             s_orig_init_outline = nullptr;
+            LOGI("[ESP-DIAG] Layer4 unhooked");
         }
+    } else {
+        LOGE("[ESP-DIAG] Layer4 SKIP — InitOutline ptr null");
     }
 
-    LOGI("ESP: %s (vis=%p hud=%p outline=%p initoutline=%p)", enable ? "ON" : "OFF",
-         s_orig_visible, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline);
+    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p",
+         (int)enable, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {
