@@ -27,38 +27,30 @@ static AsyncWorker g_worker;
 
 class ZxZolaModule : public zygisk::ModuleBase {
 public:
-    void onLoad(zygisk::Api *api, JNIEnv *) override {
+    void onLoad(zygisk::Api *api, JNIEnv *env) override {
         m_api = api;
+        m_env = env;
     }
 
-    void preAppSpecialize(zygisk::AppSpecializeArgs *) override {
-        // Do NOT call DLCLOSE here — JNI jstring access via ZygiskNext is
-        // unreliable across fork boundaries. Package check happens in
-        // postAppSpecialize via /proc/self/cmdline which is always valid.
+    void preAppSpecialize(zygisk::AppSpecializeArgs *args) override {
+        // Read nice_name here — JNI is valid in Zygote before fork.
+        // postAppSpecialize runs in the child where /proc/self/cmdline is
+        // still "zygote64" until ActivityThread sets it much later.
+        m_is_ff = false;
+        if (!m_env || !args->nice_name) return;
+        const char *name = m_env->GetStringUTFChars(args->nice_name, nullptr);
+        if (!name) return;
+        for (int i = 0; kFfPkgs[i]; ++i) {
+            if (strcmp(name, kFfPkgs[i]) == 0) { m_is_ff = true; break; }
+        }
+        if (m_is_ff) LOGI("preAppSpecialize: FF detected [%s]", name);
+        m_env->ReleaseStringUTFChars(args->nice_name, name);
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
-        // Read the process name — reliable after specialization is complete
-        char cmdline[256] = {};
-        int fd = open("/proc/self/cmdline", O_RDONLY);
-        if (fd >= 0) {
-            read(fd, cmdline, sizeof(cmdline) - 1);
-            close(fd);
-        }
+        if (!m_is_ff) return;
 
-        LOGI("postAppSpecialize: cmdline=[%s]", cmdline);
-
-        bool is_ff = false;
-        for (int i = 0; kFfPkgs[i]; ++i) {
-            if (strcmp(cmdline, kFfPkgs[i]) == 0) { is_ff = true; break; }
-        }
-
-        if (!is_ff) {
-            LOGI("Not a FF process, skipping");
-            return;
-        }
-
-        LOGI("Free Fire detected (cmdline=%s)", cmdline);
+        LOGI("Free Fire — postAppSpecialize, installing hooks");
 
         // Phase 1: Hook libc.so kill/exit/abort IMMEDIATELY on the main thread.
         // libc.so is always loaded at this point — hooks succeed before any game
@@ -102,6 +94,8 @@ public:
 
 private:
     zygisk::Api *m_api = nullptr;
+    JNIEnv      *m_env = nullptr;
+    bool         m_is_ff = false;
 };
 
 REGISTER_ZYGISK_MODULE(ZxZolaModule)
