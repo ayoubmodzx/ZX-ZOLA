@@ -283,79 +283,34 @@ void FeatureEngine::resolveClasses() {
              m_mth.revertRenderQ ? m_mth.revertRenderQ->methodPointer : nullptr);
     }
 
-    // COW::ResourceIDDef — global outline manager (singleton with GetInstance)
-    // Discovered: TryInitPlayerOutlineRes + ShowPlayerOutline are on this class
+    // COW::MatchGame — confirmed via global-metadata.dat strings analysis:
+    //   TryInitPlayerOutlineRes and ShowPlayerOutline are on COW.MatchGame, NOT ResourceIDDef.
+    //   MatchGame.GetMatch() is the static singleton accessor (COW-MatchGame-GetMatch0 in metadata).
     {
-        Il2CppClass *resIdCls = Il2CppApi::getClass(img, "COW", "ResourceIDDef");
-        m_cls.ResIdDef = resIdCls;
-        if (resIdCls) {
-            m_mth.resIdGetInstance  = Il2CppApi::getMethod(resIdCls, "GetInstance",             -1);
-            if (!m_mth.resIdGetInstance || !m_mth.resIdGetInstance->methodPointer)
-                m_mth.resIdGetInstance = Il2CppApi::getMethod(resIdCls, "get_Instance",         -1);
-            m_mth.tryInitOutlineRes = Il2CppApi::getMethod(resIdCls, "TryInitPlayerOutlineRes",-1);
-            m_mth.showPlayerOutline = Il2CppApi::getMethod(resIdCls, "ShowPlayerOutline",      -1);
-            m_mth.setOnlyHeadshot   = Il2CppApi::getMethod(resIdCls, "set_OnlyHeadshot",       1);
-            LOGI("[AIM] ResourceIDDef.set_OnlyHeadshot=%p",
-                 m_mth.setOnlyHeadshot ? m_mth.setOnlyHeadshot->methodPointer : nullptr);
-            LOGI("[ESP] ResourceIDDef: getInstance=%p tryInit=%p showOutline=%p",
+        Il2CppClass *matchGameCls = Il2CppApi::getClass(img, "COW", "MatchGame");
+        m_cls.ResIdDef = matchGameCls;  // reuse slot — ResIdDef had no outline methods
+        if (matchGameCls) {
+            // GetMatch() is the static self-accessor — returns the live MatchGame singleton
+            m_mth.resIdGetInstance  = Il2CppApi::getMethod(matchGameCls, "GetMatch",               -1);
+            m_mth.tryInitOutlineRes = Il2CppApi::getMethod(matchGameCls, "TryInitPlayerOutlineRes", -1);
+            m_mth.showPlayerOutline = Il2CppApi::getMethod(matchGameCls, "ShowPlayerOutline",       -1);
+            LOGI("[ESP] MatchGame: GetMatch=%p TryInitOutlineRes=%p ShowPlayerOutline=%p",
                  m_mth.resIdGetInstance  ? m_mth.resIdGetInstance->methodPointer  : nullptr,
                  m_mth.tryInitOutlineRes ? m_mth.tryInitOutlineRes->methodPointer : nullptr,
                  m_mth.showPlayerOutline ? m_mth.showPlayerOutline->methodPointer : nullptr);
-        } else LOGE("[ESP] ResourceIDDef class not found");
+        } else LOGE("[ESP] MatchGame class not found — namespace may differ");
 
-        // GameSettingData.EnableShowPlayerOutline(bool) — server-side gate
+        // GameSettingData.EnableShowPlayerOutline(bool) — permission gate on COW.GameSettingData
         Il2CppClass *gsCls = Il2CppApi::getClass(img, "COW", "GameSettingData");
         if (gsCls)
             m_mth.enableOutlineMth = Il2CppApi::getMethod(gsCls, "EnableShowPlayerOutline", -1);
         LOGI("[ESP] GameSettingData.EnableShowPlayerOutline=%p",
              m_mth.enableOutlineMth ? m_mth.enableOutlineMth->methodPointer : nullptr);
-    }
 
-    // ESP global switches — COW::MatchGame.ShowPlayerOutline enables the outline system
-    // for all players globally (used in kill cam / spectator mode in Free Fire).
-    // COW::GameSettingData.EnableShowPlayerOutline is the static bool gate.
-    {
-        Il2CppClass *matchGame = Il2CppApi::getClass(img, "COW", "MatchGame");
-        if (matchGame) {
-            static const char *kShowOutline[] = {
-                "ShowPlayerOutline","SetPlayerOutlineVisible","EnablePlayerOutline",
-                "SetOutlineForAllPlayers","ShowOutline", nullptr
-            };
-            for (int i = 0; kShowOutline[i]; ++i) {
-                MethodInfo *m = Il2CppApi::getMethod(matchGame, kShowOutline[i], -1);
-                if (m && m->methodPointer) {
-                    s_match_show_outline_fn = m->methodPointer;
-                    LOGI("[ESP] MatchGame.%s found", kShowOutline[i]);
-                    break;
-                }
-            }
-        } else LOGE("[ESP] MatchGame class not found");
-
-        static const char *kSettingsNS[] = { "COW", "COW.GamePlay", "COW.Data", nullptr };
-        static const char *kSettingsCls[] = {
-            "GameSettingData","GameSettings","GameSetting",
-            "PlayerSettings","GameConfig", nullptr
-        };
-        for (int ns = 0; !s_enable_outline_field && kSettingsNS[ns]; ++ns)
-            for (int c = 0; kSettingsCls[c]; ++c) {
-                Il2CppClass *sc = Il2CppApi::getClass(img, kSettingsNS[ns], kSettingsCls[c]);
-                if (!sc) continue;
-                static const char *kFieldNames[] = {
-                    "EnableShowPlayerOutline","ShowPlayerOutline",
-                    "enableOutline","m_enableOutline","outlineEnabled", nullptr
-                };
-                for (int f = 0; kFieldNames[f]; ++f) {
-                    FieldInfo *fi = Il2CppApi::getField(sc, kFieldNames[f]);
-                    if (fi) {
-                        s_enable_outline_field = fi;
-                        LOGI("[ESP] %s::%s.%s field found",
-                             kSettingsNS[ns], kSettingsCls[c], kFieldNames[f]);
-                        break;
-                    }
-                }
-                if (s_enable_outline_field) break;
-            }
-        if (!s_enable_outline_field) LOGE("[ESP] EnableShowPlayerOutline field not found");
+        // Store MatchGame.ShowPlayerOutline in the legacy s_match_show_outline_fn
+        // (used directly in applyESP before in-match lazy-init fires)
+        if (m_mth.showPlayerOutline && m_mth.showPlayerOutline->methodPointer)
+            s_match_show_outline_fn = m_mth.showPlayerOutline->methodPointer;
     }
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
@@ -595,30 +550,20 @@ static void hook_player_update(void *self, void *method) {
     //   1. SetRenderQ(5000) — render queue 5000 = overlay, draws above all geometry
     //      This is the through-wall mechanism (no shader swap needed).
     //   2. InitOutline + SetOutlineVisible(true) — neon line around body
-    // ResIDDef lazy-init fallback via Player.Update (fires for local player every frame,
-    // guaranteed in-match — catches cases where no enemies triggered GetAttackableCenterWS yet)
-    if (s_esp && s_res_id_cls && !s_res_id_inst) {
+    // MatchGame lazy-init fallback via Player.Update — fires every 60 frames (~1 sec).
+    // Catches the case where ESP was enabled but no enemy triggered GetAttackableCenterWS yet.
+    // MatchGame.GetMatch() is static, returns live singleton only when a match is active.
+    if (s_esp && s_res_id_get_inst && !s_res_id_inst) {
         static int s_upd_retry = 0;
-        if (++s_upd_retry % 60 == 1) {  // every 60 frames (~1 sec)
+        if (++s_upd_retry % 60 == 1) {
             void *inst = nullptr;
-            if (s_res_id_get_inst) {
-                using GetFn = void *(*)(void *);
-                inst = reinterpret_cast<GetFn>(s_res_id_get_inst)(nullptr);
-            }
-            if (!inst && s_res_id_cls) {
-                static const char *kF[] = {
-                    "s_Instance","m_Instance","s_instance","m_instance",
-                    "instance","Instance","_instance","<Instance>k__BackingField",nullptr};
-                for (int i = 0; kF[i]; ++i) {
-                    FieldInfo *f = Il2CppApi::getField(s_res_id_cls, kF[i]);
-                    if (f) { Il2CppApi::getStaticValue(f, &inst); if (inst) break; inst = nullptr; }
-                }
-            }
+            using GetFn = void *(*)(void *);
+            inst = reinterpret_cast<GetFn>(s_res_id_get_inst)(nullptr);
             if (inst) {
                 s_res_id_inst = inst;
                 if (s_res_id_try_init) { using Fn = void(*)(void*,void*); reinterpret_cast<Fn>(s_res_id_try_init)(inst,nullptr); }
                 if (s_res_id_show)     { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
-                LOGI("[ESP-DIAG] ResIDDef init via Player.Update: inst=%p", inst);
+                LOGI("[ESP-DIAG] MatchGame init via Player.Update: inst=%p", inst);
             }
         }
     }
@@ -745,40 +690,25 @@ static uint8_t hook_no_headshot_state(void *self, void *method) {
 // GetAttackableCenterWS — redirect aim center to head bone when auto-hs / silent-aim / aimbot on
 // Returns Vec3 by value (ARM64 HFA convention: s0/s1/s2)
 static Vec3 hook_get_attackable_center(void *self, void *method) {
-    // Lazy-init ResourceIDDef singleton — only exists inside a match, not at lobby time.
-    // Shared by both ESP outline pipeline and set_OnlyHeadshot gate.
+    // Lazy-init MatchGame singleton for ESP outline.
+    // MatchGame.GetMatch() is the static accessor (confirmed via global-metadata.dat).
+    // Fires when enemy is visible to aim system — guaranteed in-match with enemies nearby.
     {
-        static bool s_res_init_done = false;
-        static int  s_res_retry     = 0;
-        const bool  need_init = (s_esp || s_auto_headshot || s_silent_aim || s_full_aimbot);
-        if (need_init && !s_res_init_done && (++s_res_retry % 30 == 1)) {
+        static bool s_mg_init_done = false;
+        static int  s_mg_retry     = 0;
+        if (s_esp && !s_mg_init_done && (++s_mg_retry % 30 == 1)) {
             void *inst = nullptr;
             if (s_res_id_get_inst) {
+                // MatchGame.GetMatch() — static, takes no meaningful args
                 using GetFn = void *(*)(void *);
                 inst = reinterpret_cast<GetFn>(s_res_id_get_inst)(nullptr);
             }
-            if (!inst && s_res_id_cls) {
-                static const char *kF[] = {
-                    "s_Instance","m_Instance","s_instance","m_instance",
-                    "instance","Instance","_instance","<Instance>k__BackingField",nullptr};
-                for (int i = 0; kF[i]; ++i) {
-                    FieldInfo *f = Il2CppApi::getField(s_res_id_cls, kF[i]);
-                    if (f) { Il2CppApi::getStaticValue(f, &inst); if (inst) break; inst = nullptr; }
-                }
-            }
             if (inst) {
-                s_res_init_done = true;
-                s_res_id_inst   = inst;
-                // ESP outline pipeline
+                s_mg_init_done = true;
+                s_res_id_inst  = inst;
                 if (s_res_id_try_init) { using Fn = void(*)(void*,void*); reinterpret_cast<Fn>(s_res_id_try_init)(inst,nullptr); }
-                if (s_res_id_show && s_esp) { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
-                // Headshot engine-gate — set_OnlyHeadshot(true) so ALL hits use headshot multiplier
-                if (s_res_id_only_headshot && (s_auto_headshot || s_silent_aim || s_full_aimbot)) {
-                    using SetFn = void(*)(void*,uint8_t,void*);
-                    reinterpret_cast<SetFn>(s_res_id_only_headshot)(inst, 1, nullptr);
-                    LOGI("[AIM] lazy set_OnlyHeadshot(1) on ResIDDef inst=%p", inst);
-                }
-                LOGI("[ESP-DIAG] ResIDDef in-game init OK: inst=%p", inst);
+                if (s_res_id_show)     { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
+                LOGI("[ESP-DIAG] MatchGame in-game init OK via GetAttackable: inst=%p", inst);
             }
         }
     }
