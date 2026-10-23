@@ -264,8 +264,12 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun isZygiskModuleLoaded(): Boolean = withContext(Dispatchers.IO) {
         try {
+            // Check if the abstract socket \0zx_zola is bound — this confirms the Zygisk module
+            // completed Il2Cpp init and the socket server is actually listening. Checking the
+            // Magisk "unloaded" file marker only tells us the module was installed, not that
+            // it booted successfully, so /proc/net/unix gives ground truth.
             val proc = Runtime.getRuntime().exec(arrayOf("su", "-c",
-                "test ! -f $UNLOADED_MARKER && echo 1 || echo 0"))
+                "grep -qF 'zx_zola' /proc/net/unix && echo 1 || echo 0"))
             val out = proc.inputStream.bufferedReader().readText().trim()
             proc.waitFor()
             out == "1"
@@ -282,13 +286,13 @@ class MainActivity : AppCompatActivity() {
             dot.setBackgroundColor(getColor(R.color.zx_purple))
             tv.text = "MODULE ACTIVE"
             tv.setTextColor(getColor(R.color.zx_purple))
-            tvSub.text = "Zygisk OK"
+            tvSub.text = "Socket live"
         } else {
             card.setBackgroundResource(R.drawable.bg_status_error)
             dot.setBackgroundColor(0xFFC0392B.toInt())
-            tv.text = "MODULE NOT FOUND"
+            tv.text = "MODULE NOT READY"
             tv.setTextColor(0xFFC0392B.toInt())
-            tvSub.text = "Zygisk?"
+            tvSub.text = "Waiting for socket…"
         }
     }
 
