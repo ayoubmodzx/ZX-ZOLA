@@ -124,16 +124,26 @@ void FeatureEngine::resolveClasses() {
     // IsVisible gate is also hooked for culling, but the real visual effect
     // requires forcing the enemy health bar / name plate to always render.
     if (m_cls.Player) {
-        m_mth.isVisible         = Il2CppApi::getMethod(m_cls.Player, "IsVisible",         0);
-        m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible",  1);
-        m_mth.initOutline       = Il2CppApi::getMethod(m_cls.Player, "InitOutline",        0);
+        m_mth.isVisible         = Il2CppApi::getMethod(m_cls.Player, "IsVisible", 0);
+        // Try -1 first (any param count), then specific counts
+        m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible", -1);
+        if (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer)
+            m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible", 1);
+        if (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer)
+            m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible", 2);
+        m_mth.initOutline       = Il2CppApi::getMethod(m_cls.Player, "InitOutline", -1);
+        if (!m_mth.initOutline || !m_mth.initOutline->methodPointer)
+            m_mth.initOutline   = Il2CppApi::getMethod(m_cls.Player, "InitOutline", 0);
     }
-    LOGI("[ESP-DIAG] resolve: isVisible=%p setOutlineVisible=%p initOutline=%p",
-         m_mth.isVisible       ? m_mth.isVisible->methodPointer       : nullptr,
+    LOGI("[ESP-DIAG] resolve: Player=%p isVisible=%p setOutlineVisible=%p initOutline=%p",
+         (void*)m_cls.Player,
+         m_mth.isVisible         ? m_mth.isVisible->methodPointer         : nullptr,
          m_mth.setOutlineVisible ? m_mth.setOutlineVisible->methodPointer : nullptr,
          m_mth.initOutline       ? m_mth.initOutline->methodPointer       : nullptr);
-    if (!m_mth.setOutlineVisible) LOGE("[ESP-DIAG] SetOutlineVisible NOT found on Player — outline layer disabled");
-    if (!m_mth.initOutline)       LOGE("[ESP-DIAG] InitOutline NOT found on Player — spawn inject disabled");
+    if (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer)
+        LOGE("[ESP-DIAG] SetOutlineVisible NOT found on Player (tried -1,1,2 params)");
+    if (!m_mth.initOutline || !m_mth.initOutline->methodPointer)
+        LOGE("[ESP-DIAG] InitOutline NOT found on Player (tried -1,0 params)");
 
     // Search for the HUD class that renders enemy name/health plates
     static const char *kHudClasses[] = {
