@@ -123,8 +123,13 @@ void FeatureEngine::resolveClasses() {
     // ESP — hook the HUD/UI draw methods that render enemy indicators
     // IsVisible gate is also hooked for culling, but the real visual effect
     // requires forcing the enemy health bar / name plate to always render.
-    if (m_cls.Player)
-        m_mth.isVisible = Il2CppApi::getMethod(m_cls.Player, "IsVisible", 0);
+    if (m_cls.Player) {
+        m_mth.isVisible         = Il2CppApi::getMethod(m_cls.Player, "IsVisible",         0);
+        m_mth.setOutlineVisible = Il2CppApi::getMethod(m_cls.Player, "SetOutlineVisible",  1);
+        m_mth.initOutline       = Il2CppApi::getMethod(m_cls.Player, "InitOutline",        0);
+    }
+    if (!m_mth.setOutlineVisible) LOGE("ESP: SetOutlineVisible not found on Player");
+    if (!m_mth.initOutline)       LOGE("ESP: InitOutline not found on Player");
 
     // Search for the HUD class that renders enemy name/health plates
     static const char *kHudClasses[] = {
@@ -251,9 +256,11 @@ static void *s_orig_fov      = nullptr;
 static void *s_orig_jump     = nullptr;
 static void *s_orig_vehicle  = nullptr;
 // ── New orig pointers ─────────────────────────────────────────────────────────
-static void *s_orig_visible   = nullptr;
-static void *s_orig_hud_show  = nullptr;
-static bool  s_esp_hud        = false;
+static void *s_orig_visible          = nullptr;
+static void *s_orig_hud_show         = nullptr;
+static bool  s_esp_hud               = false;
+static void *s_orig_set_outline_vis  = nullptr;
+static void *s_orig_init_outline     = nullptr;
 static void *s_orig_ammo      = nullptr;
 static void *s_orig_reload    = nullptr;
 static void *s_orig_wallhit   = nullptr;
@@ -336,6 +343,24 @@ static uint8_t hook_is_visible(void *self, void *method) {
 static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
     using Fn = void (*)(void *, uint8_t, void *);
     reinterpret_cast<Fn>(s_orig_hud_show)(self, s_esp_hud ? 1 : visible, method);
+}
+
+// ESP: SetOutlineVisible(bool) — keep neon outline on for every player when ESP active
+// ARM64 IL2CPP: x0=this, w1=visible(bool), x2=MethodInfo*
+static void hook_set_outline_vis(void *self, uint8_t visible, void *method) {
+    using Fn = void (*)(void *, uint8_t, void *);
+    reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, s_esp ? 1 : visible, method);
+}
+
+// ESP: InitOutline() — inject SetOutlineVisible(true) right after each player's outline init
+// Handles enemies spawning after ESP is toggled (game never calls SetOutlineVisible on them)
+static void hook_init_outline(void *self, void *method) {
+    using Fn = void (*)(void *, void *);
+    reinterpret_cast<Fn>(s_orig_init_outline)(self, method);
+    if (s_esp && s_orig_set_outline_vis) {
+        using ShowFn = void (*)(void *, uint8_t, void *);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
+    }
 }
 
 // InfiniteAmmo: get_IsAmmoFree (bool) → 1 = ammo is free/unlimited
@@ -631,8 +656,33 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("ESP: HUD method not resolved — enemies visible in culling only, no boxes");
     }
 
-    LOGI("ESP: %s (vis=%p hud=%p)", enable ? "ON" : "OFF",
-         s_orig_visible, s_orig_hud_show);
+    // Layer 3: SetOutlineVisible — force neon outline on every player instance
+    if (m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
+        if (enable && !s_orig_set_outline_vis)
+            HookEngine::get().hookAddr(m_mth.setOutlineVisible->methodPointer,
+                reinterpret_cast<void *>(hook_set_outline_vis), &s_orig_set_outline_vis, "ESP-outline");
+        else if (!enable && s_orig_set_outline_vis) {
+            HookEngine::get().unhook(m_mth.setOutlineVisible->methodPointer);
+            s_orig_set_outline_vis = nullptr;
+        }
+    } else {
+        LOGE("ESP: SetOutlineVisible not resolved — no neon outline layer");
+    }
+
+    // Layer 4: InitOutline — inject SetOutlineVisible(true) after each player's outline init
+    // Covers enemies that spawn after ESP is toggled on
+    if (m_mth.initOutline && m_mth.initOutline->methodPointer) {
+        if (enable && !s_orig_init_outline)
+            HookEngine::get().hookAddr(m_mth.initOutline->methodPointer,
+                reinterpret_cast<void *>(hook_init_outline), &s_orig_init_outline, "ESP-initoutline");
+        else if (!enable && s_orig_init_outline) {
+            HookEngine::get().unhook(m_mth.initOutline->methodPointer);
+            s_orig_init_outline = nullptr;
+        }
+    }
+
+    LOGI("ESP: %s (vis=%p hud=%p outline=%p initoutline=%p)", enable ? "ON" : "OFF",
+         s_orig_visible, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {

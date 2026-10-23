@@ -132,9 +132,12 @@ private:
         MethodInfo *setPosition    = nullptr;  // UnityEngine.Transform.set_position
         MethodInfo *getPosition    = nullptr;  // UnityEngine.Transform.get_position
         MethodInfo *getTransform   = nullptr;  // Component.get_transform
-        MethodInfo *colliderHit    = nullptr;  // OnControllerColliderHit (NoClip)
-        MethodInfo *playerUpdate   = nullptr;  // Player.Update (Teleport tick)
-        MethodInfo *hudSetVisible  = nullptr;  // PlayerHUD.SetVisible (ESP visual)
+        MethodInfo *colliderHit       = nullptr;  // OnControllerColliderHit (NoClip)
+        MethodInfo *playerUpdate      = nullptr;  // Player.Update (Teleport tick)
+        MethodInfo *hudSetVisible     = nullptr;  // PlayerHUD.SetVisible (ESP visual)
+        // Neon outline ESP — Player built-in outline system (IL2CPP v31 verified)
+        MethodInfo *setOutlineVisible = nullptr;  // Player.SetOutlineVisible(bool)
+        MethodInfo *initOutline       = nullptr;  // Player.InitOutline()
     } m_mth;
 
     void resolveClasses();
