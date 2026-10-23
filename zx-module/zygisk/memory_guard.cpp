@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <sys/prctl.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <link.h>
 
 #define TAG "ZX-MEM"
@@ -57,23 +58,39 @@ static int hook_dl_iterate_phdr(
     return s_orig_dl_iterate(dl_hide_trampoline, &ctx);
 }
 
-// Walk /proc/self/maps to find our module's full loaded range
+// Walk /proc/self/maps to find our module's full loaded range.
+// MUST use raw syscalls — our openat hook filters out the so_name lines,
+// so fopen("/proc/self/maps") would return a filtered view that hides us.
 static bool findSelfRange(const char *so_name,
                            uintptr_t *out_base, size_t *out_size) {
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp) return false;
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    if (fd < 0) return false;
 
+    char buf[4096];
     char line[512];
+    int llen = 0;
     uintptr_t first_start = 0, last_end = 0;
 
-    while (fgets(line, sizeof(line), fp)) {
-        if (!strstr(line, so_name)) continue;
-        uintptr_t start, end;
-        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
-        if (!first_start) first_start = start;
-        if (end > last_end) last_end = end;
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (llen < (int)sizeof(line) - 1) line[llen++] = c;
+            if (c == '\n' || llen >= (int)sizeof(line) - 1) {
+                line[llen] = '\0';
+                if (strstr(line, so_name)) {
+                    uintptr_t start, end;
+                    if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
+                        if (!first_start) first_start = start;
+                        if (end > last_end) last_end = end;
+                    }
+                }
+                llen = 0;
+            }
+        }
     }
-    fclose(fp);
+    syscall(SYS_close, fd);
 
     if (!first_start) return false;
     *out_base = first_start;

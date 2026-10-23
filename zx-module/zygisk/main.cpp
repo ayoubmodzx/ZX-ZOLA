@@ -46,12 +46,17 @@ public:
             close(fd);
         }
 
+        LOGI("postAppSpecialize: cmdline=[%s]", cmdline);
+
         bool is_ff = false;
         for (int i = 0; kFfPkgs[i]; ++i) {
             if (strcmp(cmdline, kFfPkgs[i]) == 0) { is_ff = true; break; }
         }
 
-        if (!is_ff) return;
+        if (!is_ff) {
+            LOGI("Not a FF process, skipping");
+            return;
+        }
 
         LOGI("Free Fire detected (cmdline=%s)", cmdline);
 
