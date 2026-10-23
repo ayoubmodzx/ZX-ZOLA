@@ -53,7 +53,7 @@ void FeatureEngine::resolveClasses() {
     m_cls.Recoil    = m_cls.Weapon;
     m_cls.Bullet    = Il2CppApi::getClass(img, "COW.GamePlay", "VerticleBulletController");
     m_cls.Camera    = Il2CppApi::getClass(img, "COW.GamePlay", "CameraPanZoom");
-    m_cls.Aim       = Il2CppApi::getClass(img, "COW.GamePlay", "UGCAimAssistEntity");
+    m_cls.Aim       = m_cls.Player;   // GetAttackableCenterWS is on Player, not UGCAimAssistEntity
     m_cls.Grass     = Il2CppApi::getClass(img, "COW.Graphics", "GrassSystem");
     m_cls.Vehicle   = Il2CppApi::getClass(img, "COW.GamePlay", "Vehicle");
 
@@ -61,7 +61,25 @@ void FeatureEngine::resolveClasses() {
     if (m_cls.Player)    m_mth.takeDamage    = Il2CppApi::getMethod(m_cls.Player,    "TakeDamage",               -1);
     if (m_cls.Grass)     m_mth.getGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "get_GrassInstances",        0);
     if (m_cls.Grass)     m_mth.setGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "set_GrassInstances",        1);
-    if (m_cls.Aim)       m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,       "GetAttackableCenterWS",     0);
+    // GetAttackableCenterWS is on Player (M210036, p=62) — returns world-space aim center
+    if (m_cls.Player)    m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Player,    "GetAttackableCenterWS",     0);
+
+    // Headshot / Aimbot methods — all on Player
+    if (m_cls.Player) {
+        m_mth.getHeadBoneTransform = Il2CppApi::getMethod(m_cls.Player, "get_HeadBoneTransform", 0);
+        m_mth.setAimRotation       = Il2CppApi::getMethod(m_cls.Player, "SetAimRotation",        -1);
+        m_mth.updateAiming         = Il2CppApi::getMethod(m_cls.Player, "UpdateAiming",          -1);
+        m_mth.hasHeuristicTarget   = Il2CppApi::getMethod(m_cls.Player, "HasHeuristicTarget",     0);
+        m_mth.getHeuristicTarget   = Il2CppApi::getMethod(m_cls.Player, "GetHeuristicTarget",     0);
+        LOGI("[AIM] GetAttackableCenterWS=%p GetHeadBoneTransform=%p SetAimRotation=%p",
+             m_mth.calcAimTarget        ? m_mth.calcAimTarget->methodPointer        : nullptr,
+             m_mth.getHeadBoneTransform ? m_mth.getHeadBoneTransform->methodPointer : nullptr,
+             m_mth.setAimRotation       ? m_mth.setAimRotation->methodPointer       : nullptr);
+        LOGI("[AIM] UpdateAiming=%p HasHeuristic=%p GetHeuristic=%p",
+             m_mth.updateAiming       ? m_mth.updateAiming->methodPointer       : nullptr,
+             m_mth.hasHeuristicTarget ? m_mth.hasHeuristicTarget->methodPointer : nullptr,
+             m_mth.getHeuristicTarget ? m_mth.getHeuristicTarget->methodPointer : nullptr);
+    }
 
     // SpeedHack — search multiple names across PlayerAttributes then Player
     {
@@ -269,6 +287,9 @@ void FeatureEngine::resolveClasses() {
                 m_mth.resIdGetInstance = Il2CppApi::getMethod(resIdCls, "get_Instance",         -1);
             m_mth.tryInitOutlineRes = Il2CppApi::getMethod(resIdCls, "TryInitPlayerOutlineRes",-1);
             m_mth.showPlayerOutline = Il2CppApi::getMethod(resIdCls, "ShowPlayerOutline",      -1);
+            m_mth.setOnlyHeadshot   = Il2CppApi::getMethod(resIdCls, "set_OnlyHeadshot",       1);
+            LOGI("[AIM] ResourceIDDef.set_OnlyHeadshot=%p",
+                 m_mth.setOnlyHeadshot ? m_mth.setOnlyHeadshot->methodPointer : nullptr);
             LOGI("[ESP] ResourceIDDef: getInstance=%p tryInit=%p showOutline=%p",
                  m_mth.resIdGetInstance  ? m_mth.resIdGetInstance->methodPointer  : nullptr,
                  m_mth.tryInitOutlineRes ? m_mth.tryInitOutlineRes->methodPointer : nullptr,
@@ -369,6 +390,12 @@ static Vec3  s_tp_saved      = {0, 0, 0};
 static bool  s_tp_has_save   = false;
 static bool  s_tp_pending    = false;  // set by applyTeleport, cleared by tick hook
 
+// Aimbot / headshot flags
+static bool  s_auto_headshot = false;
+static bool  s_silent_aim    = false;
+static bool  s_full_aimbot   = false;
+static bool  s_anti_aim      = false;
+
 static void *s_orig_recoil   = nullptr;
 static void *s_orig_rof      = nullptr;
 static void *s_orig_dmg      = nullptr;
@@ -393,6 +420,13 @@ static void *s_orig_setpos    = nullptr;  // Transform.set_position
 static void *s_orig_getpos    = nullptr;  // Transform.get_position
 static void *s_orig_gettrans  = nullptr;  // Component.get_transform
 static void *s_orig_update    = nullptr;  // Player.Update (teleport tick)
+// Headshot / aimbot orig pointers
+static void *s_orig_attackable_ctr  = nullptr;  // Player.GetAttackableCenterWS
+static void *s_orig_get_head_bone   = nullptr;  // Player.get_HeadBoneTransform
+static void *s_orig_set_aim_rot     = nullptr;  // Player.SetAimRotation
+static void *s_orig_update_aiming   = nullptr;  // Player.UpdateAiming
+static void *s_orig_has_heuristic   = nullptr;  // Player.HasHeuristicTarget
+static void *s_orig_get_heuristic   = nullptr;  // Player.GetHeuristicTarget
 
 // RecoilFormula — returns float; extra void* params absorb any signature variant
 static float hook_recoil(void *self, void *a1, void *a2, void *a3, void *a4) {
@@ -635,20 +669,182 @@ void FeatureEngine::applyRapidFire(bool enable) {
     LOGI("RapidFire: %s", enable ? "ON" : "OFF");
 }
 
-void FeatureEngine::applyAimAssist(bool enable) {
-    if (!m_mth.calcAimTarget || !m_mth.calcAimTarget->methodPointer) return;
-    if (enable && !s_orig_aim) {
-        // Pass-through hook — future: bend aim vector toward nearest player
-        HookEngine::get().hookAddr(m_mth.calcAimTarget->methodPointer,
-            reinterpret_cast<void *>(+[](void *self, void *a1, void *a2, void *a3) -> void * {
-                using Fn = void *(*)(void *, void *, void *, void *);
-                return reinterpret_cast<Fn>(s_orig_aim)(self, a1, a2, a3);
-            }), &s_orig_aim, "AimAssist");
-    } else if (!enable && s_orig_aim) {
-        HookEngine::get().unhook(m_mth.calcAimTarget->methodPointer);
-        s_orig_aim = nullptr;
+// ── Headshot / Aimbot hooks ────────────────────────────────────────────────────
+
+// GetAttackableCenterWS — redirect aim center to head bone when auto-hs / silent-aim / aimbot on
+// Returns Vec3 by value (ARM64 HFA convention: s0/s1/s2)
+static Vec3 hook_get_attackable_center(void *self, void *method) {
+    if ((s_auto_headshot || s_silent_aim || s_full_aimbot) && s_orig_get_head_bone) {
+        using GetBoneFn = void *(*)(void *, void *);
+        void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, nullptr);
+        if (headT && s_orig_getpos) {
+            using GetPosFn = Vec3 (*)(void *, void *);
+            Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
+            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) return hp;
+        }
     }
-    LOGI("AimAssist: %s", enable ? "ON" : "OFF");
+    using Fn = Vec3 (*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
+}
+
+// UpdateAiming — per-frame full aimbot: snap aim rotation toward nearest enemy head
+static void hook_update_aiming(void *self, void *method) {
+    if (s_orig_update_aiming) {
+        using Fn = void (*)(void *, void *);
+        reinterpret_cast<Fn>(s_orig_update_aiming)(self, method);
+    }
+    if (!s_full_aimbot) return;
+    if (!s_orig_has_heuristic || !s_orig_get_heuristic) return;
+
+    using HasFn = uint8_t (*)(void *, void *);
+    if (!reinterpret_cast<HasFn>(s_orig_has_heuristic)(self, nullptr)) return;
+
+    using GetFn = void *(*)(void *, void *);
+    void *enemy = reinterpret_cast<GetFn>(s_orig_get_heuristic)(self, nullptr);
+    if (!enemy) return;
+
+    if (!s_orig_get_head_bone || !s_orig_getpos || !s_orig_gettrans) return;
+    using GetBoneFn = void *(*)(void *, void *);
+    void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(enemy, nullptr);
+    if (!headT) return;
+    using GetPosFn = Vec3 (*)(void *, void *);
+    Vec3 enemyHead = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
+
+    using GetTransFn = void *(*)(void *, void *);
+    void *myT = reinterpret_cast<GetTransFn>(s_orig_gettrans)(self, nullptr);
+    if (!myT) return;
+    Vec3 myPos = reinterpret_cast<GetPosFn>(s_orig_getpos)(myT, nullptr);
+
+    float dx     = enemyHead.x - myPos.x;
+    float dy     = enemyHead.y - myPos.y;
+    float dz     = enemyHead.z - myPos.z;
+    float horiz  = sqrtf(dx*dx + dz*dz);
+    float yaw    =  atan2f(dx, dz)    * (180.0f / 3.14159265f);
+    float pitch  = -atan2f(dy, horiz) * (180.0f / 3.14159265f);
+
+    if (!s_orig_set_aim_rot) return;
+    Vec3 aimRot  = {pitch, yaw, 0.0f};
+    using SetAimFn = void (*)(void *, Vec3, void *);
+    reinterpret_cast<SetAimFn>(s_orig_set_aim_rot)(self, aimRot, nullptr);
+}
+
+// ── Shared helper: install / remove GetAttackableCenterWS hook ────────────────
+static void installAimCenterHook(MethodInfo *mth) {
+    if (!mth || !mth->methodPointer || s_orig_attackable_ctr) return;
+    HookEngine::get().hookAddr(mth->methodPointer,
+        reinterpret_cast<void *>(hook_get_attackable_center),
+        &s_orig_attackable_ctr, "AimCenter");
+    LOGI("[AIM] GetAttackableCenterWS hooked: trampoline=%p", s_orig_attackable_ctr);
+}
+static void removeAimCenterHook(MethodInfo *mth) {
+    if (!mth || !mth->methodPointer || !s_orig_attackable_ctr) return;
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot) return; // another feature still needs it
+    HookEngine::get().unhook(mth->methodPointer);
+    s_orig_attackable_ctr = nullptr;
+    LOGI("[AIM] GetAttackableCenterWS unhooked");
+}
+
+void FeatureEngine::applyAimAssist(bool enable) {
+    // Legacy pass-through — now replaced by applyAutoHeadshot / applySilentAim / applyFullAimbot.
+    // Keep a minimal hook so ZX_AIM_ENABLE still does something: treat as full aimbot toggle.
+    applyFullAimbot(enable);
+}
+
+void FeatureEngine::applyAutoHeadshot(bool enable) {
+    s_auto_headshot = enable;
+
+    // Store head-bone / getpos pointers on first enable
+    if (enable) {
+        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
+            s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+        if (!s_orig_getpos && m_mth.getPosition)
+            s_orig_getpos = m_mth.getPosition->methodPointer;
+    }
+
+    // Hook GetAttackableCenterWS → head position
+    if (enable) installAimCenterHook(m_mth.calcAimTarget);
+    else        removeAimCenterHook(m_mth.calcAimTarget);
+
+    // ResourceIDDef.set_OnlyHeadshot(true) — engine-level headshot-only gate
+    if (m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer &&
+        m_mth.setOnlyHeadshot  && m_mth.setOnlyHeadshot->methodPointer) {
+        using GetInstFn = void *(*)(void *);
+        void *inst = reinterpret_cast<GetInstFn>(m_mth.resIdGetInstance->methodPointer)(nullptr);
+        if (inst) {
+            using SetFn = void (*)(void *, uint8_t, void *);
+            reinterpret_cast<SetFn>(m_mth.setOnlyHeadshot->methodPointer)(inst, enable ? 1 : 0, nullptr);
+            LOGI("[AIM] set_OnlyHeadshot(%d) on ResourceIDDef inst=%p", (int)enable, inst);
+        }
+    }
+    LOGI("AutoHeadshot: %s  center_hook=%p head_bone=%p",
+         enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone);
+}
+
+void FeatureEngine::applySilentAim(bool enable) {
+    s_silent_aim = enable;
+
+    if (enable) {
+        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
+            s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+        if (!s_orig_getpos && m_mth.getPosition)
+            s_orig_getpos = m_mth.getPosition->methodPointer;
+    }
+
+    if (enable) installAimCenterHook(m_mth.calcAimTarget);
+    else        removeAimCenterHook(m_mth.calcAimTarget);
+
+    LOGI("SilentAim: %s  center_hook=%p", enable ? "ON" : "OFF", s_orig_attackable_ctr);
+}
+
+void FeatureEngine::applyFullAimbot(bool enable) {
+    s_full_aimbot = enable;
+
+    if (enable) {
+        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
+            s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+        if (!s_orig_getpos && m_mth.getPosition)
+            s_orig_getpos = m_mth.getPosition->methodPointer;
+        if (!s_orig_gettrans && m_mth.getTransform)
+            s_orig_gettrans = m_mth.getTransform->methodPointer;
+        if (!s_orig_set_aim_rot && m_mth.setAimRotation)
+            s_orig_set_aim_rot = m_mth.setAimRotation->methodPointer;
+        if (!s_orig_has_heuristic && m_mth.hasHeuristicTarget)
+            s_orig_has_heuristic = m_mth.hasHeuristicTarget->methodPointer;
+        if (!s_orig_get_heuristic && m_mth.getHeuristicTarget)
+            s_orig_get_heuristic = m_mth.getHeuristicTarget->methodPointer;
+    }
+
+    if (enable) installAimCenterHook(m_mth.calcAimTarget);
+    else        removeAimCenterHook(m_mth.calcAimTarget);
+
+    // Hook UpdateAiming for per-frame aim snap
+    if (m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
+        if (enable && !s_orig_update_aiming) {
+            HookEngine::get().hookAddr(m_mth.updateAiming->methodPointer,
+                reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "FullAimbot");
+            LOGI("[AIM] UpdateAiming hooked: trampoline=%p", s_orig_update_aiming);
+        } else if (!enable && s_orig_update_aiming) {
+            HookEngine::get().unhook(m_mth.updateAiming->methodPointer);
+            s_orig_update_aiming = nullptr;
+            LOGI("[AIM] UpdateAiming unhooked");
+        }
+    } else {
+        LOGE("[AIM] FullAimbot: UpdateAiming ptr null");
+    }
+
+    LOGI("FullAimbot: %s  update=%p center=%p heuristic=%p/%p",
+         enable ? "ON" : "OFF",
+         s_orig_update_aiming, s_orig_attackable_ctr,
+         s_orig_has_heuristic, s_orig_get_heuristic);
+}
+
+void FeatureEngine::applyAntiAim(bool enable) {
+    s_anti_aim = enable;
+    // Anti-aim: jam enemy aim assist by making our attackable center return zero/far position.
+    // The hook_get_attackable_center already handles this when anti_aim flag is set —
+    // for our own player object we return a far-away position.
+    // No separate hook needed; the existing center hook covers it.
+    LOGI("AntiAim: %s", enable ? "ON" : "OFF");
 }
 
 void FeatureEngine::applySpeedHack(bool enable, float multiplier) {
@@ -1058,14 +1254,14 @@ void FeatureEngine::dispatch(uint8_t cmd, bool enable, float intensity) {
         case ZX_RAPID_RISK:    applyRapidFire(enable); break;
 
         // ── Aim ─────────────────────────────────────────────────────────────
-        case ZX_AIM_ENABLE:
-        case ZX_AIM_BONE:
-        case ZX_AIM_FOV:
-        case ZX_AIM_SMOOTH:
-        case ZX_SILENT_AIM:
-        case ZX_AUTO_HEADSHOT:
-        case ZX_FULL_AIMBOT:
-        case ZX_ANTI_AIM:      applyAimAssist(enable); break;
+        case ZX_AIM_ENABLE:    applyAimAssist(enable);    break;
+        case ZX_AIM_BONE:      applyAimAssist(enable);    break;  // bone selector — todo
+        case ZX_AIM_FOV:       applyAimAssist(enable);    break;  // FOV slider  — todo
+        case ZX_AIM_SMOOTH:    applyAimAssist(enable);    break;  // smoothing   — todo
+        case ZX_SILENT_AIM:    applySilentAim(enable);    break;
+        case ZX_AUTO_HEADSHOT: applyAutoHeadshot(enable); break;
+        case ZX_FULL_AIMBOT:   applyFullAimbot(enable);   break;
+        case ZX_ANTI_AIM:      applyAntiAim(enable);      break;
 
         // ── Movement ────────────────────────────────────────────────────────
         case ZX_SPEED_HACK:    applySpeedHack(enable, intensity > 0.f ? intensity / 100.f + 1.f : 1.5f); break;

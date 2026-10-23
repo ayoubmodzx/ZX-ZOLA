@@ -47,6 +47,12 @@ public:
     void applyRapidFire(bool enable = true);
     void applyAimAssist(bool enable = true);
 
+    // ── HEADSHOT / AIMBOT ─────────────────────────────────────────
+    void applyAutoHeadshot(bool enable = true);
+    void applySilentAim(bool enable = true);
+    void applyFullAimbot(bool enable = true);
+    void applyAntiAim(bool enable = true);
+
     // ── MOVEMENT ──────────────────────────────────────────────────
     void applySpeedHack(bool enable = true, float multiplier = 1.5f);
     void applyHighJump(bool enable = true);
@@ -146,6 +152,14 @@ private:
         MethodInfo *showPlayerOutline = nullptr;  // ResourceIDDef.ShowPlayerOutline(bool)
         // COW::GameSettingData — server-side outline gate
         MethodInfo *enableOutlineMth  = nullptr;  // GameSettingData.EnableShowPlayerOutline(bool)
+        // Headshot / Aimbot — Player class
+        MethodInfo *getHeadBoneTransform = nullptr; // Player.get_HeadBoneTransform()
+        MethodInfo *setAimRotation       = nullptr; // Player.SetAimRotation(Vector3)
+        MethodInfo *updateAiming         = nullptr; // Player.UpdateAiming()  (per-frame)
+        MethodInfo *hasHeuristicTarget   = nullptr; // Player.HasHeuristicTarget() → bool
+        MethodInfo *getHeuristicTarget   = nullptr; // Player.GetHeuristicTarget() → Player*
+        // ResourceIDDef — headshot-only mode gate
+        MethodInfo *setOnlyHeadshot      = nullptr; // ResourceIDDef.set_OnlyHeadshot(bool)
     } m_mth;
 
     void resolveClasses();
