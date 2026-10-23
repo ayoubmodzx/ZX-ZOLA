@@ -52,13 +52,51 @@ void FeatureEngine::resolveClasses() {
 
     // Method names verified against IL2CPP v31 global-metadata.dat (Free Fire OB47)
     if (m_cls.Player)    m_mth.takeDamage    = Il2CppApi::getMethod(m_cls.Player,    "TakeDamage",               -1);
-    if (m_cls.Character) m_mth.setSpeedScale = Il2CppApi::getMethod(m_cls.Character, "SetSpecialRunSpeedScale",   1);
     if (m_cls.Grass)     m_mth.getGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "get_GrassInstances",        0);
     if (m_cls.Grass)     m_mth.setGrassInst  = Il2CppApi::getMethod(m_cls.Grass,     "set_GrassInstances",        1);
     if (m_cls.Aim)       m_mth.calcAimTarget = Il2CppApi::getMethod(m_cls.Aim,       "CalculateAimPoint",        -1);
-    // Recoil / RoF — fully obfuscated in this build; leave null (features degrade gracefully)
-    m_mth.recoilFormula = nullptr;
-    m_mth.rateOfFire    = nullptr;
+
+    // SpeedHack — search multiple names across PlayerAttributes then Player
+    {
+        static const char *kSpeedNames[] = {
+            "SetSpecialRunSpeedScale", "SetRunSpeedScale", "SetMoveSpeedScale",
+            "AddRunSpeed", "SetSpeed", "SetMoveSpeed", nullptr
+        };
+        Il2CppClass *tgts[] = { m_cls.Character, m_cls.Player, nullptr };
+        for (int t = 0; !m_mth.setSpeedScale && tgts[t]; ++t)
+            for (int i = 0; kSpeedNames[i]; ++i) {
+                MethodInfo *m = Il2CppApi::getMethod(tgts[t], kSpeedNames[i], -1);
+                if (m && m->methodPointer) { m_mth.setSpeedScale = m; break; }
+            }
+    }
+
+    // Recoil / RoF — obfuscated; try common patterns across Weapon / Player / Character
+    {
+        static const char *kRecoilNames[] = {
+            "GetRecoilScale","CalcRecoil","GetRecoil","ComputeRecoil",
+            "GetRecoilValue","OnRecoil","ApplyRecoil","CalcSpread",
+            "GetVerticalRecoil","GetHorizontalRecoil", nullptr
+        };
+        static const char *kRofNames[] = {
+            "GetFireRate","CalcFireRate","GetRateOfFire","GetFireInterval",
+            "ComputeFireRate","GetShootInterval","GetFireDelay", nullptr
+        };
+        Il2CppClass *tgts[] = { m_cls.Weapon, m_cls.Player, m_cls.Character, nullptr };
+        for (int t = 0; tgts[t]; ++t) {
+            if (!m_mth.recoilFormula)
+                for (int i = 0; kRecoilNames[i]; ++i) {
+                    MethodInfo *m = Il2CppApi::getMethod(tgts[t], kRecoilNames[i], -1);
+                    if (m && m->methodPointer) { m_mth.recoilFormula = m; break; }
+                }
+            if (!m_mth.rateOfFire)
+                for (int i = 0; kRofNames[i]; ++i) {
+                    MethodInfo *m = Il2CppApi::getMethod(tgts[t], kRofNames[i], -1);
+                    if (m && m->methodPointer) { m_mth.rateOfFire = m; break; }
+                }
+        }
+        if (!m_mth.recoilFormula) LOGE("recoilFormula: all names exhausted — still obfuscated");
+        if (!m_mth.rateOfFire)    LOGE("rateOfFire: all names exhausted — still obfuscated");
+    }
 
     // Resolve UnityEngine.Camera.set_fieldOfView for WidePOV
     // Also resolve Transform for Teleport
@@ -93,9 +131,18 @@ void FeatureEngine::resolveClasses() {
     if (m_cls.Player)
         m_mth.isNeedReload = Il2CppApi::getMethod(m_cls.Player, "IsReloading", 0);
 
-    // WallShoot — CanFire on VerticleBulletController (index 257403); return 1 = allowed to fire
-    if (m_cls.Bullet)
-        m_mth.checkWallHit = Il2CppApi::getMethod(m_cls.Bullet, "CanFire", 0);
+    // WallShoot — search multiple names on VerticleBulletController
+    if (m_cls.Bullet) {
+        static const char *kFireNames[] = {
+            "CanFire","CheckCanFire","IsCanFire","get_CanFire",
+            "CanShoot","IsAllowedToFire","CheckWallPenetration", nullptr
+        };
+        for (int i = 0; kFireNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Bullet, kFireNames[i], -1);
+            if (m && m->methodPointer) { m_mth.checkWallHit = m; break; }
+        }
+        if (!m_mth.checkWallHit) LOGE("WallShoot: no method found on VerticleBulletController");
+    }
 
     // AutoRevive — get_IsPendingRevive on Player (index 210262); return 1 triggers revive logic
     if (m_cls.Player)
@@ -106,9 +153,17 @@ void FeatureEngine::resolveClasses() {
         m_mth.colliderHit = Il2CppApi::getMethod(m_cls.Player,
             "COW.GamePlay.IPhysicalCharacter.OnControllerColliderHit", 1);
 
-    // Teleport — OnUpdate on Player (index 210551)
-    if (m_cls.Player)
-        m_mth.playerUpdate = Il2CppApi::getMethod(m_cls.Player, "OnUpdate", 0);
+    // Teleport tick — search multiple Update names on Player
+    if (m_cls.Player) {
+        static const char *kUpdateNames[] = {
+            "OnUpdate","Update","Tick","OnTick","FixedUpdate","LateUpdate", nullptr
+        };
+        for (int i = 0; kUpdateNames[i]; ++i) {
+            MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kUpdateNames[i], -1);
+            if (m && m->methodPointer) { m_mth.playerUpdate = m; break; }
+        }
+        if (!m_mth.playerUpdate) LOGE("Teleport: no Update method found on Player");
+    }
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
     LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p cam_fov:%p",
