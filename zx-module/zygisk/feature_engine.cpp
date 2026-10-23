@@ -281,6 +281,7 @@ void FeatureEngine::resolveClasses() {
     // Discovered: TryInitPlayerOutlineRes + ShowPlayerOutline are on this class
     {
         Il2CppClass *resIdCls = Il2CppApi::getClass(img, "COW", "ResourceIDDef");
+        m_cls.ResIdDef = resIdCls;
         if (resIdCls) {
             m_mth.resIdGetInstance  = Il2CppApi::getMethod(resIdCls, "GetInstance",             -1);
             if (!m_mth.resIdGetInstance || !m_mth.resIdGetInstance->methodPointer)
@@ -580,13 +581,23 @@ static void hook_player_update(void *self, void *method) {
     //      This is the through-wall mechanism (no shader swap needed).
     //   2. InitOutline + SetOutlineVisible(true) — neon line around body
     if (s_esp) {
+        // Diagnostic: confirm hook fires for multiple player instances (enemies, not just local)
+        static void  *s_esp_first_self = nullptr;
+        static int    s_esp_multi_seen = 0;
+        if (!s_esp_first_self) s_esp_first_self = self;
+        else if (self != s_esp_first_self && ++s_esp_multi_seen <= 5)
+            LOGI("[ESP-DIAG] Update: enemy player seen self=%p (first=%p multi#%d)",
+                 self, s_esp_first_self, s_esp_multi_seen);
+
         ++s_outline_tick;
         if (s_outline_tick >= 30) {
             s_outline_tick = 0;
             // Through-wall: render queue 5000 (Unity Overlay — renders above walls)
             if (s_orig_set_render_q) {
+                static bool s_rq_first_fire = true;
                 using SetRQFn = void (*)(void *, int, void *);
                 reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
+                if (s_rq_first_fire) { s_rq_first_fire = false; LOGI("[ESP-DIAG] SetRenderQ(5000) first fire: self=%p", self); }
             }
             // Neon outline: InitOutline must come before SetOutlineVisible
             if (s_orig_init_outline) {
@@ -1092,12 +1103,32 @@ void FeatureEngine::applyESP(bool enable) {
     }
 
     // Global: ResourceIDDef.TryInitPlayerOutlineRes + ShowPlayerOutline(true).
-    // Unlocks the game's outline system globally so individual player calls take effect.
-    if (enable && m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer) {
-        using GetInstFn = void *(*)(void *);
-        void *inst = reinterpret_cast<GetInstFn>(m_mth.resIdGetInstance->methodPointer)(nullptr);
-        LOGI("[ESP-DIAG] ResourceIDDef instance=%p", inst);
-        if (inst) {
+    // Unlocks the game's outline pipeline so individual player SetOutlineVisible calls take effect.
+    {
+        void *inst = nullptr;
+        // Primary: method-based singleton getter
+        if (m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer) {
+            using GetInstFn = void *(*)(void *);
+            inst = reinterpret_cast<GetInstFn>(m_mth.resIdGetInstance->methodPointer)(nullptr);
+        }
+        // Fallback: read C# static singleton backing field directly
+        if (!inst && m_cls.ResIdDef) {
+            static const char *kFields[] = {
+                "s_Instance","m_Instance","s_instance","m_instance",
+                "instance","Instance","_instance","<Instance>k__BackingField",nullptr
+            };
+            for (int i = 0; kFields[i]; ++i) {
+                FieldInfo *fld = Il2CppApi::getField(m_cls.ResIdDef, kFields[i]);
+                if (fld) {
+                    Il2CppApi::getStaticValue(fld, &inst);
+                    if (inst) { LOGI("[ESP-DIAG] ResIDDef singleton via field '%s'=%p", kFields[i], inst); break; }
+                    inst = nullptr;
+                }
+            }
+        }
+        LOGI("[ESP-DIAG] ResourceIDDef instance=%p (method_ptr=%p)", inst,
+             m_mth.resIdGetInstance ? m_mth.resIdGetInstance->methodPointer : nullptr);
+        if (enable && inst) {
             if (m_mth.tryInitOutlineRes && m_mth.tryInitOutlineRes->methodPointer) {
                 using InitResFn = void (*)(void *, void *);
                 reinterpret_cast<InitResFn>(m_mth.tryInitOutlineRes->methodPointer)(inst, nullptr);

@@ -100,6 +100,7 @@ private:
         Il2CppClass *Loot         = nullptr;
         Il2CppClass *UnityCamera  = nullptr;  // UnityEngine.Camera — for WidePOV
         Il2CppClass *UnityTransform = nullptr; // UnityEngine.Transform — for Teleport
+        Il2CppClass *ResIdDef     = nullptr;  // COW::ResourceIDDef — singleton outline manager
     } m_cls;
 
     struct Fields {
