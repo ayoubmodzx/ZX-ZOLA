@@ -444,15 +444,31 @@ static void hook_collider_hit(void *self, void *hit, void *method) {
     reinterpret_cast<Fn>(s_orig_collider)(self, hit, method);
 }
 
-// Teleport tick: hooked onto Player.Update.
+// Frame counter for ESP outline throttle — inject every 30 Player.Update calls per instance
+// (avoids calling SetOutlineVisible at 60fps on every player every frame)
+static thread_local uint8_t s_outline_tick = 0;
+
+// Teleport tick + ESP proactive outline injection: hooked onto Player.Update.
 // ARM64 Vector3 HFA: set_position(Transform* x0, float s0,s1,s2, MethodInfo* x1)
 //                    get_position returns floats in s0/s1/s2
 static void hook_player_update(void *self, void *method) {
+    // ── ESP proactive outline injection ──────────────────────────────────────
+    // SetOutlineVisible / InitOutline are NEVER called by the game on existing
+    // players after they spawn, so we force the call ourselves each ~30 frames.
+    if (s_esp && s_orig_set_outline_vis) {
+        ++s_outline_tick;
+        if (s_outline_tick >= 30) {
+            s_outline_tick = 0;
+            using ShowFn = void (*)(void *, uint8_t, void *);
+            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
+        }
+    }
+
+    // ── Teleport tick ────────────────────────────────────────────────────────
     if (s_orig_gettrans && s_orig_setpos && s_orig_getpos) {
         using GetTransFn = void *(*)(void *, void *);
         void *tr = reinterpret_cast<GetTransFn>(s_orig_gettrans)(self, nullptr);
         if (tr) {
-            // Save current position when requested
             if (!s_tp_has_save) {
                 using GetPosFn = Vec3 (*)(void *, void *);
                 s_tp_saved   = reinterpret_cast<GetPosFn>(s_orig_getpos)(tr, nullptr);
@@ -460,7 +476,6 @@ static void hook_player_update(void *self, void *method) {
                 LOGI("TeleportSave: pos=(%.2f,%.2f,%.2f)",
                      s_tp_saved.x, s_tp_saved.y, s_tp_saved.z);
             }
-            // Teleport to saved position when requested
             if (s_tp_pending) {
                 using SetPosFn = void (*)(void *, float, float, float, void *);
                 reinterpret_cast<SetPosFn>(s_orig_setpos)(
@@ -732,8 +747,28 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("[ESP-DIAG] Layer4 SKIP — InitOutline ptr null");
     }
 
-    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p",
-         (int)enable, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline);
+    // Layer 5: Player.Update hook for proactive per-frame outline injection.
+    // When SetOutlineVisible is found but the game never calls it on existing players,
+    // we force it ourselves every 30 frames inside Player.Update.
+    // Only hook/unhook if teleport isn't already using the same hook.
+    if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer &&
+        m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
+        if (enable && !s_orig_update) {
+            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+                reinterpret_cast<void *>(hook_player_update), &s_orig_update, "ESP-UpdateTick");
+            LOGI("[ESP-DIAG] Layer5 Player.Update hooked for proactive outline");
+        } else if (!enable && s_orig_update) {
+            // Only unhook if teleport isn't also using it
+            if (!s_tp_has_save && !s_tp_pending) {
+                HookEngine::get().unhook(m_mth.playerUpdate->methodPointer);
+                s_orig_update = nullptr;
+                LOGI("[ESP-DIAG] Layer5 Player.Update unhooked");
+            }
+        }
+    }
+
+    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p update=%p",
+         (int)enable, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline, s_orig_update);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {
