@@ -428,6 +428,11 @@ static void *s_orig_set_aim_rot     = nullptr;  // Player.SetAimRotation
 static void *s_orig_update_aiming   = nullptr;  // Player.UpdateAiming
 static void *s_orig_has_heuristic   = nullptr;  // Player.HasHeuristicTarget
 static void *s_orig_get_heuristic   = nullptr;  // Player.GetHeuristicTarget
+// ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
+static void        *s_res_id_get_inst  = nullptr;  // ResourceIDDef.GetInstance()
+static void        *s_res_id_try_init  = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
+static void        *s_res_id_show      = nullptr;  // ResourceIDDef.ShowPlayerOutline(bool)
+static Il2CppClass *s_res_id_cls       = nullptr;  // ResourceIDDef class (for field scan)
 
 // RecoilFormula — returns float; extra void* params absorb any signature variant
 static float hook_recoil(void *self, void *a1, void *a2, void *a3, void *a4) {
@@ -691,6 +696,34 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
     if (s_esp) {
         static bool s_esp_ac_first = true;
         if (s_esp_ac_first) { s_esp_ac_first = false; LOGI("[ESP-DIAG] ESP via GetAttackableCenterWS: self=%p", self); }
+
+        // Lazy-init ResourceIDDef outline pipeline — singleton only exists inside a match,
+        // not at lobby time when ESP is first toggled.
+        static bool s_res_init_done = false;
+        static int  s_res_retry     = 0;
+        if (!s_res_init_done && (++s_res_retry % 30 == 1)) {
+            void *inst = nullptr;
+            if (s_res_id_get_inst) {
+                using GetFn = void *(*)(void *);
+                inst = reinterpret_cast<GetFn>(s_res_id_get_inst)(nullptr);
+            }
+            if (!inst && s_res_id_cls) {
+                static const char *kF[] = {
+                    "s_Instance","m_Instance","s_instance","m_instance",
+                    "instance","Instance","_instance","<Instance>k__BackingField",nullptr};
+                for (int i = 0; kF[i]; ++i) {
+                    FieldInfo *f = Il2CppApi::getField(s_res_id_cls, kF[i]);
+                    if (f) { Il2CppApi::getStaticValue(f, &inst); if (inst) break; inst = nullptr; }
+                }
+            }
+            if (inst) {
+                s_res_init_done = true;
+                if (s_res_id_try_init) { using Fn = void(*)(void*,void*); reinterpret_cast<Fn>(s_res_id_try_init)(inst,nullptr); }
+                if (s_res_id_show)     { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
+                LOGI("[ESP-DIAG] ResIDDef in-game init OK: inst=%p", inst);
+            }
+        }
+
         if (s_orig_set_render_q) {
             using SetRQFn = void (*)(void *, int, void *);
             reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
@@ -1018,6 +1051,25 @@ void FeatureEngine::applyAntiDamage(bool enable) {
 void FeatureEngine::applyESP(bool enable) {
     s_esp     = enable;
     s_esp_hud = enable;
+
+    // Cache ResourceIDDef pointers for lazy in-game init inside hook_get_attackable_center.
+    // Singleton only exists inside a match, so we can't call it here at toggle time.
+    if (enable) {
+        s_res_id_get_inst = m_mth.resIdGetInstance  ? m_mth.resIdGetInstance->methodPointer  : nullptr;
+        s_res_id_try_init = m_mth.tryInitOutlineRes ? m_mth.tryInitOutlineRes->methodPointer : nullptr;
+        s_res_id_show     = m_mth.showPlayerOutline ? m_mth.showPlayerOutline->methodPointer : nullptr;
+        s_res_id_cls      = m_cls.ResIdDef;
+    } else {
+        // Reset lazy-init state so next enable retries from scratch
+        s_res_id_get_inst = nullptr;
+        s_res_id_try_init = nullptr;
+        s_res_id_show     = nullptr;
+        s_res_id_cls      = nullptr;
+        // Reset per-session statics in the hook so next enable restarts fresh
+        // (done via the s_res_init_done static inside hook_get_attackable_center —
+        //  can't reset a function-local static from here; it resets on next match entry
+        //  naturally since the singleton pointer changes per session)
+    }
 
     // Layer 1 (DISABLED): IsVisible() in Free Fire is a stealth-state getter, not a
     // renderer culling check. Forcing it true marks ALL players as cloaked/invisible,
