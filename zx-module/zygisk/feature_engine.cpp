@@ -37,6 +37,9 @@ void FeatureEngine::init(AsyncWorker *worker) {
 // Global outline enable — declared here so resolveClasses() can write them
 static void     *s_match_show_outline_fn = nullptr;
 static FieldInfo *s_enable_outline_field = nullptr;
+// Through-wall render queue trampolines (filled by applyESP hook setup)
+static void *s_orig_set_render_q    = nullptr;
+static void *s_orig_revert_render_q = nullptr;
 
 void FeatureEngine::resolveClasses() {
     Il2CppImage *img = Il2CppApi::getImage("Assembly-CSharp");
@@ -244,6 +247,40 @@ void FeatureEngine::resolveClasses() {
             if (m && m->methodPointer) { m_mth.playerUpdate = m; break; }
         }
         if (!m_mth.playerUpdate) LOGE("Teleport: no Update method found on Player");
+    }
+
+    // Player.SetRenderQ(int) — sets render queue to 5000+ so player renders above walls
+    // Player.RevertToDefaultRenderQ() — restores normal render queue on ESP off
+    if (m_cls.Player) {
+        m_mth.setRenderQ    = Il2CppApi::getMethod(m_cls.Player, "SetRenderQ",              -1);
+        m_mth.revertRenderQ = Il2CppApi::getMethod(m_cls.Player, "RevertToDefaultRenderQ",  0);
+        LOGI("[ESP] SetRenderQ=%p RevertRenderQ=%p",
+             m_mth.setRenderQ    ? m_mth.setRenderQ->methodPointer    : nullptr,
+             m_mth.revertRenderQ ? m_mth.revertRenderQ->methodPointer : nullptr);
+    }
+
+    // COW::ResourceIDDef — global outline manager (singleton with GetInstance)
+    // Discovered: TryInitPlayerOutlineRes + ShowPlayerOutline are on this class
+    {
+        Il2CppClass *resIdCls = Il2CppApi::getClass(img, "COW", "ResourceIDDef");
+        if (resIdCls) {
+            m_mth.resIdGetInstance  = Il2CppApi::getMethod(resIdCls, "GetInstance",             -1);
+            if (!m_mth.resIdGetInstance || !m_mth.resIdGetInstance->methodPointer)
+                m_mth.resIdGetInstance = Il2CppApi::getMethod(resIdCls, "get_Instance",         -1);
+            m_mth.tryInitOutlineRes = Il2CppApi::getMethod(resIdCls, "TryInitPlayerOutlineRes",-1);
+            m_mth.showPlayerOutline = Il2CppApi::getMethod(resIdCls, "ShowPlayerOutline",      -1);
+            LOGI("[ESP] ResourceIDDef: getInstance=%p tryInit=%p showOutline=%p",
+                 m_mth.resIdGetInstance  ? m_mth.resIdGetInstance->methodPointer  : nullptr,
+                 m_mth.tryInitOutlineRes ? m_mth.tryInitOutlineRes->methodPointer : nullptr,
+                 m_mth.showPlayerOutline ? m_mth.showPlayerOutline->methodPointer : nullptr);
+        } else LOGE("[ESP] ResourceIDDef class not found");
+
+        // GameSettingData.EnableShowPlayerOutline(bool) — server-side gate
+        Il2CppClass *gsCls = Il2CppApi::getClass(img, "COW", "GameSettingData");
+        if (gsCls)
+            m_mth.enableOutlineMth = Il2CppApi::getMethod(gsCls, "EnableShowPlayerOutline", -1);
+        LOGI("[ESP] GameSettingData.EnableShowPlayerOutline=%p",
+             m_mth.enableOutlineMth ? m_mth.enableOutlineMth->methodPointer : nullptr);
     }
 
     // ESP global switches — COW::MatchGame.ShowPlayerOutline enables the outline system
@@ -503,21 +540,34 @@ static thread_local uint8_t s_outline_tick = 0;
 // ARM64 Vector3 HFA: set_position(Transform* x0, float s0,s1,s2, MethodInfo* x1)
 //                    get_position returns floats in s0/s1/s2
 static void hook_player_update(void *self, void *method) {
-    // ── ESP proactive outline injection ──────────────────────────────────────
-    // InitOutline MUST be called before SetOutlineVisible — it sets up the
-    // outline renderer component. Without it SetOutlineVisible does nothing
-    // (renderer ptr is null). Call both every 30 frames.
-    if (s_esp && s_orig_set_outline_vis) {
+    // ── ESP proactive injection ───────────────────────────────────────────────
+    // Every 30 frames per player:
+    //   1. SetRenderQ(5000) — render queue 5000 = overlay, draws above all geometry
+    //      This is the through-wall mechanism (no shader swap needed).
+    //   2. InitOutline + SetOutlineVisible(true) — neon line around body
+    if (s_esp) {
         ++s_outline_tick;
         if (s_outline_tick >= 30) {
             s_outline_tick = 0;
+            // Through-wall: render queue 5000 (Unity Overlay — renders above walls)
+            if (s_orig_set_render_q) {
+                using SetRQFn = void (*)(void *, int, void *);
+                reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
+            }
+            // Neon outline: InitOutline must come before SetOutlineVisible
             if (s_orig_init_outline) {
                 using InitFn = void (*)(void *, void *);
                 reinterpret_cast<InitFn>(s_orig_init_outline)(self, nullptr);
             }
-            using ShowFn = void (*)(void *, uint8_t, void *);
-            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
+            if (s_orig_set_outline_vis) {
+                using ShowFn = void (*)(void *, uint8_t, void *);
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
+            }
         }
+    } else if (!s_esp && s_orig_revert_render_q) {
+        // Restore normal render queue when ESP disabled
+        using RevertFn = void (*)(void *, void *);
+        reinterpret_cast<RevertFn>(s_orig_revert_render_q)(self, nullptr);
     }
 
     // ── Teleport tick ────────────────────────────────────────────────────────
@@ -803,44 +853,77 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("[ESP-DIAG] Layer4 SKIP — InitOutline ptr null");
     }
 
-    // Layer 5: Player.Update hook for proactive per-frame outline injection.
-    // When SetOutlineVisible is found but the game never calls it on existing players,
-    // we force it ourselves every 30 frames inside Player.Update.
-    // Only hook/unhook if teleport isn't already using the same hook.
-    if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer &&
-        m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
+    // Layer 5: Player.Update hook for proactive per-frame outline + renderQ injection.
+    // Activates when either SetOutlineVisible OR SetRenderQ is resolved — we need the
+    // per-frame tick regardless of which outline path we end up using.
+    bool hasOutlinePath = (m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) ||
+                          (m_mth.setRenderQ       && m_mth.setRenderQ->methodPointer);
+    if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer && hasOutlinePath) {
         if (enable && !s_orig_update) {
             HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "ESP-UpdateTick");
-            LOGI("[ESP-DIAG] Layer5 Player.Update hooked for proactive outline");
+            LOGI("[ESP-DIAG] Layer5 Player.Update hooked for proactive outline+renderQ");
         } else if (!enable && s_orig_update) {
-            // Only unhook if teleport isn't also using it
             if (!s_tp_has_save && !s_tp_pending) {
                 HookEngine::get().unhook(m_mth.playerUpdate->methodPointer);
                 s_orig_update = nullptr;
                 LOGI("[ESP-DIAG] Layer5 Player.Update unhooked");
             }
         }
+    } else {
+        LOGE("[ESP-DIAG] Layer5 SKIP — no outline path or playerUpdate ptr null");
     }
 
-    // Global outline enable switches — these unlock the outline system for ALL players.
-    // GameSettingData.EnableShowPlayerOutline = true: lifts the engine-level gate.
-    // MatchGame.ShowPlayerOutline(true): activates the depth-ignore outline shader
-    // used in kill cam / spectating that renders through walls.
-    if (s_enable_outline_field) {
-        uint8_t val = enable ? 1 : 0;
-        Il2CppApi::setStaticValue(nullptr, s_enable_outline_field, &val);
-        LOGI("[ESP-DIAG] GameSettingData.EnableShowPlayerOutline = %d", (int)val);
-    }
-    if (s_match_show_outline_fn && enable) {
-        using ShowAllFn = void (*)(uint8_t, void *);
-        reinterpret_cast<ShowAllFn>(s_match_show_outline_fn)(1, nullptr);
-        LOGI("[ESP-DIAG] MatchGame.ShowPlayerOutline(true) called");
+    // Layer 6: SetRenderQ — store method pointer for per-frame injection in hook_player_update.
+    // SetRenderQ(5000) puts each player in Unity's Overlay render queue (renders above walls).
+    // No Dobby hook needed — we call it directly inside the Player.Update hook.
+    LOGI("[ESP-DIAG] Layer6 setup: setRenderQ=%p revertRenderQ=%p",
+         m_mth.setRenderQ    ? m_mth.setRenderQ->methodPointer    : nullptr,
+         m_mth.revertRenderQ ? m_mth.revertRenderQ->methodPointer : nullptr);
+    if (m_mth.setRenderQ && m_mth.setRenderQ->methodPointer) {
+        if (enable) {
+            s_orig_set_render_q    = m_mth.setRenderQ->methodPointer;
+            s_orig_revert_render_q = (m_mth.revertRenderQ && m_mth.revertRenderQ->methodPointer)
+                                     ? m_mth.revertRenderQ->methodPointer : nullptr;
+            LOGI("[ESP-DIAG] Layer6 SetRenderQ ptr=%p stored", s_orig_set_render_q);
+        } else {
+            s_orig_set_render_q    = nullptr;
+            s_orig_revert_render_q = nullptr;
+            LOGI("[ESP-DIAG] Layer6 SetRenderQ ptr cleared");
+        }
+    } else {
+        LOGE("[ESP-DIAG] Layer6 SKIP — SetRenderQ ptr null");
     }
 
-    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p update=%p matchfn=%p fieldfound=%d",
+    // Global: ResourceIDDef.TryInitPlayerOutlineRes + ShowPlayerOutline(true).
+    // Unlocks the game's outline system globally so individual player calls take effect.
+    if (enable && m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer) {
+        using GetInstFn = void *(*)(void *);
+        void *inst = reinterpret_cast<GetInstFn>(m_mth.resIdGetInstance->methodPointer)(nullptr);
+        LOGI("[ESP-DIAG] ResourceIDDef instance=%p", inst);
+        if (inst) {
+            if (m_mth.tryInitOutlineRes && m_mth.tryInitOutlineRes->methodPointer) {
+                using InitResFn = void (*)(void *, void *);
+                reinterpret_cast<InitResFn>(m_mth.tryInitOutlineRes->methodPointer)(inst, nullptr);
+                LOGI("[ESP-DIAG] TryInitPlayerOutlineRes() called");
+            }
+            if (m_mth.showPlayerOutline && m_mth.showPlayerOutline->methodPointer) {
+                using ShowFn = void (*)(void *, uint8_t, void *);
+                reinterpret_cast<ShowFn>(m_mth.showPlayerOutline->methodPointer)(inst, 1, nullptr);
+                LOGI("[ESP-DIAG] ShowPlayerOutline(true) called");
+            }
+        }
+    }
+    // GameSettingData.EnableShowPlayerOutline — method-based gate
+    if (m_mth.enableOutlineMth && m_mth.enableOutlineMth->methodPointer) {
+        using EnableFn = void (*)(uint8_t, void *);
+        reinterpret_cast<EnableFn>(m_mth.enableOutlineMth->methodPointer)(enable ? 1 : 0, nullptr);
+        LOGI("[ESP-DIAG] EnableShowPlayerOutline(%d) called", (int)enable);
+    }
+
+    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p update=%p renderQ=%p",
          (int)enable, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline,
-         s_orig_update, s_match_show_outline_fn, s_enable_outline_field != nullptr);
+         s_orig_update, s_orig_set_render_q);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {

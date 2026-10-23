@@ -138,6 +138,14 @@ private:
         // Neon outline ESP — Player built-in outline system (IL2CPP v31 verified)
         MethodInfo *setOutlineVisible = nullptr;  // Player.SetOutlineVisible(bool)
         MethodInfo *initOutline       = nullptr;  // Player.InitOutline()
+        MethodInfo *setRenderQ        = nullptr;  // Player.SetRenderQ(int) — through-wall rendering
+        MethodInfo *revertRenderQ     = nullptr;  // Player.RevertToDefaultRenderQ()
+        // COW::ResourceIDDef singleton — global outline enable
+        MethodInfo *resIdGetInstance  = nullptr;  // ResourceIDDef.GetInstance() [static]
+        MethodInfo *tryInitOutlineRes = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
+        MethodInfo *showPlayerOutline = nullptr;  // ResourceIDDef.ShowPlayerOutline(bool)
+        // COW::GameSettingData — server-side outline gate
+        MethodInfo *enableOutlineMth  = nullptr;  // GameSettingData.EnableShowPlayerOutline(bool)
     } m_mth;
 
     void resolveClasses();
