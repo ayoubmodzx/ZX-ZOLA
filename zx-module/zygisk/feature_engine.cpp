@@ -733,38 +733,11 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         // Log every call for first 20, then every 60 — catches crashes on first execution
         bool do_log = (s_aim_cnt <= 20) || ((s_aim_cnt % 60) == 1);
 
-        if (do_log) LOGI("[HS-CRASH] aim#%u ENTER self=%p collider_fn=%p bounds_fn=%p headtf_fn=%p bone_fn=%p getpos_fn=%p",
-            s_aim_cnt, self,
-            s_orig_get_head_collider, s_orig_collider_get_bounds,
-            s_orig_get_head_tf, s_orig_get_head_bone, s_orig_getpos);
+        if (do_log) LOGI("[HS-CRASH] aim#%u ENTER self=%p headtf_fn=%p bone_fn=%p getpos_fn=%p",
+            s_aim_cnt, self, s_orig_get_head_tf, s_orig_get_head_bone, s_orig_getpos);
 
-        // Priority 1: Collider.bounds.center — exact world-space physics hitbox center
-        if (s_orig_get_head_collider && s_orig_collider_get_bounds) {
-            if (do_log) LOGI("[HS-CRASH] aim#%u calling get_HeadCollider fn=%p self=%p", s_aim_cnt, s_orig_get_head_collider, self);
-            using GetColFn = void *(*)(void *, void *);
-            void *col = reinterpret_cast<GetColFn>(s_orig_get_head_collider)(self, nullptr);
-            if (do_log) LOGI("[HS-CRASH] aim#%u get_HeadCollider returned col=%p", s_aim_cnt, col);
-            if (col) {
-                struct UnityBounds { float cx, cy, cz, ex, ey, ez; };
-                UnityBounds bounds{};
-                if (do_log) LOGI("[HS-CRASH] aim#%u calling get_bounds fn=%p col=%p", s_aim_cnt, s_orig_collider_get_bounds, col);
-                using GetBoundsFn = void (*)(void *, UnityBounds *, void *);
-                reinterpret_cast<GetBoundsFn>(s_orig_collider_get_bounds)(col, &bounds, nullptr);
-                Vec3 hitboxCenter = {bounds.cx, bounds.cy, bounds.cz};
-                if (do_log) LOGI("[HS-CRASH] aim#%u get_bounds done center=(%.3f,%.3f,%.3f) ext=(%.3f,%.3f,%.3f)",
-                    s_aim_cnt, hitboxCenter.x, hitboxCenter.y, hitboxCenter.z, bounds.ex, bounds.ey, bounds.ez);
-                if (hitboxCenter.x != 0.0f || hitboxCenter.y != 0.0f || hitboxCenter.z != 0.0f) {
-                    return hitboxCenter;
-                }
-                if (do_log) LOGI("[HS-CRASH] aim#%u bounds.center=ZERO — falling back", s_aim_cnt);
-            } else {
-                if (do_log) LOGI("[HS-CRASH] aim#%u get_HeadCollider=NULL self=%p — falling back", s_aim_cnt, self);
-            }
-        } else {
-            if (do_log) LOGI("[HS-CRASH] aim#%u P1 SKIP: collider_fn=%p bounds_fn=%p",
-                s_aim_cnt, s_orig_get_head_collider, s_orig_collider_get_bounds);
-        }
-
+        // Priority 1 (Collider.get_bounds) REMOVED — Collider.bounds queries PhysX
+        // which is NOT thread-safe from a hook thread → guaranteed crash.
         // Priority 2: GetHeadTF (alternate head transform)
         if (s_orig_get_head_tf && s_orig_getpos) {
             if (do_log) LOGI("[HS-CRASH] aim#%u calling GetHeadTF fn=%p self=%p", s_aim_cnt, s_orig_get_head_tf, self);
