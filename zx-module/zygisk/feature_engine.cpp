@@ -672,40 +672,14 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
     // Per-enemy InitOutline + SetOutlineVisible(1) is injected every ~90 calls via the
     // hooked InitOutline address — this goes through hook_init_outline which runs
     // original + SetOutlineVisible(1), covering enemies present before ESP was toggled.
+    // ESP: set render queue above Overlay (5000) so enemy renders through walls.
+    // Only SetRenderQ here — InitOutline fires naturally from game; MatchGame calls
+    // were crashing because both called with nullptr MethodInfo* on first enemy tick.
     if (s_esp && s_orig_set_render_q) {
         static bool s_esp_ac_first = true;
         if (s_esp_ac_first) { s_esp_ac_first = false; LOGI("[ESP-DIAG] ESP via GetAttackableCenterWS: self=%p", self); }
         using SetRQFn = void (*)(void *, int, void *);
-        reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 3000, nullptr);
-        // Proactive outline: call through hooked InitOutline every 90 frames globally.
-        // hook_init_outline runs: original InitOutline → SetOutlineVisible(self, 1).
-        // This covers enemies that spawned before ESP was enabled.
-        if (s_initoutline_hooked_addr) {
-            static uint32_t s_outline_cnt = 0;
-            if ((++s_outline_cnt % 90) == 1) {
-                using InitFn = void (*)(void *, void *);
-                reinterpret_cast<InitFn>(s_initoutline_hooked_addr)(self, nullptr);
-            }
-        }
-        // MatchGame.ShowPlayerOutline(true) — global neon outline enable.
-        // Called ONCE per match session from here (game's own update thread = safe managed context).
-        // applyESP() runs on socket thread which lacks managed context → moved here.
-        if (!s_matchgame_outline_done && s_res_id_get_inst) {
-            using GetInstFn = void *(*)(void *);
-            void *inst = reinterpret_cast<GetInstFn>(s_res_id_get_inst)(nullptr);
-            if (inst) {
-                if (s_res_id_try_init) {
-                    using TryInitFn = void (*)(void *, void *);
-                    reinterpret_cast<TryInitFn>(s_res_id_try_init)(inst, nullptr);
-                }
-                if (s_res_id_show) {
-                    using ShowFn = void (*)(void *, uint8_t, void *);
-                    reinterpret_cast<ShowFn>(s_res_id_show)(inst, 1, nullptr);
-                }
-                s_matchgame_outline_done = true;
-                LOGI("[ESP-DIAG] MatchGame.ShowPlayerOutline(true) called (game thread, inst=%p)", inst);
-            }
-        }
+        reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
     }
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
         // Priority: use Collider.bounds.center = exact world-space physics hitbox center.
