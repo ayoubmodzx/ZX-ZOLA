@@ -35,7 +35,11 @@ void FeatureEngine::init(AsyncWorker *worker) {
 }
 
 // Global outline enable — declared here so resolveClasses() can write them
-static void     *s_match_show_outline_fn = nullptr;
+static void     *s_match_show_outline_fn      = nullptr;  // MatchGame.ShowPlayerOutline
+static void     *s_match_show_team_outline_fn = nullptr;  // MatchGame.ShowTeamOutline
+static void     *s_match_try_init_fn          = nullptr;  // MatchGame.TryInitPlayerOutlineRes
+static void     *s_match_get_inst_fn          = nullptr;  // MatchGame.GetMatch (static)
+static void     *s_gs_enable_outline_fn       = nullptr;  // GameSettingData.EnableShowPlayerOutline
 static FieldInfo *s_enable_outline_field = nullptr;
 // Through-wall render queue trampolines (filled by applyESP hook setup)
 static void *s_orig_set_render_q    = nullptr;
@@ -334,10 +338,29 @@ void FeatureEngine::resolveClasses() {
         LOGI("[ESP] GameSettingData.EnableShowPlayerOutline=%p",
              m_mth.enableOutlineMth ? m_mth.enableOutlineMth->methodPointer : nullptr);
 
-        // Store MatchGame.ShowPlayerOutline in the legacy s_match_show_outline_fn
-        // (used directly in applyESP before in-match lazy-init fires)
+        // Store all MatchGame outline functions — called from game-thread hooks
         if (m_mth.showPlayerOutline && m_mth.showPlayerOutline->methodPointer)
             s_match_show_outline_fn = m_mth.showPlayerOutline->methodPointer;
+        if (m_mth.tryInitOutlineRes && m_mth.tryInitOutlineRes->methodPointer)
+            s_match_try_init_fn = m_mth.tryInitOutlineRes->methodPointer;
+        if (m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer)
+            s_match_get_inst_fn = m_mth.resIdGetInstance->methodPointer;
+        // ShowTeamOutline — also activate for full visibility
+        MethodInfo *showTeamMth = Il2CppApi::getMethod(matchGameCls, "ShowTeamOutline", -1);
+        if (showTeamMth && showTeamMth->methodPointer)
+            s_match_show_team_outline_fn = showTeamMth->methodPointer;
+        LOGI("[ESP] MatchGame fns: GetMatch=%p TryInit=%p ShowPlayer=%p ShowTeam=%p",
+             s_match_get_inst_fn, s_match_try_init_fn,
+             s_match_show_outline_fn, s_match_show_team_outline_fn);
+    }
+
+    // GameSettingData.EnableShowPlayerOutline — call to unlock the outline permission gate
+    Il2CppClass *gsCls2 = Il2CppApi::getClass(img, "COW", "GameSettingData");
+    if (gsCls2) {
+        MethodInfo *enMth = Il2CppApi::getMethod(gsCls2, "EnableShowPlayerOutline", -1);
+        if (enMth && enMth->methodPointer)
+            s_gs_enable_outline_fn = enMth->methodPointer;
+        LOGI("[ESP] GameSettingData.EnableShowPlayerOutline=%p", s_gs_enable_outline_fn);
     }
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
@@ -583,18 +606,44 @@ static void hook_player_update(void *self, void *method) {
     // Fix: global counter mod small number → fires for EVERY player frequently.
     // Pass nullptr for MethodInfo* — method here is Player.Update's MethodInfo,
     // which is wrong for SetOutlineVisible. nullptr is safe; game ignores it.
-    if (s_esp && s_orig_set_outline_vis) {
-        ++s_global_outline_tick;
-        // Fire for this player every 30 global ticks (~0.5 sec at 60fps with 1 player,
-        // faster with more players — all players covered within 30 global Updates).
-        uint32_t slot = ((uintptr_t)self >> 12) & 0x1F; // 0-31 per-player bucket
-        if ((s_global_outline_tick % 30) == (slot % 30)) {
-            using ShowFn = void (*)(void *, uint8_t, int, void *);
-            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, nullptr);
-            static uint32_t s_sov_fire_cnt = 0;
-            if ((++s_sov_fire_cnt) <= 10)
-                LOGI("[ESP-DBG] proactive SOV(2,1) fire#%u self=%p slot=%u tick=%u",
-                    s_sov_fire_cnt, self, slot, s_global_outline_tick);
+    if (s_esp) {
+        // ── Once-per-match: call MatchGame.ShowPlayerOutline(true) on the game thread ──
+        // This is the game's own enemy-outline API. Calling it here (inside a hooked Unity
+        // Update) is safe — we're on the managed IL2CPP game thread with a valid context.
+        // s_matchgame_outline_done resets to false on every applyESP(false) call.
+        if (!s_matchgame_outline_done && s_match_get_inst_fn && s_match_show_outline_fn) {
+            using GetMatchFn = void *(*)(void *);  // static method, no this
+            void *mg = reinterpret_cast<GetMatchFn>(s_match_get_inst_fn)(nullptr);
+            if (mg) {
+                if (s_match_try_init_fn) {
+                    using TryInitFn = void (*)(void *, void *);
+                    reinterpret_cast<TryInitFn>(s_match_try_init_fn)(mg, nullptr);
+                    LOGI("[ESP-DBG] TryInitPlayerOutlineRes called mg=%p", mg);
+                }
+                using ShowOLFn = void (*)(void *, uint8_t, void *);
+                reinterpret_cast<ShowOLFn>(s_match_show_outline_fn)(mg, 1, nullptr);
+                LOGI("[ESP-DBG] ShowPlayerOutline(true) called mg=%p", mg);
+                if (s_match_show_team_outline_fn)
+                    reinterpret_cast<ShowOLFn>(s_match_show_team_outline_fn)(mg, 1, nullptr);
+                s_matchgame_outline_done = true;
+            } else {
+                LOGI("[ESP-DBG] GetMatch() returned null — will retry");
+            }
+        }
+
+        if (s_orig_set_outline_vis) {
+            ++s_global_outline_tick;
+            uint32_t slot = ((uintptr_t)self >> 12) & 0x1F;
+            if ((s_global_outline_tick % 30) == (slot % 30)) {
+                using ShowFn = void (*)(void *, uint8_t, int, void *);
+                // mode=0 → enemy outline, mode=1 → teammate outline; call both to cover all cases
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 0, nullptr);
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, nullptr);
+                static uint32_t s_sov_fire_cnt = 0;
+                if ((++s_sov_fire_cnt) <= 10)
+                    LOGI("[ESP-DBG] proactive SOV(2,0+1) fire#%u self=%p slot=%u tick=%u",
+                        s_sov_fire_cnt, self, slot, s_global_outline_tick);
+            }
         }
     }
     // ── Teleport tick ────────────────────────────────────────────────────────
