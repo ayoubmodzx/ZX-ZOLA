@@ -553,24 +553,10 @@ static void hook_player_update(void *self, void *method) {
     // MatchGame lazy-init fallback via Player.Update — fires every 60 frames (~1 sec).
     // Catches the case where ESP was enabled but no enemy triggered GetAttackableCenterWS yet.
     // MatchGame.GetMatch() is static, returns live singleton only when a match is active.
-    if (s_esp && s_res_id_get_inst && !s_res_id_inst) {
-        static int s_upd_retry = 0;
-        if (++s_upd_retry % 60 == 1) {
-            void *inst = nullptr;
-            using GetFn = void *(*)(void *);
-            inst = reinterpret_cast<GetFn>(s_res_id_get_inst)(nullptr);
-            if (inst) {
-                s_res_id_inst = inst;
-                if (s_res_id_try_init) { using Fn = void(*)(void*,void*); reinterpret_cast<Fn>(s_res_id_try_init)(inst,nullptr); }
-                if (s_res_id_show)     { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
-                LOGI("[ESP-DIAG] MatchGame init via Player.Update: inst=%p", inst);
-            }
-        }
-    }
+    // MatchGame lazy-init removed from hook context — GetMatch() called from IL2CPP
+    // hook thread causes a crash. Called directly from applyESP() instead (main thread).
 
-    // ESP effects (SetRenderQ / SetOutlineVisible) are applied per-enemy inside
-    // hook_get_attackable_center — NOT here, because Player.Update fires for the
-    // local player too and calling InitOutline/SetRenderQ on self causes a crash.
+    // ESP effects applied per-enemy in hook_get_attackable_center only (not here).
 
     // ── Teleport tick ────────────────────────────────────────────────────────
     if (s_orig_gettrans && s_orig_setpos && s_orig_getpos) {
@@ -662,25 +648,8 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
     // Lazy-init MatchGame singleton for ESP outline.
     // MatchGame.GetMatch() is the static accessor (confirmed via global-metadata.dat).
     // Fires when enemy is visible to aim system — guaranteed in-match with enemies nearby.
-    {
-        static bool s_mg_init_done = false;
-        static int  s_mg_retry     = 0;
-        if (s_esp && !s_mg_init_done && (++s_mg_retry % 30 == 1)) {
-            void *inst = nullptr;
-            if (s_res_id_get_inst) {
-                // MatchGame.GetMatch() — static, takes no meaningful args
-                using GetFn = void *(*)(void *);
-                inst = reinterpret_cast<GetFn>(s_res_id_get_inst)(nullptr);
-            }
-            if (inst) {
-                s_mg_init_done = true;
-                s_res_id_inst  = inst;
-                if (s_res_id_try_init) { using Fn = void(*)(void*,void*); reinterpret_cast<Fn>(s_res_id_try_init)(inst,nullptr); }
-                if (s_res_id_show)     { using Fn = void(*)(void*,uint8_t,void*); reinterpret_cast<Fn>(s_res_id_show)(inst,1,nullptr); }
-                LOGI("[ESP-DIAG] MatchGame in-game init OK via GetAttackable: inst=%p", inst);
-            }
-        }
-    }
+    // MatchGame lazy-init intentionally removed from hook context (crash in IL2CPP hook thread).
+    // MatchGame.ShowPlayerOutline is called once in applyESP() from safe main-thread context.
 
     // ESP: set enemy render queue to Transparent+500 (draws above walls, never OOB).
     // Neon outline is handled globally by MatchGame.ShowPlayerOutline(true) above —
@@ -698,7 +667,12 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         if (headT && s_orig_getpos) {
             using GetPosFn = Vec3 (*)(void *, void *);
             Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
-            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) return hp;
+            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
+                // Head bone sits at crown of mesh; head hitbox center is ~0.06m lower.
+                // -0.06f keeps aim visibly on head while landing inside the hitbox sphere.
+                hp.y -= 0.06f;
+                return hp;
+            }
         }
     }
     using Fn = Vec3 (*)(void *, void *);
