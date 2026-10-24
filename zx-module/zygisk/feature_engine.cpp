@@ -156,11 +156,19 @@ void FeatureEngine::resolveClasses() {
         Il2CppClass *component = Il2CppApi::getClass(unityImg, "UnityEngine", "Component");
         if (component)
             m_mth.getTransform = Il2CppApi::getMethod(component, "get_transform", 0);
-        // Collider.get_bounds() — returns Bounds{center(Vec3), extents(Vec3)} = world-space hitbox center.
-        // IL2CPP struct-return convention (ARM64): void get_bounds(Collider* this, Bounds* result, MethodInfo*)
-        Il2CppClass *colliderCls = Il2CppApi::getClass(unityImg, "UnityEngine", "Collider");
-        if (colliderCls)
-            m_mth.colliderGetBounds = Il2CppApi::getMethod(colliderCls, "get_bounds", 0);
+        // Collider.get_bounds() — in Unity 2019+ it lives in UnityEngine.PhysicsModule, not CoreModule.
+        // Search PhysicsModule first; fall back to whichever unity image we already have.
+        {
+            Il2CppImage *physImg = Il2CppApi::getImage("UnityEngine.PhysicsModule");
+            if (!physImg) physImg = Il2CppApi::getImage("UnityEngine.Physics");
+            Il2CppImage *imgs[] = { physImg, unityImg, nullptr };
+            for (int i = 0; !m_mth.colliderGetBounds && imgs[i]; ++i) {
+                if (!imgs[i]) continue;
+                Il2CppClass *colliderCls = Il2CppApi::getClass(imgs[i], "UnityEngine", "Collider");
+                if (colliderCls)
+                    m_mth.colliderGetBounds = Il2CppApi::getMethod(colliderCls, "get_bounds", 0);
+            }
+        }
         LOGI("[AIM] Collider.get_bounds=%p",
              m_mth.colliderGetBounds ? m_mth.colliderGetBounds->methodPointer : nullptr);
     }
@@ -578,6 +586,17 @@ static void hook_player_update(void *self, void *method) {
 
     // ESP effects applied per-enemy in hook_get_attackable_center only (not here).
 
+    // ── ESP proactive outline ─────────────────────────────────────────────────
+    // InitOutline fires once per player at spawn. If ESP was toggled on after spawn
+    // our hook_init_outline never saw them. Re-kick SetOutlineVisible(1) every 60
+    // Update ticks so late-join enemies get the neon outline without waiting for respawn.
+    if (s_esp && s_orig_set_outline_vis) {
+        if (++s_outline_tick >= 60) {
+            s_outline_tick = 0;
+            using ShowFn = void (*)(void *, uint8_t, void *);
+            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, method);
+        }
+    }
     // ── Teleport tick ────────────────────────────────────────────────────────
     if (s_orig_gettrans && s_orig_setpos && s_orig_getpos) {
         using GetTransFn = void *(*)(void *, void *);
@@ -735,7 +754,8 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 using GetPosFn = Vec3 (*)(void *, void *);
                 Vec3 tp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headTF, nullptr);
                 if (tp.x != 0.0f || tp.y != 0.0f || tp.z != 0.0f) {
-                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=GetHeadTF pos=(%.3f,%.3f,%.3f)", s_aim_cnt, tp.x, tp.y, tp.z);
+                    tp.y -= 0.10f;
+                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=GetHeadTF pos=(%.3f,%.3f,%.3f) adj_y=%.3f", s_aim_cnt, tp.x, tp.y + 0.10f, tp.z, tp.y);
                     return tp;
                 }
             }
