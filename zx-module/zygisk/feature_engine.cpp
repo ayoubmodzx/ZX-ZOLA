@@ -513,7 +513,8 @@ static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
 
 // ESP: SetOutlineVisible — binary-verified: pc=2 (uint8 visible, int mode).
 static void hook_set_outline_vis(void *self, uint8_t visible, int mode, void *method) {
-    uint8_t forced = (s_esp && visible == 0) ? 1 : visible;
+    // Game natively calls with visible=2 (outline on). Force 2 if game tries to hide (0).
+    uint8_t forced = (s_esp && visible == 0) ? 2 : visible;
     LOGI("[ESP-DBG] SetOutlineVisible: self=%p game_val=%d mode=%d forced=%d esp=%d", self, (int)visible, mode, (int)forced, (int)s_esp);
     using Fn = void (*)(void *, uint8_t, int, void *);
     reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, mode, method);
@@ -525,11 +526,11 @@ static void hook_init_outline(void *self, void *param0, void *method) {
     LOGI("[ESP-DBG] InitOutline fired: self=%p param0=%p esp=%d outline_fn=%p", self, param0, (int)s_esp, s_orig_set_outline_vis);
     using Fn = void (*)(void *, void *, void *);
     reinterpret_cast<Fn>(s_orig_init_outline)(self, param0, method);
-    LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(1,0)");
+    LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(2,1)");
     if (s_esp && s_orig_set_outline_vis) {
         using ShowFn = void (*)(void *, uint8_t, int, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, 1, method);
-        LOGI("[ESP-DBG] SetOutlineVisible(1,1) injected for self=%p", self);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, method);
+        LOGI("[ESP-DBG] SetOutlineVisible(2,1) injected for self=%p", self);
     } else {
         LOGI("[ESP-DBG] InitOutline: skipped inject (esp=%d fn=%p)", (int)s_esp, s_orig_set_outline_vis);
     }
@@ -600,7 +601,7 @@ static void hook_player_update(void *self, void *method) {
             if (++s_outline_tick >= 60) {
                 s_outline_tick = 0;
                 using ShowFn = void (*)(void *, uint8_t, int, void *);
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, 1, method);
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, method);
             }
         } else {
             static uint32_t s_esp_null_cnt = 0;
@@ -679,14 +680,15 @@ void FeatureEngine::applyRapidFire(bool enable) {
 // Force-return true when any headshot feature is active so every bullet counts.
 // Signature: bool CheckDamageHitHead(DamageInfo* info) — we pass through `info` unchanged.
 static uint8_t hook_check_dmg_hithead(void *self, void *info, void *method) {
+    LOGI("[HS-CRASH] hook_check_dmg_hithead ENTERED: self=%p info=%p method=%p hs=%d sa=%d fa=%d",
+         self, info, method, (int)s_auto_headshot, (int)s_silent_aim, (int)s_full_aimbot);
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
-        LOGI("[HS-DBG] CheckDamageHitHead: self=%p info=%p FORCED=1 (hs=%d sa=%d fa=%d)",
-             self, info, (int)s_auto_headshot, (int)s_silent_aim, (int)s_full_aimbot);
         return 1;
     }
+    LOGI("[HS-CRASH] CheckDamageHitHead: calling original trampoline=%p", s_orig_check_dmg_hithead);
     using Fn = uint8_t (*)(void *, void *, void *);
     uint8_t r = reinterpret_cast<Fn>(s_orig_check_dmg_hithead)(self, info, method);
-    LOGI("[HS-DBG] CheckDamageHitHead: self=%p info=%p orig=%d", self, info, (int)r);
+    LOGI("[HS-CRASH] CheckDamageHitHead: orig returned %d", (int)r);
     return r;
 }
 
@@ -726,71 +728,85 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         if (rq_log) LOGI("[ESP-DBG] SetRenderQ returned OK call#%u", s_rq_cnt);
     }
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
-        // Throttle diagnostic logging to every 60 calls (~1 second at 60fps)
         static uint32_t s_aim_cnt = 0;
-        bool do_log = ((++s_aim_cnt) % 60) == 1;
+        ++s_aim_cnt;
+        // Log every call for first 20, then every 60 — catches crashes on first execution
+        bool do_log = (s_aim_cnt <= 20) || ((s_aim_cnt % 60) == 1);
 
-        // Priority 1: Collider.bounds.center = exact world-space physics hitbox center.
-        // Collider.transform.position = bone crown (WRONG).
-        // Collider.bounds.center = center of physics capsule (CORRECT, matches server).
+        if (do_log) LOGI("[HS-CRASH] aim#%u ENTER self=%p collider_fn=%p bounds_fn=%p headtf_fn=%p bone_fn=%p getpos_fn=%p",
+            s_aim_cnt, self,
+            s_orig_get_head_collider, s_orig_collider_get_bounds,
+            s_orig_get_head_tf, s_orig_get_head_bone, s_orig_getpos);
+
+        // Priority 1: Collider.bounds.center — exact world-space physics hitbox center
         if (s_orig_get_head_collider && s_orig_collider_get_bounds) {
+            if (do_log) LOGI("[HS-CRASH] aim#%u calling get_HeadCollider fn=%p self=%p", s_aim_cnt, s_orig_get_head_collider, self);
             using GetColFn = void *(*)(void *, void *);
             void *col = reinterpret_cast<GetColFn>(s_orig_get_head_collider)(self, nullptr);
+            if (do_log) LOGI("[HS-CRASH] aim#%u get_HeadCollider returned col=%p", s_aim_cnt, col);
             if (col) {
                 struct UnityBounds { float cx, cy, cz, ex, ey, ez; };
                 UnityBounds bounds{};
+                if (do_log) LOGI("[HS-CRASH] aim#%u calling get_bounds fn=%p col=%p", s_aim_cnt, s_orig_collider_get_bounds, col);
                 using GetBoundsFn = void (*)(void *, UnityBounds *, void *);
                 reinterpret_cast<GetBoundsFn>(s_orig_collider_get_bounds)(col, &bounds, nullptr);
                 Vec3 hitboxCenter = {bounds.cx, bounds.cy, bounds.cz};
+                if (do_log) LOGI("[HS-CRASH] aim#%u get_bounds done center=(%.3f,%.3f,%.3f) ext=(%.3f,%.3f,%.3f)",
+                    s_aim_cnt, hitboxCenter.x, hitboxCenter.y, hitboxCenter.z, bounds.ex, bounds.ey, bounds.ez);
                 if (hitboxCenter.x != 0.0f || hitboxCenter.y != 0.0f || hitboxCenter.z != 0.0f) {
-                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=bounds col=%p center=(%.3f,%.3f,%.3f) ext=(%.3f,%.3f,%.3f)",
-                        s_aim_cnt, col, hitboxCenter.x, hitboxCenter.y, hitboxCenter.z,
-                        bounds.ex, bounds.ey, bounds.ez);
                     return hitboxCenter;
                 }
-                if (do_log) LOGI("[HS-DBG] aim#%u bounds.center=ZERO col=%p — falling back", s_aim_cnt, col);
+                if (do_log) LOGI("[HS-CRASH] aim#%u bounds.center=ZERO — falling back", s_aim_cnt);
             } else {
-                if (do_log) LOGI("[HS-DBG] aim#%u get_HeadCollider=NULL self=%p — falling back", s_aim_cnt, self);
+                if (do_log) LOGI("[HS-CRASH] aim#%u get_HeadCollider=NULL self=%p — falling back", s_aim_cnt, self);
             }
         } else {
-            if (do_log) LOGI("[HS-DBG] aim#%u bounds path SKIPPED: collider_fn=%p bounds_fn=%p",
+            if (do_log) LOGI("[HS-CRASH] aim#%u P1 SKIP: collider_fn=%p bounds_fn=%p",
                 s_aim_cnt, s_orig_get_head_collider, s_orig_collider_get_bounds);
         }
 
         // Priority 2: GetHeadTF (alternate head transform)
         if (s_orig_get_head_tf && s_orig_getpos) {
-            using GetTFFn  = void *(*)(void *, void *);
+            if (do_log) LOGI("[HS-CRASH] aim#%u calling GetHeadTF fn=%p self=%p", s_aim_cnt, s_orig_get_head_tf, self);
+            using GetTFFn = void *(*)(void *, void *);
             void *headTF = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(self, nullptr);
+            if (do_log) LOGI("[HS-CRASH] aim#%u GetHeadTF returned tf=%p", s_aim_cnt, headTF);
             if (headTF) {
+                if (do_log) LOGI("[HS-CRASH] aim#%u calling getpos on headTF fn=%p tf=%p", s_aim_cnt, s_orig_getpos, headTF);
                 using GetPosFn = Vec3 (*)(void *, void *);
                 Vec3 tp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headTF, nullptr);
+                if (do_log) LOGI("[HS-CRASH] aim#%u GetHeadTF.pos=(%.3f,%.3f,%.3f)", s_aim_cnt, tp.x, tp.y, tp.z);
                 if (tp.x != 0.0f || tp.y != 0.0f || tp.z != 0.0f) {
                     tp.y -= 0.15f;
-                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=GetHeadTF pos=(%.3f,%.3f,%.3f) adj_y=%.3f", s_aim_cnt, tp.x, tp.y + 0.15f, tp.z, tp.y);
                     return tp;
                 }
             }
-            if (do_log) LOGI("[HS-DBG] aim#%u GetHeadTF=null/zero — falling back", s_aim_cnt);
+            if (do_log) LOGI("[HS-CRASH] aim#%u P2 GetHeadTF=null/zero — falling back", s_aim_cnt);
+        } else {
+            if (do_log) LOGI("[HS-CRASH] aim#%u P2 SKIP: tf_fn=%p getpos_fn=%p", s_aim_cnt, s_orig_get_head_tf, s_orig_getpos);
         }
 
-        // Priority 3: head bone with -0.10m offset (mesh crown → physics center)
+        // Priority 3: head bone with -0.15m offset
         if (s_orig_get_head_bone && s_orig_getpos) {
+            if (do_log) LOGI("[HS-CRASH] aim#%u calling get_HeadBoneTransform fn=%p self=%p", s_aim_cnt, s_orig_get_head_bone, self);
             using GetBoneFn = void *(*)(void *, void *);
             void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, nullptr);
+            if (do_log) LOGI("[HS-CRASH] aim#%u get_HeadBoneTransform returned bone=%p", s_aim_cnt, headT);
             if (headT) {
+                if (do_log) LOGI("[HS-CRASH] aim#%u calling getpos on bone fn=%p bone=%p", s_aim_cnt, s_orig_getpos, headT);
                 using GetPosFn = Vec3 (*)(void *, void *);
                 Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
+                if (do_log) LOGI("[HS-CRASH] aim#%u bone.pos=(%.3f,%.3f,%.3f)", s_aim_cnt, hp.x, hp.y, hp.z);
                 if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
-                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=bone_offset bone=(%.3f,%.3f,%.3f) adj_y=%.3f",
-                        s_aim_cnt, hp.x, hp.y, hp.z, hp.y - 0.15f);
                     hp.y -= 0.15f;
                     return hp;
                 }
             }
+        } else {
+            if (do_log) LOGI("[HS-CRASH] aim#%u P3 SKIP: bone_fn=%p getpos_fn=%p", s_aim_cnt, s_orig_get_head_bone, s_orig_getpos);
         }
 
-        if (do_log) LOGI("[HS-DBG] aim#%u ALL paths failed — returning original. collider=%p bounds=%p bone=%p",
-            s_aim_cnt, s_orig_get_head_collider, s_orig_collider_get_bounds, s_orig_get_head_bone);
+        if (do_log) LOGI("[HS-CRASH] aim#%u ALL paths failed — returning original", s_aim_cnt);
     }
     using Fn = Vec3 (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
@@ -887,8 +903,13 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
     }
 
     // Hook GetAttackableCenterWS → head position
+    LOGI("[HS-CRASH] about to %s AimCenterHook calcAimTarget=%p ptr=%p",
+        enable ? "install" : "remove",
+        m_mth.calcAimTarget,
+        m_mth.calcAimTarget ? m_mth.calcAimTarget->methodPointer : nullptr);
     if (enable) installAimCenterHook(m_mth.calcAimTarget);
     else        removeAimCenterHook(m_mth.calcAimTarget);
+    LOGI("[HS-CRASH] AimCenterHook %s done trampoline=%p", enable ? "install" : "remove", s_orig_attackable_ctr);
 
     // If the singleton is already live (e.g. toggled mid-match), call immediately.
     // Otherwise hook_get_attackable_center will call it lazily on next enemy tick.
@@ -910,14 +931,19 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
     // CheckDamageHitHead / IsInNoHeadShotState — direct damage-gate hooks
     if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer) {
         if (enable && !s_orig_check_dmg_hithead) {
+            LOGI("[HS-CRASH] BEFORE hookAddr CheckDamageHitHead ptr=%p hook_fn=%p",
+                m_mth.checkDamageHitHead->methodPointer,
+                reinterpret_cast<void *>(hook_check_dmg_hithead));
             HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
-            LOGI("[AIM] CheckDamageHitHead hooked: trampoline=%p", s_orig_check_dmg_hithead);
+            LOGI("[HS-CRASH] AFTER hookAddr CheckDamageHitHead trampoline=%p", s_orig_check_dmg_hithead);
         } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_check_dmg_hithead) {
             HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
             s_orig_check_dmg_hithead = nullptr;
         }
-    } else { LOGE("[AIM] CheckDamageHitHead ptr null — fallback to aim-center only"); }
+    } else { LOGE("[HS-CRASH] CheckDamageHitHead mth=%p ptr=%s — fallback to aim-center only",
+        m_mth.checkDamageHitHead,
+        m_mth.checkDamageHitHead ? "NULL_method_ptr" : "NULL_mth"); }
 
     LOGI("AutoHeadshot: %s  center_hook=%p bone=%p collider=%p headTF=%p hithead=%p",
          enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone,
@@ -948,9 +974,11 @@ void FeatureEngine::applySilentAim(bool enable) {
         // Share the damage-gate hooks with AutoHeadshot
         if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer
                 && !s_orig_check_dmg_hithead) {
+            LOGI("[HS-CRASH] BEFORE hookAddr CheckDamageHitHead (SilentAim) ptr=%p",
+                m_mth.checkDamageHitHead->methodPointer);
             HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
-            LOGI("[AIM] CheckDamageHitHead hooked (SilentAim): trampoline=%p", s_orig_check_dmg_hithead);
+            LOGI("[HS-CRASH] AFTER hookAddr CheckDamageHitHead (SilentAim) trampoline=%p", s_orig_check_dmg_hithead);
         }
     } else {
         if (!s_auto_headshot && !s_full_aimbot) {
