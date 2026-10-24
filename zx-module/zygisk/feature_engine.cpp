@@ -528,8 +528,8 @@ static void hook_init_outline(void *self, void *param0, void *method) {
     LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(1,0)");
     if (s_esp && s_orig_set_outline_vis) {
         using ShowFn = void (*)(void *, uint8_t, int, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, 0, method);
-        LOGI("[ESP-DBG] SetOutlineVisible(1,0) injected for self=%p", self);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, 1, method);
+        LOGI("[ESP-DBG] SetOutlineVisible(1,1) injected for self=%p", self);
     } else {
         LOGI("[ESP-DBG] InitOutline: skipped inject (esp=%d fn=%p)", (int)s_esp, s_orig_set_outline_vis);
     }
@@ -595,11 +595,17 @@ static void hook_player_update(void *self, void *method) {
     // InitOutline fires once per player at spawn. If ESP was toggled on after spawn
     // our hook_init_outline never saw them. Re-kick SetOutlineVisible(1) every 60
     // Update ticks so late-join enemies get the neon outline without waiting for respawn.
-    if (s_esp && s_orig_set_outline_vis) {
-        if (++s_outline_tick >= 60) {
-            s_outline_tick = 0;
-            using ShowFn = void (*)(void *, uint8_t, int, void *);
-            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, 0, method);
+    if (s_esp) {
+        if (s_orig_set_outline_vis) {
+            if (++s_outline_tick >= 60) {
+                s_outline_tick = 0;
+                using ShowFn = void (*)(void *, uint8_t, int, void *);
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, 1, method);
+            }
+        } else {
+            static uint32_t s_esp_null_cnt = 0;
+            if ((++s_esp_null_cnt % 120) == 1)
+                LOGI("[ESP-DBG] Update tick#%u esp=1 but outline_fn=NULL — hook not installed", s_esp_null_cnt);
         }
     }
     // ── Teleport tick ────────────────────────────────────────────────────────
@@ -693,37 +699,6 @@ static uint8_t hook_no_headshot_state(void *self, void *method) {
     }
     using Fn = uint8_t (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_no_headshot_state)(self, method);
-}
-
-// TakeDamage(4) — fires on enemy Player instances during client-side prediction.
-// Binary analysis: pc=4, method index 210713. The first explicit param (x1) is DamageInfo*.
-// We scan bytes 0x10-0x40 in DamageInfo for a zero byte and set it to 1 when we find a
-// likely headshot flag. The scan runs only under aimbot modes so normal play is unaffected.
-// Log throttled: prints DamageInfo hex dump every 30 calls for runtime struct discovery.
-static void hook_take_damage_4(void *self, void *p0, void *p1, void *p2, void *p3, void *method) {
-    static uint32_t s_td_cnt = 0;
-    bool do_log = (s_auto_headshot || s_silent_aim || s_full_aimbot) &&
-                  ((++s_td_cnt) % 30) == 1;
-    if (do_log && p0) {
-        // Dump first 64 bytes of DamageInfo (p0) for runtime struct analysis.
-        const uint8_t *d = reinterpret_cast<const uint8_t *>(p0);
-        LOGI("[HS-TDM] TakeDamage4: self=%p p0=%p p1=%p p2=%p p3=%p call#%u",
-             self, p0, p1, p2, p3, s_td_cnt);
-        LOGI("[HS-TDM] DInfo[00-15]: %02x %02x %02x %02x  %02x %02x %02x %02x  "
-             "%02x %02x %02x %02x  %02x %02x %02x %02x",
-             d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
-             d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
-        LOGI("[HS-TDM] DInfo[16-31]: %02x %02x %02x %02x  %02x %02x %02x %02x  "
-             "%02x %02x %02x %02x  %02x %02x %02x %02x",
-             d[16],d[17],d[18],d[19],d[20],d[21],d[22],d[23],
-             d[24],d[25],d[26],d[27],d[28],d[29],d[30],d[31]);
-        LOGI("[HS-TDM] DInfo[32-47]: %02x %02x %02x %02x  %02x %02x %02x %02x  "
-             "%02x %02x %02x %02x  %02x %02x %02x %02x",
-             d[32],d[33],d[34],d[35],d[36],d[37],d[38],d[39],
-             d[40],d[41],d[42],d[43],d[44],d[45],d[46],d[47]);
-    }
-    using Fn = void (*)(void *, void *, void *, void *, void *, void *);
-    reinterpret_cast<Fn>(s_orig_take_damage_4)(self, p0, p1, p2, p3, method);
 }
 
 // GetAttackableCenterWS — redirect aim center to head bone when auto-hs / silent-aim / aimbot on
@@ -944,23 +919,9 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         }
     } else { LOGE("[AIM] CheckDamageHitHead ptr null — fallback to aim-center only"); }
 
-    // TakeDamage(4) hook — fires during client-side prediction on enemy instances.
-    // Used to log DamageInfo struct bytes for runtime field discovery.
-    if (m_mth.takeDamage4 && m_mth.takeDamage4->methodPointer) {
-        if (enable && !s_orig_take_damage_4) {
-            HookEngine::get().hookAddr(m_mth.takeDamage4->methodPointer,
-                reinterpret_cast<void *>(hook_take_damage_4), &s_orig_take_damage_4, "TakeDamage4");
-            LOGI("[AIM] TakeDamage4 hooked: trampoline=%p", s_orig_take_damage_4);
-        } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_take_damage_4) {
-            HookEngine::get().unhook(m_mth.takeDamage4->methodPointer);
-            s_orig_take_damage_4 = nullptr;
-        }
-    } else { LOGE("[AIM] TakeDamage4 ptr null — DamageInfo logging unavailable"); }
-
-    LOGI("AutoHeadshot: %s  center_hook=%p bone=%p collider=%p headTF=%p hithead=%p td4=%p",
+    LOGI("AutoHeadshot: %s  center_hook=%p bone=%p collider=%p headTF=%p hithead=%p",
          enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone,
-         s_orig_get_head_collider, s_orig_get_head_tf, s_orig_check_dmg_hithead,
-         s_orig_take_damage_4);
+         s_orig_get_head_collider, s_orig_get_head_tf, s_orig_check_dmg_hithead);
 }
 
 void FeatureEngine::applySilentAim(bool enable) {
@@ -1253,15 +1214,20 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("ESP: HUD method not resolved — enemies visible in culling only, no boxes");
     }
 
-    // Layer 3: SetOutlineVisible — store pointer for direct calls in per-frame hooks.
-    // We do NOT hook the function (interception caused crashes via mode enum mismatch).
-    // Instead we call it directly with value=1 from GetAttackableCenterWS / Player.Update.
+    // Layer 3: SetOutlineVisible — Dobby hook (signature fixed: pc=2 → uint8_t visible, int mode).
+    // Hooks every game call so visible=0 is forced to 1; trampoline fills s_orig_set_outline_vis.
     if (m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
-        if (enable)
-            s_orig_set_outline_vis = m_mth.setOutlineVisible->methodPointer;
-        else
+        if (enable && !s_orig_set_outline_vis) {
+            HookEngine::get().hookAddr(m_mth.setOutlineVisible->methodPointer,
+                reinterpret_cast<void *>(hook_set_outline_vis), &s_orig_set_outline_vis, "ESP-SetOutlineVis");
+            LOGI("[ESP-DIAG] Layer3 SetOutlineVisible HOOKED trampoline=%p", s_orig_set_outline_vis);
+        } else if (!enable && s_orig_set_outline_vis) {
+            HookEngine::get().unhook(m_mth.setOutlineVisible->methodPointer);
             s_orig_set_outline_vis = nullptr;
-        LOGI("[ESP-DIAG] Layer3 ptr=%p (direct-call mode, no hook)", s_orig_set_outline_vis);
+            LOGI("[ESP-DIAG] Layer3 SetOutlineVisible unhooked");
+        } else {
+            LOGI("[ESP-DIAG] Layer3 ptr=%p (already in target state)", s_orig_set_outline_vis);
+        }
     } else {
         LOGE("[ESP-DIAG] Layer3 SKIP — SetOutlineVisible ptr null");
     }
