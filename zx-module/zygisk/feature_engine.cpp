@@ -767,7 +767,15 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
             if (do_log) LOGI("[HS-CRASH] aim#%u P3 SKIP: bone_fn=%p getpos_fn=%p", s_aim_cnt, s_orig_get_head_bone, s_orig_getpos);
         }
 
-        if (do_log) LOGI("[HS-CRASH] aim#%u ALL paths failed — returning original", s_aim_cnt);
+        // Priority LAST: all specialized head methods failed/null — shift original center up ~0.55m
+        // This works unconditionally since s_orig_attackable_ctr trampoline is always valid when we get here.
+        {
+            using Fn = Vec3 (*)(void *, void *);
+            Vec3 orig = reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
+            orig.y += 0.55f;
+            if (do_log) LOGI("[HS-CRASH] aim#%u YSHIFT fallback orig+0.55=(%.3f,%.3f,%.3f)", s_aim_cnt, orig.x, orig.y, orig.z);
+            return orig;
+        }
     }
     using Fn = Vec3 (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
