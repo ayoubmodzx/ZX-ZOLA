@@ -498,11 +498,9 @@ static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
 }
 
 // ESP: SetOutlineVisible — keep neon outline on for every player when ESP active.
-// The game passes 16 (0x10) for full enemy outline mode, not a plain bool.
-// Rule: if ESP is ON and game tries to HIDE (visible==0), force to 16 instead.
-//       If game passes any non-zero mode, let it through unchanged.
 static void hook_set_outline_vis(void *self, uint8_t visible, void *method) {
-    uint8_t forced = (s_esp && visible == 0) ? 16 : visible;
+    uint8_t forced = (s_esp && visible == 0) ? 1 : visible;
+    LOGI("[ESP-DBG] SetOutlineVisible: self=%p game_val=%d forced=%d esp=%d", self, (int)visible, (int)forced, (int)s_esp);
     using Fn = void (*)(void *, uint8_t, void *);
     reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, method);
 }
@@ -511,11 +509,16 @@ static void hook_set_outline_vis(void *self, uint8_t visible, void *method) {
 // Handles enemies spawning after ESP is toggled (game never calls SetOutlineVisible on them).
 // FIXED: value must be 1 (bool true), NOT 16 — 16 indexes into a color-mode table OOB → crash.
 static void hook_init_outline(void *self, void *method) {
+    LOGI("[ESP-DBG] InitOutline fired: self=%p esp=%d outline_fn=%p", self, (int)s_esp, s_orig_set_outline_vis);
     using Fn = void (*)(void *, void *);
     reinterpret_cast<Fn>(s_orig_init_outline)(self, method);
+    LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(1)");
     if (s_esp && s_orig_set_outline_vis) {
         using ShowFn = void (*)(void *, uint8_t, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, method);
+        LOGI("[ESP-DBG] SetOutlineVisible(1) injected for self=%p", self);
+    } else {
+        LOGI("[ESP-DBG] InitOutline: skipped inject (esp=%d fn=%p)", (int)s_esp, s_orig_set_outline_vis);
     }
 }
 
@@ -646,15 +649,24 @@ void FeatureEngine::applyRapidFire(bool enable) {
 // Force-return true when any headshot feature is active so every bullet counts.
 // Signature: bool CheckDamageHitHead(DamageInfo* info) — we pass through `info` unchanged.
 static uint8_t hook_check_dmg_hithead(void *self, void *info, void *method) {
-    if (s_auto_headshot || s_silent_aim || s_full_aimbot) return 1;
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
+        LOGI("[HS-DBG] CheckDamageHitHead: self=%p info=%p FORCED=1 (hs=%d sa=%d fa=%d)",
+             self, info, (int)s_auto_headshot, (int)s_silent_aim, (int)s_full_aimbot);
+        return 1;
+    }
     using Fn = uint8_t (*)(void *, void *, void *);
-    return reinterpret_cast<Fn>(s_orig_check_dmg_hithead)(self, info, method);
+    uint8_t r = reinterpret_cast<Fn>(s_orig_check_dmg_hithead)(self, info, method);
+    LOGI("[HS-DBG] CheckDamageHitHead: self=%p info=%p orig=%d", self, info, (int)r);
+    return r;
 }
 
 // IsInNoHeadShotState — returns true when player is in a state where headshots are blocked
 // (e.g. special armor, skill effects). Force-return false so the block is bypassed.
 static uint8_t hook_no_headshot_state(void *self, void *method) {
-    if (s_auto_headshot || s_silent_aim || s_full_aimbot) return 0;
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
+        LOGI("[HS-DBG] IsInNoHeadShotState: self=%p FORCED=0 (bypassed)", self);
+        return 0;
+    }
     using Fn = uint8_t (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_no_headshot_state)(self, method);
 }
@@ -676,17 +688,21 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
     // Only SetRenderQ here — InitOutline fires naturally from game; MatchGame calls
     // were crashing because both called with nullptr MethodInfo* on first enemy tick.
     if (s_esp && s_orig_set_render_q) {
-        static bool s_esp_ac_first = true;
-        if (s_esp_ac_first) { s_esp_ac_first = false; LOGI("[ESP-DIAG] ESP via GetAttackableCenterWS: self=%p", self); }
+        static uint32_t s_rq_cnt = 0;
+        bool rq_log = ((++s_rq_cnt) % 120) == 1;
+        if (rq_log) LOGI("[ESP-DBG] SetRenderQ(5000) call#%u self=%p fn=%p", s_rq_cnt, self, s_orig_set_render_q);
         using SetRQFn = void (*)(void *, int, void *);
         reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
+        if (rq_log) LOGI("[ESP-DBG] SetRenderQ returned OK call#%u", s_rq_cnt);
     }
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
-        // Priority: use Collider.bounds.center = exact world-space physics hitbox center.
-        // Collider.transform.position = position of the attached GameObject (= bone crown, WRONG).
-        // Collider.bounds.center     = world-space center of the physics capsule/sphere (CORRECT).
-        // IL2CPP struct-return ARM64: void get_bounds(Collider* this, Bounds* result, MethodInfo*)
-        // Bounds = { Vector3 center; Vector3 extents; } = 6 floats = 24 bytes.
+        // Throttle diagnostic logging to every 60 calls (~1 second at 60fps)
+        static uint32_t s_aim_cnt = 0;
+        bool do_log = ((++s_aim_cnt) % 60) == 1;
+
+        // Priority 1: Collider.bounds.center = exact world-space physics hitbox center.
+        // Collider.transform.position = bone crown (WRONG).
+        // Collider.bounds.center = center of physics capsule (CORRECT, matches server).
         if (s_orig_get_head_collider && s_orig_collider_get_bounds) {
             using GetColFn = void *(*)(void *, void *);
             void *col = reinterpret_cast<GetColFn>(s_orig_get_head_collider)(self, nullptr);
@@ -697,25 +713,36 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 reinterpret_cast<GetBoundsFn>(s_orig_collider_get_bounds)(col, &bounds, nullptr);
                 Vec3 hitboxCenter = {bounds.cx, bounds.cy, bounds.cz};
                 if (hitboxCenter.x != 0.0f || hitboxCenter.y != 0.0f || hitboxCenter.z != 0.0f) {
-                    LOGI("[AIM-DBG] bounds.center=(%.3f,%.3f,%.3f)", hitboxCenter.x, hitboxCenter.y, hitboxCenter.z);
+                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=bounds col=%p center=(%.3f,%.3f,%.3f) ext=(%.3f,%.3f,%.3f)",
+                        s_aim_cnt, col, hitboxCenter.x, hitboxCenter.y, hitboxCenter.z,
+                        bounds.ex, bounds.ey, bounds.ez);
                     return hitboxCenter;
                 }
+                if (do_log) LOGI("[HS-DBG] aim#%u bounds.center=ZERO col=%p — falling back", s_aim_cnt, col);
+            } else {
+                if (do_log) LOGI("[HS-DBG] aim#%u get_HeadCollider=NULL self=%p — falling back", s_aim_cnt, self);
             }
+        } else {
+            if (do_log) LOGI("[HS-DBG] aim#%u bounds path SKIPPED: collider_fn=%p bounds_fn=%p",
+                s_aim_cnt, s_orig_get_head_collider, s_orig_collider_get_bounds);
         }
-        // Fallback: GetHeadTF (alternate head transform, may differ from bone crown)
+
+        // Priority 2: GetHeadTF (alternate head transform)
         if (s_orig_get_head_tf && s_orig_getpos) {
             using GetTFFn  = void *(*)(void *, void *);
             void *headTF = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(self, nullptr);
             if (headTF) {
                 using GetPosFn = Vec3 (*)(void *, void *);
                 Vec3 tp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headTF, nullptr);
-                if (tp.x != 0.0f || tp.y != 0.0f || tp.z != 0.0f)
+                if (tp.x != 0.0f || tp.y != 0.0f || tp.z != 0.0f) {
+                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=GetHeadTF pos=(%.3f,%.3f,%.3f)", s_aim_cnt, tp.x, tp.y, tp.z);
                     return tp;
+                }
             }
+            if (do_log) LOGI("[HS-DBG] aim#%u GetHeadTF=null/zero — falling back", s_aim_cnt);
         }
-        // Last resort: head bone transform with empirical offset.
-        // HeadBone is at the mesh crown; server head hitbox center is ~0.10m lower.
-        // -0.10f covers standing enemies where lag compensation provides no margin.
+
+        // Priority 3: head bone with -0.10m offset (mesh crown → physics center)
         if (s_orig_get_head_bone && s_orig_getpos) {
             using GetBoneFn = void *(*)(void *, void *);
             void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, nullptr);
@@ -723,11 +750,16 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 using GetPosFn = Vec3 (*)(void *, void *);
                 Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
                 if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
+                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=bone_offset bone=(%.3f,%.3f,%.3f) adj_y=%.3f",
+                        s_aim_cnt, hp.x, hp.y, hp.z, hp.y - 0.10f);
                     hp.y -= 0.10f;
                     return hp;
                 }
             }
         }
+
+        if (do_log) LOGI("[HS-DBG] aim#%u ALL paths failed — returning original. collider=%p bounds=%p bone=%p",
+            s_aim_cnt, s_orig_get_head_collider, s_orig_collider_get_bounds, s_orig_get_head_bone);
     }
     using Fn = Vec3 (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
