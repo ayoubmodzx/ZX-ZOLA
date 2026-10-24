@@ -505,26 +505,25 @@ static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
     reinterpret_cast<Fn>(s_orig_hud_show)(self, forced, method);
 }
 
-// ESP: SetOutlineVisible — keep neon outline on for every player when ESP active.
-static void hook_set_outline_vis(void *self, uint8_t visible, void *method) {
+// ESP: SetOutlineVisible — binary-verified: pc=2 (uint8 visible, int mode).
+static void hook_set_outline_vis(void *self, uint8_t visible, int mode, void *method) {
     uint8_t forced = (s_esp && visible == 0) ? 1 : visible;
-    LOGI("[ESP-DBG] SetOutlineVisible: self=%p game_val=%d forced=%d esp=%d", self, (int)visible, (int)forced, (int)s_esp);
-    using Fn = void (*)(void *, uint8_t, void *);
-    reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, method);
+    LOGI("[ESP-DBG] SetOutlineVisible: self=%p game_val=%d mode=%d forced=%d esp=%d", self, (int)visible, mode, (int)forced, (int)s_esp);
+    using Fn = void (*)(void *, uint8_t, int, void *);
+    reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, mode, method);
 }
 
-// ESP: InitOutline() — inject SetOutlineVisible(true) right after each player's outline init
-// Handles enemies spawning after ESP is toggled (game never calls SetOutlineVisible on them).
-// FIXED: value must be 1 (bool true), NOT 16 — 16 indexes into a color-mode table OOB → crash.
-static void hook_init_outline(void *self, void *method) {
-    LOGI("[ESP-DBG] InitOutline fired: self=%p esp=%d outline_fn=%p", self, (int)s_esp, s_orig_set_outline_vis);
-    using Fn = void (*)(void *, void *);
-    reinterpret_cast<Fn>(s_orig_init_outline)(self, method);
-    LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(1)");
+// ESP: InitOutline() — binary-verified: pc=1 (one explicit param before MethodInfo*).
+// Inject SetOutlineVisible(self, 1, 0) right after each player's outline init.
+static void hook_init_outline(void *self, void *param0, void *method) {
+    LOGI("[ESP-DBG] InitOutline fired: self=%p param0=%p esp=%d outline_fn=%p", self, param0, (int)s_esp, s_orig_set_outline_vis);
+    using Fn = void (*)(void *, void *, void *);
+    reinterpret_cast<Fn>(s_orig_init_outline)(self, param0, method);
+    LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(1,0)");
     if (s_esp && s_orig_set_outline_vis) {
-        using ShowFn = void (*)(void *, uint8_t, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, method);
-        LOGI("[ESP-DBG] SetOutlineVisible(1) injected for self=%p", self);
+        using ShowFn = void (*)(void *, uint8_t, int, void *);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, 0, method);
+        LOGI("[ESP-DBG] SetOutlineVisible(1,0) injected for self=%p", self);
     } else {
         LOGI("[ESP-DBG] InitOutline: skipped inject (esp=%d fn=%p)", (int)s_esp, s_orig_set_outline_vis);
     }
@@ -593,8 +592,8 @@ static void hook_player_update(void *self, void *method) {
     if (s_esp && s_orig_set_outline_vis) {
         if (++s_outline_tick >= 60) {
             s_outline_tick = 0;
-            using ShowFn = void (*)(void *, uint8_t, void *);
-            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, method);
+            using ShowFn = void (*)(void *, uint8_t, int, void *);
+            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, 0, method);
         }
     }
     // ── Teleport tick ────────────────────────────────────────────────────────
