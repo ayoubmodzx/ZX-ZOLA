@@ -409,6 +409,9 @@ static void        *s_res_id_show          = nullptr;  // ResourceIDDef.ShowPlay
 static void        *s_res_id_only_headshot = nullptr;  // ResourceIDDef.set_OnlyHeadshot(bool)
 static Il2CppClass *s_res_id_cls           = nullptr;  // ResourceIDDef class (for field scan)
 static void        *s_res_id_inst          = nullptr;  // cached singleton instance (set after lazy-init)
+// Flag: ShowPlayerOutline(true) was successfully called this match session.
+// Reset on applyESP(false) so next enable tries again.
+static bool         s_matchgame_outline_done = false;
 
 // RecoilFormula — returns float; extra void* params absorb any signature variant
 static float hook_recoil(void *self, void *a1, void *a2, void *a3, void *a4) {
@@ -676,6 +679,25 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 reinterpret_cast<InitFn>(s_initoutline_hooked_addr)(self, nullptr);
             }
         }
+        // MatchGame.ShowPlayerOutline(true) — global neon outline enable.
+        // Called ONCE per match session from here (game's own update thread = safe managed context).
+        // applyESP() runs on socket thread which lacks managed context → moved here.
+        if (!s_matchgame_outline_done && s_res_id_get_inst) {
+            using GetInstFn = void *(*)(void *);
+            void *inst = reinterpret_cast<GetInstFn>(s_res_id_get_inst)(nullptr);
+            if (inst) {
+                if (s_res_id_try_init) {
+                    using TryInitFn = void (*)(void *, void *);
+                    reinterpret_cast<TryInitFn>(s_res_id_try_init)(inst, nullptr);
+                }
+                if (s_res_id_show) {
+                    using ShowFn = void (*)(void *, uint8_t, void *);
+                    reinterpret_cast<ShowFn>(s_res_id_show)(inst, 1, nullptr);
+                }
+                s_matchgame_outline_done = true;
+                LOGI("[ESP-DIAG] MatchGame.ShowPlayerOutline(true) called (game thread, inst=%p)", inst);
+            }
+        }
     }
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
         // Priority: use the REAL physics head collider (= exact server-side hitbox position).
@@ -707,7 +729,9 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                     return tp;
             }
         }
-        // Last resort: head bone transform with empirical 0.06m down-offset
+        // Last resort: head bone transform with empirical offset.
+        // HeadBone is at the mesh crown; server head hitbox center is ~0.10m lower.
+        // -0.10f covers standing enemies where lag compensation provides no margin.
         if (s_orig_get_head_bone && s_orig_getpos) {
             using GetBoneFn = void *(*)(void *, void *);
             void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, nullptr);
@@ -715,7 +739,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 using GetPosFn = Vec3 (*)(void *, void *);
                 Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
                 if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
-                    hp.y -= 0.06f;
+                    hp.y -= 0.10f;
                     return hp;
                 }
             }
@@ -846,8 +870,9 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         }
     } else { LOGE("[AIM] CheckDamageHitHead ptr null — fallback to aim-center only"); }
 
-    LOGI("AutoHeadshot: %s  center_hook=%p head_bone=%p hithead=%p",
-         enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone, s_orig_check_dmg_hithead);
+    LOGI("AutoHeadshot: %s  center_hook=%p bone=%p collider=%p headTF=%p hithead=%p",
+         enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone,
+         s_orig_get_head_collider, s_orig_get_head_tf, s_orig_check_dmg_hithead);
 }
 
 void FeatureEngine::applySilentAim(bool enable) {
@@ -1212,51 +1237,13 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("[ESP-DIAG] Layer6 SKIP — SetRenderQ ptr null");
     }
 
-    // Global: ResourceIDDef.TryInitPlayerOutlineRes + ShowPlayerOutline(true).
-    // Unlocks the game's outline pipeline so individual player SetOutlineVisible calls take effect.
-    {
-        void *inst = nullptr;
-        // Primary: method-based singleton getter
-        if (m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer) {
-            using GetInstFn = void *(*)(void *);
-            inst = reinterpret_cast<GetInstFn>(m_mth.resIdGetInstance->methodPointer)(nullptr);
-        }
-        // Fallback: read C# static singleton backing field directly
-        if (!inst && m_cls.ResIdDef) {
-            static const char *kFields[] = {
-                "s_Instance","m_Instance","s_instance","m_instance",
-                "instance","Instance","_instance","<Instance>k__BackingField",nullptr
-            };
-            for (int i = 0; kFields[i]; ++i) {
-                FieldInfo *fld = Il2CppApi::getField(m_cls.ResIdDef, kFields[i]);
-                if (fld) {
-                    Il2CppApi::getStaticValue(fld, &inst);
-                    if (inst) { LOGI("[ESP-DIAG] ResIDDef singleton via field '%s'=%p", kFields[i], inst); break; }
-                    inst = nullptr;
-                }
-            }
-        }
-        LOGI("[ESP-DIAG] ResourceIDDef instance=%p (method_ptr=%p)", inst,
-             m_mth.resIdGetInstance ? m_mth.resIdGetInstance->methodPointer : nullptr);
-        if (enable && inst) {
-            if (m_mth.tryInitOutlineRes && m_mth.tryInitOutlineRes->methodPointer) {
-                using InitResFn = void (*)(void *, void *);
-                reinterpret_cast<InitResFn>(m_mth.tryInitOutlineRes->methodPointer)(inst, nullptr);
-                LOGI("[ESP-DIAG] TryInitPlayerOutlineRes() called");
-            }
-            if (m_mth.showPlayerOutline && m_mth.showPlayerOutline->methodPointer) {
-                using ShowFn = void (*)(void *, uint8_t, void *);
-                reinterpret_cast<ShowFn>(m_mth.showPlayerOutline->methodPointer)(inst, 1, nullptr);
-                LOGI("[ESP-DIAG] ShowPlayerOutline(true) called");
-            }
-        }
-    }
-    // GameSettingData.EnableShowPlayerOutline — method-based gate
-    if (m_mth.enableOutlineMth && m_mth.enableOutlineMth->methodPointer) {
-        using EnableFn = void (*)(uint8_t, void *);
-        reinterpret_cast<EnableFn>(m_mth.enableOutlineMth->methodPointer)(enable ? 1 : 0, nullptr);
-        LOGI("[ESP-DIAG] EnableShowPlayerOutline(%d) called", (int)enable);
-    }
+    // MatchGame.ShowPlayerOutline(true) is deferred to hook_get_attackable_center.
+    // Reason: applyESP runs on the socket server thread (raw pthread, no IL2CPP managed context).
+    // Calling managed IL2CPP singletons from that thread crashes. The aim hook runs on the
+    // game's own update thread which has managed context — safe to call GetMatch() there.
+    // Reset the once-flag so the next match session re-enables the outline.
+    if (!enable) s_matchgame_outline_done = false;
+    LOGI("[ESP-DIAG] MatchGame.ShowPlayerOutline deferred to game thread (flag reset=%d)", !enable);
 
     // Layer 7: GetAttackableCenterWS hook — fires on each enemy the aim system processes.
     // Guarantees SetRenderQ + SetOutlineVisible reach enemy instances even when
