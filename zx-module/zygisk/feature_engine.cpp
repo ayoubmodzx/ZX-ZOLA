@@ -67,6 +67,10 @@ void FeatureEngine::resolveClasses() {
     // Headshot / Aimbot methods — all on Player
     if (m_cls.Player) {
         m_mth.getHeadBoneTransform = Il2CppApi::getMethod(m_cls.Player, "get_HeadBoneTransform", 0);
+        // Binary-verified: get_HeadCollider returns the PHYSICS Collider (= real server-side hitbox)
+        // GetHeadTF returns a Transform at the head (may differ from bone crown)
+        m_mth.getHeadCollider      = Il2CppApi::getMethod(m_cls.Player, "get_HeadCollider",      0);
+        m_mth.getHeadTF            = Il2CppApi::getMethod(m_cls.Player, "GetHeadTF",             0);
         m_mth.setAimRotation       = Il2CppApi::getMethod(m_cls.Player, "SetAimRotation",        -1);
         m_mth.updateAiming         = Il2CppApi::getMethod(m_cls.Player, "UpdateAiming",          -1);
         m_mth.hasHeuristicTarget   = Il2CppApi::getMethod(m_cls.Player, "HasHeuristicTarget",     0);
@@ -79,6 +83,9 @@ void FeatureEngine::resolveClasses() {
              m_mth.updateAiming       ? m_mth.updateAiming->methodPointer       : nullptr,
              m_mth.hasHeuristicTarget ? m_mth.hasHeuristicTarget->methodPointer : nullptr,
              m_mth.getHeuristicTarget ? m_mth.getHeuristicTarget->methodPointer : nullptr);
+        LOGI("[AIM] get_HeadCollider=%p GetHeadTF=%p",
+             m_mth.getHeadCollider ? m_mth.getHeadCollider->methodPointer : nullptr,
+             m_mth.getHeadTF       ? m_mth.getHeadTF->methodPointer       : nullptr);
         // Headshot gate hooks — override at the damage-hit-check level
         m_mth.checkDamageHitHead  = Il2CppApi::getMethod(m_cls.Player, "CheckDamageHitHead",  -1);
         m_mth.isInNoHeadShotState = Il2CppApi::getMethod(m_cls.Player, "IsInNoHeadShotState", -1);
@@ -385,12 +392,16 @@ static void *s_orig_update    = nullptr;  // Player.Update (teleport tick)
 // Headshot / aimbot orig pointers
 static void *s_orig_attackable_ctr      = nullptr;  // Player.GetAttackableCenterWS
 static void *s_orig_get_head_bone       = nullptr;  // Player.get_HeadBoneTransform
+static void *s_orig_get_head_collider   = nullptr;  // Player.get_HeadCollider() — real physics hitbox
+static void *s_orig_get_head_tf         = nullptr;  // Player.GetHeadTF() — alternative head transform
 static void *s_orig_set_aim_rot         = nullptr;  // Player.SetAimRotation
 static void *s_orig_update_aiming       = nullptr;  // Player.UpdateAiming
 static void *s_orig_has_heuristic       = nullptr;  // Player.HasHeuristicTarget
 static void *s_orig_get_heuristic       = nullptr;  // Player.GetHeuristicTarget
 static void *s_orig_check_dmg_hithead   = nullptr;  // Player.CheckDamageHitHead
 static void *s_orig_no_headshot_state   = nullptr;  // Player.IsInNoHeadShotState
+// InitOutline hooked target address — calling this address goes through our hook
+static void *s_initoutline_hooked_addr  = nullptr;
 // ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
 static void        *s_res_id_get_inst      = nullptr;  // ResourceIDDef.GetInstance()
 static void        *s_res_id_try_init      = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
@@ -486,19 +497,14 @@ static void hook_set_outline_vis(void *self, uint8_t visible, void *method) {
 }
 
 // ESP: InitOutline() — inject SetOutlineVisible(true) right after each player's outline init
-// Handles enemies spawning after ESP is toggled (game never calls SetOutlineVisible on them)
+// Handles enemies spawning after ESP is toggled (game never calls SetOutlineVisible on them).
+// FIXED: value must be 1 (bool true), NOT 16 — 16 indexes into a color-mode table OOB → crash.
 static void hook_init_outline(void *self, void *method) {
-    LOGI("[ESP-DIAG] InitOutline called: player=%p esp_on=%d outline_trampoline=%p",
-         self, (int)s_esp, s_orig_set_outline_vis);
     using Fn = void (*)(void *, void *);
     reinterpret_cast<Fn>(s_orig_init_outline)(self, method);
     if (s_esp && s_orig_set_outline_vis) {
-        LOGI("[ESP-DIAG] InitOutline: injecting SetOutlineVisible(16) on player=%p", self);
         using ShowFn = void (*)(void *, uint8_t, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, nullptr);
-    } else {
-        LOGI("[ESP-DIAG] InitOutline: skipped inject — esp=%d trampoline=%p",
-             (int)s_esp, s_orig_set_outline_vis);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
     }
 }
 
@@ -651,27 +657,67 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
     // MatchGame lazy-init intentionally removed from hook context (crash in IL2CPP hook thread).
     // MatchGame.ShowPlayerOutline is called once in applyESP() from safe main-thread context.
 
-    // ESP: set enemy render queue to Transparent+500 (draws above walls, never OOB).
-    // Neon outline is handled globally by MatchGame.ShowPlayerOutline(true) above —
-    // no per-player SetOutlineVisible needed (calling it without a prior InitOutline
-    // on that instance = null-deref crash inside the outline renderer).
+    // ESP: set enemy render queue to Transparent layer (renders above walls).
+    // Per-enemy InitOutline + SetOutlineVisible(1) is injected every ~90 calls via the
+    // hooked InitOutline address — this goes through hook_init_outline which runs
+    // original + SetOutlineVisible(1), covering enemies present before ESP was toggled.
     if (s_esp && s_orig_set_render_q) {
         static bool s_esp_ac_first = true;
         if (s_esp_ac_first) { s_esp_ac_first = false; LOGI("[ESP-DIAG] ESP via GetAttackableCenterWS: self=%p", self); }
         using SetRQFn = void (*)(void *, int, void *);
         reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 3000, nullptr);
+        // Proactive outline: call through hooked InitOutline every 90 frames globally.
+        // hook_init_outline runs: original InitOutline → SetOutlineVisible(self, 1).
+        // This covers enemies that spawned before ESP was enabled.
+        if (s_initoutline_hooked_addr) {
+            static uint32_t s_outline_cnt = 0;
+            if ((++s_outline_cnt % 90) == 1) {
+                using InitFn = void (*)(void *, void *);
+                reinterpret_cast<InitFn>(s_initoutline_hooked_addr)(self, nullptr);
+            }
+        }
     }
-    if ((s_auto_headshot || s_silent_aim || s_full_aimbot) && s_orig_get_head_bone) {
-        using GetBoneFn = void *(*)(void *, void *);
-        void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, nullptr);
-        if (headT && s_orig_getpos) {
-            using GetPosFn = Vec3 (*)(void *, void *);
-            Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
-            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
-                // Head bone sits at crown of mesh; head hitbox center is ~0.06m lower.
-                // -0.06f keeps aim visibly on head while landing inside the hitbox sphere.
-                hp.y -= 0.06f;
-                return hp;
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
+        // Priority: use the REAL physics head collider (= exact server-side hitbox position).
+        // Binary verified: Player.get_HeadCollider() returns the head SphereCollider/CapsuleCollider.
+        // Its transform.position = where the physics engine (and server) places the hitbox.
+        // This eliminates the guesswork offset needed with the mesh bone (which is at the crown).
+        if (s_orig_get_head_collider && s_orig_gettrans && s_orig_getpos) {
+            using GetColFn  = void *(*)(void *, void *);
+            void *col = reinterpret_cast<GetColFn>(s_orig_get_head_collider)(self, nullptr);
+            if (col) {
+                using GetTransFn = void *(*)(void *, void *);
+                void *colTr = reinterpret_cast<GetTransFn>(s_orig_gettrans)(col, nullptr);
+                if (colTr) {
+                    using GetPosFn = Vec3 (*)(void *, void *);
+                    Vec3 cp = reinterpret_cast<GetPosFn>(s_orig_getpos)(colTr, nullptr);
+                    if (cp.x != 0.0f || cp.y != 0.0f || cp.z != 0.0f)
+                        return cp;
+                }
+            }
+        }
+        // Fallback: GetHeadTF (alternate head transform, may differ from bone crown)
+        if (s_orig_get_head_tf && s_orig_getpos) {
+            using GetTFFn  = void *(*)(void *, void *);
+            void *headTF = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(self, nullptr);
+            if (headTF) {
+                using GetPosFn = Vec3 (*)(void *, void *);
+                Vec3 tp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headTF, nullptr);
+                if (tp.x != 0.0f || tp.y != 0.0f || tp.z != 0.0f)
+                    return tp;
+            }
+        }
+        // Last resort: head bone transform with empirical 0.06m down-offset
+        if (s_orig_get_head_bone && s_orig_getpos) {
+            using GetBoneFn = void *(*)(void *, void *);
+            void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, nullptr);
+            if (headT) {
+                using GetPosFn = Vec3 (*)(void *, void *);
+                Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
+                if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
+                    hp.y -= 0.06f;
+                    return hp;
+                }
             }
         }
     }
@@ -745,12 +791,19 @@ void FeatureEngine::applyAimAssist(bool enable) {
 void FeatureEngine::applyAutoHeadshot(bool enable) {
     s_auto_headshot = enable;
 
-    // Store head-bone / getpos pointers on first enable
+    // Store head-bone / collider / getpos / gettrans pointers on first enable
     if (enable) {
         if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
             s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+        // Binary-verified: get_HeadCollider = real physics hitbox — use as primary aim point
+        if (!s_orig_get_head_collider && m_mth.getHeadCollider)
+            s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
+        if (!s_orig_get_head_tf && m_mth.getHeadTF)
+            s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
+        if (!s_orig_gettrans && m_mth.getTransform)
+            s_orig_gettrans = m_mth.getTransform->methodPointer;
         // Cache set_OnlyHeadshot fn pointer for lazy-init path inside the hook
         if (!s_res_id_only_headshot && m_mth.setOnlyHeadshot)
             s_res_id_only_headshot = m_mth.setOnlyHeadshot->methodPointer;
@@ -803,8 +856,14 @@ void FeatureEngine::applySilentAim(bool enable) {
     if (enable) {
         if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
             s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+        if (!s_orig_get_head_collider && m_mth.getHeadCollider)
+            s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
+        if (!s_orig_get_head_tf && m_mth.getHeadTF)
+            s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
+        if (!s_orig_gettrans && m_mth.getTransform)
+            s_orig_gettrans = m_mth.getTransform->methodPointer;
         if (!s_res_id_only_headshot && m_mth.setOnlyHeadshot)
             s_res_id_only_headshot = m_mth.setOnlyHeadshot->methodPointer;
         if (!s_res_id_cls)      s_res_id_cls      = m_cls.ResIdDef;
@@ -838,6 +897,10 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     if (enable) {
         if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
             s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+        if (!s_orig_get_head_collider && m_mth.getHeadCollider)
+            s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
+        if (!s_orig_get_head_tf && m_mth.getHeadTF)
+            s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
         if (!s_orig_gettrans && m_mth.getTransform)
@@ -1086,14 +1149,23 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("[ESP-DIAG] Layer3 SKIP — SetOutlineVisible ptr null");
     }
 
-    // Layer 4: InitOutline — store pointer for direct calls in per-frame hooks.
-    // Not hooked for the same reason as Layer3 — direct call after SetRenderQ is safer.
+    // Layer 4: InitOutline — HOOK it so hook_init_outline auto-calls SetOutlineVisible(1) after.
+    // We call InitOutline through its hooked address from hook_get_attackable_center (throttled),
+    // which triggers: hook_init_outline → original InitOutline → SetOutlineVisible(self, 1).
+    // s_orig_init_outline = trampoline to original (filled by Dobby).
     if (m_mth.initOutline && m_mth.initOutline->methodPointer) {
-        if (enable)
-            s_orig_init_outline = m_mth.initOutline->methodPointer;
-        else
+        if (enable && !s_orig_init_outline) {
+            HookEngine::get().hookAddr(m_mth.initOutline->methodPointer,
+                reinterpret_cast<void *>(hook_init_outline), &s_orig_init_outline, "ESP-InitOutline");
+            s_initoutline_hooked_addr = m_mth.initOutline->methodPointer;
+            LOGI("[ESP-DIAG] Layer4 InitOutline hooked, trampoline=%p hooked_addr=%p",
+                 s_orig_init_outline, s_initoutline_hooked_addr);
+        } else if (!enable && s_orig_init_outline) {
+            HookEngine::get().unhook(m_mth.initOutline->methodPointer);
             s_orig_init_outline = nullptr;
-        LOGI("[ESP-DIAG] Layer4 ptr=%p (direct-call mode, no hook)", s_orig_init_outline);
+            s_initoutline_hooked_addr = nullptr;
+            LOGI("[ESP-DIAG] Layer4 InitOutline unhooked");
+        }
     } else {
         LOGE("[ESP-DIAG] Layer4 SKIP — InitOutline ptr null");
     }

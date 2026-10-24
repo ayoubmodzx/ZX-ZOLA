@@ -164,6 +164,9 @@ private:
         // Headshot damage gate — direct hooks (more reliable than set_OnlyHeadshot)
         MethodInfo *checkDamageHitHead   = nullptr; // Player.CheckDamageHitHead(DamageInfo) → bool
         MethodInfo *isInNoHeadShotState  = nullptr; // Player.IsInNoHeadShotState() → bool
+        // Confirmed via global-metadata.dat strings analysis (binary verified)
+        MethodInfo *getHeadCollider      = nullptr; // Player.get_HeadCollider() → Collider* (REAL hitbox)
+        MethodInfo *getHeadTF            = nullptr; // Player.GetHeadTF() → Transform* (head transform)
     } m_mth;
 
     void resolveClasses();
