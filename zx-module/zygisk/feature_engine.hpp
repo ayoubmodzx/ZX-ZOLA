@@ -168,6 +168,7 @@ private:
         MethodInfo *getHeadCollider      = nullptr; // Player.get_HeadCollider() → Collider* (REAL hitbox)
         MethodInfo *getHeadTF            = nullptr; // Player.GetHeadTF() → Transform* (head transform)
         MethodInfo *colliderGetBounds    = nullptr; // UnityEngine.Collider.get_bounds() → Bounds struct
+        MethodInfo *takeDamage4          = nullptr; // Player.TakeDamage(4 params) [210713] — client prediction
     } m_mth;
 
     void resolveClasses();

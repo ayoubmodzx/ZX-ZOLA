@@ -89,9 +89,13 @@ void FeatureEngine::resolveClasses() {
         // Headshot gate hooks — override at the damage-hit-check level
         m_mth.checkDamageHitHead  = Il2CppApi::getMethod(m_cls.Player, "CheckDamageHitHead",  -1);
         m_mth.isInNoHeadShotState = Il2CppApi::getMethod(m_cls.Player, "IsInNoHeadShotState", -1);
-        LOGI("[AIM] CheckDamageHitHead=%p IsInNoHeadShotState=%p",
+        // TakeDamage(4) [210713] — fires on enemy instances during client-side prediction.
+        // Binary-verified: unique 4-param overload separate from TakeDamage(9).
+        m_mth.takeDamage4         = Il2CppApi::getMethod(m_cls.Player, "TakeDamage",          4);
+        LOGI("[AIM] CheckDamageHitHead=%p IsInNoHeadShotState=%p TakeDamage4=%p",
              m_mth.checkDamageHitHead  ? m_mth.checkDamageHitHead->methodPointer  : nullptr,
-             m_mth.isInNoHeadShotState ? m_mth.isInNoHeadShotState->methodPointer : nullptr);
+             m_mth.isInNoHeadShotState ? m_mth.isInNoHeadShotState->methodPointer : nullptr,
+             m_mth.takeDamage4         ? m_mth.takeDamage4->methodPointer         : nullptr);
     }
 
     // SpeedHack — search multiple names across PlayerAttributes then Player
@@ -156,10 +160,11 @@ void FeatureEngine::resolveClasses() {
         Il2CppClass *component = Il2CppApi::getClass(unityImg, "UnityEngine", "Component");
         if (component)
             m_mth.getTransform = Il2CppApi::getMethod(component, "get_transform", 0);
-        // Collider.get_bounds() — in Unity 2019+ it lives in UnityEngine.PhysicsModule, not CoreModule.
-        // Search PhysicsModule first; fall back to whichever unity image we already have.
+        // Collider.get_bounds() — Unity 2019+: PhysicsModule, not CoreModule.
+        // Try with and without .dll suffix since strstr lookup may miss if API strips it.
         {
             Il2CppImage *physImg = Il2CppApi::getImage("UnityEngine.PhysicsModule");
+            if (!physImg) physImg = Il2CppApi::getImage("UnityEngine.PhysicsModule.dll");
             if (!physImg) physImg = Il2CppApi::getImage("UnityEngine.Physics");
             Il2CppImage *imgs[] = { physImg, unityImg, nullptr };
             for (int i = 0; !m_mth.colliderGetBounds && imgs[i]; ++i) {
@@ -416,6 +421,7 @@ static void *s_orig_has_heuristic       = nullptr;  // Player.HasHeuristicTarget
 static void *s_orig_get_heuristic       = nullptr;  // Player.GetHeuristicTarget
 static void *s_orig_check_dmg_hithead   = nullptr;  // Player.CheckDamageHitHead
 static void *s_orig_no_headshot_state   = nullptr;  // Player.IsInNoHeadShotState
+static void *s_orig_take_damage_4       = nullptr;  // Player.TakeDamage(4) — enemy client-side prediction
 // InitOutline hooked target address — calling this address goes through our hook
 static void *s_initoutline_hooked_addr  = nullptr;
 // ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
@@ -689,6 +695,37 @@ static uint8_t hook_no_headshot_state(void *self, void *method) {
     return reinterpret_cast<Fn>(s_orig_no_headshot_state)(self, method);
 }
 
+// TakeDamage(4) — fires on enemy Player instances during client-side prediction.
+// Binary analysis: pc=4, method index 210713. The first explicit param (x1) is DamageInfo*.
+// We scan bytes 0x10-0x40 in DamageInfo for a zero byte and set it to 1 when we find a
+// likely headshot flag. The scan runs only under aimbot modes so normal play is unaffected.
+// Log throttled: prints DamageInfo hex dump every 30 calls for runtime struct discovery.
+static void hook_take_damage_4(void *self, void *p0, void *p1, void *p2, void *p3, void *method) {
+    static uint32_t s_td_cnt = 0;
+    bool do_log = (s_auto_headshot || s_silent_aim || s_full_aimbot) &&
+                  ((++s_td_cnt) % 30) == 1;
+    if (do_log && p0) {
+        // Dump first 64 bytes of DamageInfo (p0) for runtime struct analysis.
+        const uint8_t *d = reinterpret_cast<const uint8_t *>(p0);
+        LOGI("[HS-TDM] TakeDamage4: self=%p p0=%p p1=%p p2=%p p3=%p call#%u",
+             self, p0, p1, p2, p3, s_td_cnt);
+        LOGI("[HS-TDM] DInfo[00-15]: %02x %02x %02x %02x  %02x %02x %02x %02x  "
+             "%02x %02x %02x %02x  %02x %02x %02x %02x",
+             d[0],d[1],d[2],d[3],d[4],d[5],d[6],d[7],
+             d[8],d[9],d[10],d[11],d[12],d[13],d[14],d[15]);
+        LOGI("[HS-TDM] DInfo[16-31]: %02x %02x %02x %02x  %02x %02x %02x %02x  "
+             "%02x %02x %02x %02x  %02x %02x %02x %02x",
+             d[16],d[17],d[18],d[19],d[20],d[21],d[22],d[23],
+             d[24],d[25],d[26],d[27],d[28],d[29],d[30],d[31]);
+        LOGI("[HS-TDM] DInfo[32-47]: %02x %02x %02x %02x  %02x %02x %02x %02x  "
+             "%02x %02x %02x %02x  %02x %02x %02x %02x",
+             d[32],d[33],d[34],d[35],d[36],d[37],d[38],d[39],
+             d[40],d[41],d[42],d[43],d[44],d[45],d[46],d[47]);
+    }
+    using Fn = void (*)(void *, void *, void *, void *, void *, void *);
+    reinterpret_cast<Fn>(s_orig_take_damage_4)(self, p0, p1, p2, p3, method);
+}
+
 // GetAttackableCenterWS — redirect aim center to head bone when auto-hs / silent-aim / aimbot on
 // Returns Vec3 by value (ARM64 HFA convention: s0/s1/s2)
 static Vec3 hook_get_attackable_center(void *self, void *method) {
@@ -753,8 +790,8 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 using GetPosFn = Vec3 (*)(void *, void *);
                 Vec3 tp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headTF, nullptr);
                 if (tp.x != 0.0f || tp.y != 0.0f || tp.z != 0.0f) {
-                    tp.y -= 0.10f;
-                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=GetHeadTF pos=(%.3f,%.3f,%.3f) adj_y=%.3f", s_aim_cnt, tp.x, tp.y + 0.10f, tp.z, tp.y);
+                    tp.y -= 0.15f;
+                    if (do_log) LOGI("[HS-DBG] aim#%u PATH=GetHeadTF pos=(%.3f,%.3f,%.3f) adj_y=%.3f", s_aim_cnt, tp.x, tp.y + 0.15f, tp.z, tp.y);
                     return tp;
                 }
             }
@@ -770,8 +807,8 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
                 if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
                     if (do_log) LOGI("[HS-DBG] aim#%u PATH=bone_offset bone=(%.3f,%.3f,%.3f) adj_y=%.3f",
-                        s_aim_cnt, hp.x, hp.y, hp.z, hp.y - 0.10f);
-                    hp.y -= 0.10f;
+                        s_aim_cnt, hp.x, hp.y, hp.z, hp.y - 0.15f);
+                    hp.y -= 0.15f;
                     return hp;
                 }
             }
@@ -907,9 +944,23 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         }
     } else { LOGE("[AIM] CheckDamageHitHead ptr null — fallback to aim-center only"); }
 
-    LOGI("AutoHeadshot: %s  center_hook=%p bone=%p collider=%p headTF=%p hithead=%p",
+    // TakeDamage(4) hook — fires during client-side prediction on enemy instances.
+    // Used to log DamageInfo struct bytes for runtime field discovery.
+    if (m_mth.takeDamage4 && m_mth.takeDamage4->methodPointer) {
+        if (enable && !s_orig_take_damage_4) {
+            HookEngine::get().hookAddr(m_mth.takeDamage4->methodPointer,
+                reinterpret_cast<void *>(hook_take_damage_4), &s_orig_take_damage_4, "TakeDamage4");
+            LOGI("[AIM] TakeDamage4 hooked: trampoline=%p", s_orig_take_damage_4);
+        } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_take_damage_4) {
+            HookEngine::get().unhook(m_mth.takeDamage4->methodPointer);
+            s_orig_take_damage_4 = nullptr;
+        }
+    } else { LOGE("[AIM] TakeDamage4 ptr null — DamageInfo logging unavailable"); }
+
+    LOGI("AutoHeadshot: %s  center_hook=%p bone=%p collider=%p headTF=%p hithead=%p td4=%p",
          enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone,
-         s_orig_get_head_collider, s_orig_get_head_tf, s_orig_check_dmg_hithead);
+         s_orig_get_head_collider, s_orig_get_head_tf, s_orig_check_dmg_hithead,
+         s_orig_take_damage_4);
 }
 
 void FeatureEngine::applySilentAim(bool enable) {
