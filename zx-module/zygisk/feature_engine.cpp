@@ -156,6 +156,13 @@ void FeatureEngine::resolveClasses() {
         Il2CppClass *component = Il2CppApi::getClass(unityImg, "UnityEngine", "Component");
         if (component)
             m_mth.getTransform = Il2CppApi::getMethod(component, "get_transform", 0);
+        // Collider.get_bounds() — returns Bounds{center(Vec3), extents(Vec3)} = world-space hitbox center.
+        // IL2CPP struct-return convention (ARM64): void get_bounds(Collider* this, Bounds* result, MethodInfo*)
+        Il2CppClass *colliderCls = Il2CppApi::getClass(unityImg, "UnityEngine", "Collider");
+        if (colliderCls)
+            m_mth.colliderGetBounds = Il2CppApi::getMethod(colliderCls, "get_bounds", 0);
+        LOGI("[AIM] Collider.get_bounds=%p",
+             m_mth.colliderGetBounds ? m_mth.colliderGetBounds->methodPointer : nullptr);
     }
 
     // ESP — hook the HUD/UI draw methods that render enemy indicators
@@ -394,6 +401,7 @@ static void *s_orig_attackable_ctr      = nullptr;  // Player.GetAttackableCente
 static void *s_orig_get_head_bone       = nullptr;  // Player.get_HeadBoneTransform
 static void *s_orig_get_head_collider   = nullptr;  // Player.get_HeadCollider() — real physics hitbox
 static void *s_orig_get_head_tf         = nullptr;  // Player.GetHeadTF() — alternative head transform
+static void *s_orig_collider_get_bounds = nullptr;  // Collider.get_bounds() → Bounds{center,extents}
 static void *s_orig_set_aim_rot         = nullptr;  // Player.SetAimRotation
 static void *s_orig_update_aiming       = nullptr;  // Player.UpdateAiming
 static void *s_orig_has_heuristic       = nullptr;  // Player.HasHeuristicTarget
@@ -700,21 +708,23 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         }
     }
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
-        // Priority: use the REAL physics head collider (= exact server-side hitbox position).
-        // Binary verified: Player.get_HeadCollider() returns the head SphereCollider/CapsuleCollider.
-        // Its transform.position = where the physics engine (and server) places the hitbox.
-        // This eliminates the guesswork offset needed with the mesh bone (which is at the crown).
-        if (s_orig_get_head_collider && s_orig_gettrans && s_orig_getpos) {
-            using GetColFn  = void *(*)(void *, void *);
+        // Priority: use Collider.bounds.center = exact world-space physics hitbox center.
+        // Collider.transform.position = position of the attached GameObject (= bone crown, WRONG).
+        // Collider.bounds.center     = world-space center of the physics capsule/sphere (CORRECT).
+        // IL2CPP struct-return ARM64: void get_bounds(Collider* this, Bounds* result, MethodInfo*)
+        // Bounds = { Vector3 center; Vector3 extents; } = 6 floats = 24 bytes.
+        if (s_orig_get_head_collider && s_orig_collider_get_bounds) {
+            using GetColFn = void *(*)(void *, void *);
             void *col = reinterpret_cast<GetColFn>(s_orig_get_head_collider)(self, nullptr);
             if (col) {
-                using GetTransFn = void *(*)(void *, void *);
-                void *colTr = reinterpret_cast<GetTransFn>(s_orig_gettrans)(col, nullptr);
-                if (colTr) {
-                    using GetPosFn = Vec3 (*)(void *, void *);
-                    Vec3 cp = reinterpret_cast<GetPosFn>(s_orig_getpos)(colTr, nullptr);
-                    if (cp.x != 0.0f || cp.y != 0.0f || cp.z != 0.0f)
-                        return cp;
+                struct UnityBounds { float cx, cy, cz, ex, ey, ez; };
+                UnityBounds bounds{};
+                using GetBoundsFn = void (*)(void *, UnityBounds *, void *);
+                reinterpret_cast<GetBoundsFn>(s_orig_collider_get_bounds)(col, &bounds, nullptr);
+                Vec3 hitboxCenter = {bounds.cx, bounds.cy, bounds.cz};
+                if (hitboxCenter.x != 0.0f || hitboxCenter.y != 0.0f || hitboxCenter.z != 0.0f) {
+                    LOGI("[AIM-DBG] bounds.center=(%.3f,%.3f,%.3f)", hitboxCenter.x, hitboxCenter.y, hitboxCenter.z);
+                    return hitboxCenter;
                 }
             }
         }
@@ -824,6 +834,8 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
         if (!s_orig_get_head_tf && m_mth.getHeadTF)
             s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
+        if (!s_orig_collider_get_bounds && m_mth.colliderGetBounds)
+            s_orig_collider_get_bounds = m_mth.colliderGetBounds->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
         if (!s_orig_gettrans && m_mth.getTransform)
@@ -885,6 +897,8 @@ void FeatureEngine::applySilentAim(bool enable) {
             s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
         if (!s_orig_get_head_tf && m_mth.getHeadTF)
             s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
+        if (!s_orig_collider_get_bounds && m_mth.colliderGetBounds)
+            s_orig_collider_get_bounds = m_mth.colliderGetBounds->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
         if (!s_orig_gettrans && m_mth.getTransform)
@@ -926,6 +940,8 @@ void FeatureEngine::applyFullAimbot(bool enable) {
             s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
         if (!s_orig_get_head_tf && m_mth.getHeadTF)
             s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
+        if (!s_orig_collider_get_bounds && m_mth.colliderGetBounds)
+            s_orig_collider_get_bounds = m_mth.colliderGetBounds->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
         if (!s_orig_gettrans && m_mth.getTransform)

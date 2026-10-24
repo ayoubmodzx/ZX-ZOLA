@@ -167,6 +167,7 @@ private:
         // Confirmed via global-metadata.dat strings analysis (binary verified)
         MethodInfo *getHeadCollider      = nullptr; // Player.get_HeadCollider() → Collider* (REAL hitbox)
         MethodInfo *getHeadTF            = nullptr; // Player.GetHeadTF() → Transform* (head transform)
+        MethodInfo *colliderGetBounds    = nullptr; // UnityEngine.Collider.get_bounds() → Bounds struct
     } m_mth;
 
     void resolveClasses();
