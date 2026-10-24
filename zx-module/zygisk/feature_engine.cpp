@@ -529,7 +529,7 @@ static void hook_init_outline(void *self, void *param0, void *method) {
     LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(2,1)");
     if (s_esp && s_orig_set_outline_vis) {
         using ShowFn = void (*)(void *, uint8_t, int, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, method);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, nullptr);
         LOGI("[ESP-DBG] SetOutlineVisible(2,1) injected for self=%p", self);
     } else {
         LOGI("[ESP-DBG] InitOutline: skipped inject (esp=%d fn=%p)", (int)s_esp, s_orig_set_outline_vis);
@@ -571,42 +571,30 @@ static void hook_collider_hit(void *self, void *hit, void *method) {
     reinterpret_cast<Fn>(s_orig_collider)(self, hit, method);
 }
 
-// Frame counter for ESP outline throttle — inject every 30 Player.Update calls per instance
-// (avoids calling SetOutlineVisible at 60fps on every player every frame)
-static thread_local uint8_t s_outline_tick = 0;
+// Global tick for ESP outline — increments once per ANY player Update call.
+// All players share this counter on the Unity main thread so thread_local is wrong.
+static uint32_t s_global_outline_tick = 0;
 
-// Teleport tick + ESP proactive outline injection: hooked onto Player.Update.
-// ARM64 Vector3 HFA: set_position(Transform* x0, float s0,s1,s2, MethodInfo* x1)
-//                    get_position returns floats in s0/s1/s2
 static void hook_player_update(void *self, void *method) {
-    // ── ESP proactive injection ───────────────────────────────────────────────
-    // Every 30 frames per player:
-    //   1. SetRenderQ(5000) — render queue 5000 = overlay, draws above all geometry
-    //      This is the through-wall mechanism (no shader swap needed).
-    //   2. InitOutline + SetOutlineVisible(true) — neon line around body
-    // MatchGame lazy-init fallback via Player.Update — fires every 60 frames (~1 sec).
-    // Catches the case where ESP was enabled but no enemy triggered GetAttackableCenterWS yet.
-    // MatchGame.GetMatch() is static, returns live singleton only when a match is active.
-    // MatchGame lazy-init removed from hook context — GetMatch() called from IL2CPP
-    // hook thread causes a crash. Called directly from applyESP() instead (main thread).
-
-    // ESP effects applied per-enemy in hook_get_attackable_center only (not here).
-
     // ── ESP proactive outline ─────────────────────────────────────────────────
-    // InitOutline fires once per player at spawn. If ESP was toggled on after spawn
-    // our hook_init_outline never saw them. Re-kick SetOutlineVisible(1) every 60
-    // Update ticks so late-join enemies get the neon outline without waiting for respawn.
-    if (s_esp) {
-        if (s_orig_set_outline_vis) {
-            if (++s_outline_tick >= 60) {
-                s_outline_tick = 0;
-                using ShowFn = void (*)(void *, uint8_t, int, void *);
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, method);
-            }
-        } else {
-            static uint32_t s_esp_null_cnt = 0;
-            if ((++s_esp_null_cnt % 120) == 1)
-                LOGI("[ESP-DBG] Update tick#%u esp=1 but outline_fn=NULL — hook not installed", s_esp_null_cnt);
+    // thread_local was wrong: all Unity Update() callbacks run on the same main
+    // thread, so thread_local is SHARED across all players. With 4 players only
+    // the one that hits tick=60 ever gets SetOutlineVisible — others are skipped.
+    // Fix: global counter mod small number → fires for EVERY player frequently.
+    // Pass nullptr for MethodInfo* — method here is Player.Update's MethodInfo,
+    // which is wrong for SetOutlineVisible. nullptr is safe; game ignores it.
+    if (s_esp && s_orig_set_outline_vis) {
+        ++s_global_outline_tick;
+        // Fire for this player every 30 global ticks (~0.5 sec at 60fps with 1 player,
+        // faster with more players — all players covered within 30 global Updates).
+        uint32_t slot = ((uintptr_t)self >> 12) & 0x1F; // 0-31 per-player bucket
+        if ((s_global_outline_tick % 30) == (slot % 30)) {
+            using ShowFn = void (*)(void *, uint8_t, int, void *);
+            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, nullptr);
+            static uint32_t s_sov_fire_cnt = 0;
+            if ((++s_sov_fire_cnt) <= 10)
+                LOGI("[ESP-DBG] proactive SOV(2,1) fire#%u self=%p slot=%u tick=%u",
+                    s_sov_fire_cnt, self, slot, s_global_outline_tick);
         }
     }
     // ── Teleport tick ────────────────────────────────────────────────────────
