@@ -568,40 +568,9 @@ static void hook_player_update(void *self, void *method) {
         }
     }
 
-    if (s_esp) {
-        // Diagnostic: confirm hook fires for multiple player instances (enemies, not just local)
-        static void  *s_esp_first_self = nullptr;
-        static int    s_esp_multi_seen = 0;
-        if (!s_esp_first_self) s_esp_first_self = self;
-        else if (self != s_esp_first_self && ++s_esp_multi_seen <= 5)
-            LOGI("[ESP-DIAG] Update: enemy player seen self=%p (first=%p multi#%d)",
-                 self, s_esp_first_self, s_esp_multi_seen);
-
-        ++s_outline_tick;
-        if (s_outline_tick >= 30) {
-            s_outline_tick = 0;
-            // Through-wall: render queue 5000 (Unity Overlay — renders above walls)
-            if (s_orig_set_render_q) {
-                static bool s_rq_first_fire = true;
-                using SetRQFn = void (*)(void *, int, void *);
-                reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
-                if (s_rq_first_fire) { s_rq_first_fire = false; LOGI("[ESP-DIAG] SetRenderQ(5000) first fire: self=%p", self); }
-            }
-            // Neon outline: InitOutline must come before SetOutlineVisible
-            if (s_orig_init_outline) {
-                using InitFn = void (*)(void *, void *);
-                reinterpret_cast<InitFn>(s_orig_init_outline)(self, nullptr);
-            }
-            if (s_orig_set_outline_vis) {
-                using ShowFn = void (*)(void *, uint8_t, void *);
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
-            }
-        }
-    } else if (!s_esp && s_orig_revert_render_q) {
-        // Restore normal render queue when ESP disabled
-        using RevertFn = void (*)(void *, void *);
-        reinterpret_cast<RevertFn>(s_orig_revert_render_q)(self, nullptr);
-    }
+    // ESP effects (SetRenderQ / SetOutlineVisible) are applied per-enemy inside
+    // hook_get_attackable_center — NOT here, because Player.Update fires for the
+    // local player too and calling InitOutline/SetRenderQ on self causes a crash.
 
     // ── Teleport tick ────────────────────────────────────────────────────────
     if (s_orig_gettrans && s_orig_setpos && s_orig_getpos) {
@@ -713,21 +682,15 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         }
     }
 
-    // ESP side-effect: apply rendering to this enemy while we have their pointer.
-    // GetAttackableCenterWS fires for every enemy the game's aim system processes —
-    // more reliable than Player.Update which may not run for remote players.
-    if (s_esp) {
+    // ESP: set enemy render queue to Transparent+500 (draws above walls, never OOB).
+    // Neon outline is handled globally by MatchGame.ShowPlayerOutline(true) above —
+    // no per-player SetOutlineVisible needed (calling it without a prior InitOutline
+    // on that instance = null-deref crash inside the outline renderer).
+    if (s_esp && s_orig_set_render_q) {
         static bool s_esp_ac_first = true;
         if (s_esp_ac_first) { s_esp_ac_first = false; LOGI("[ESP-DIAG] ESP via GetAttackableCenterWS: self=%p", self); }
-
-        if (s_orig_set_render_q) {
-            using SetRQFn = void (*)(void *, int, void *);
-            reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
-        }
-        if (s_orig_set_outline_vis) {
-            using ShowFn = void (*)(void *, uint8_t, void *);
-            reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 1, nullptr);
-        }
+        using SetRQFn = void (*)(void *, int, void *);
+        reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 3000, nullptr);
     }
     if ((s_auto_headshot || s_silent_aim || s_full_aimbot) && s_orig_get_head_bone) {
         using GetBoneFn = void *(*)(void *, void *);
@@ -735,13 +698,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         if (headT && s_orig_getpos) {
             using GetPosFn = Vec3 (*)(void *, void *);
             Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
-            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
-                // Head bone is at the top of the head mesh.
-                // Head hitbox center is ~0.12m lower — offset so bullet hits
-                // the hitbox reliably even against standing (no lag-compensation) targets.
-                hp.y -= 0.12f;
-                return hp;
-            }
+            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) return hp;
         }
     }
     using Fn = Vec3 (*)(void *, void *);
