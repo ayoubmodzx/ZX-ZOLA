@@ -661,6 +661,8 @@ static void hook_player_update(void *self, void *method) {
         using IsLocalFn = uint8_t (*)(void *, void *);
         uint8_t isLocal = reinterpret_cast<IsLocalFn>(s_is_local_player_fn)(self, nullptr);
         if (isLocal) {
+            if (s_local_player != self)
+                LOGI("[PLAYER-DIAG] LocalPlayer SET self=%p (was %p)", self, s_local_player);
             s_local_player = self;
             // Call GameSettingData.EnableShowPlayerOutline/Team once per session from game thread
             if (s_esp && !s_gs_outline_done && s_gs_get_instance_fn && s_gs_enable_outline_fn) {
@@ -680,8 +682,10 @@ static void hook_player_update(void *self, void *method) {
             bool found = false;
             for (int i = 0; i < s_enemy_count; ++i)
                 if (s_enemy_list[i] == self) { found = true; break; }
-            if (!found && s_enemy_count < 32)
+            if (!found && s_enemy_count < 32) {
+                LOGI("[PLAYER-DIAG] Enemy ADDED[%d] self=%p total=%d", s_enemy_count, self, s_enemy_count + 1);
                 s_enemy_list[s_enemy_count++] = self;
+            }
         }
     }
     // ── Teleport tick ────────────────────────────────────────────────────────
@@ -755,16 +759,33 @@ void FeatureEngine::applyRapidFire(bool enable) {
 // Force-return true when any headshot feature is active so every bullet counts.
 // Signature: bool CheckDamageHitHead(DamageInfo* info) — we pass through `info` unchanged.
 static uint8_t hook_check_dmg_hithead(void *self, void *info, void *method) {
-    LOGI("[HS-CRASH] hook_check_dmg_hithead ENTERED: self=%p info=%p method=%p hs=%d sa=%d fa=%d",
-         self, info, method, (int)s_auto_headshot, (int)s_silent_aim, (int)s_full_aimbot);
+    static uint32_t s_hdcheck_cnt = 0;
+    ++s_hdcheck_cnt;
+    // Log every call — tells us if headshot gate is actually invoked in the damage pipeline
+    LOGI("[HS-GATE] CheckDamageHitHead#%u self=%p info=%p hs=%d sa=%d fa=%d",
+         s_hdcheck_cnt, self, info, (int)s_auto_headshot, (int)s_silent_aim, (int)s_full_aimbot);
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
+        LOGI("[HS-GATE] FORCED=1 (headshot registered) call#%u", s_hdcheck_cnt);
         return 1;
     }
-    LOGI("[HS-CRASH] CheckDamageHitHead: calling original trampoline=%p", s_orig_check_dmg_hithead);
     using Fn = uint8_t (*)(void *, void *, void *);
     uint8_t r = reinterpret_cast<Fn>(s_orig_check_dmg_hithead)(self, info, method);
-    LOGI("[HS-CRASH] CheckDamageHitHead: orig returned %d", (int)r);
+    LOGI("[HS-GATE] orig=%d call#%u", (int)r, s_hdcheck_cnt);
     return r;
+}
+
+// TakeDamage(4) diagnostic — fires whenever a player is damaged; tells us if
+// CheckDamageHitHead is even in the call chain. If this fires but HS-GATE never does,
+// the headshot gate was bypassed entirely (server-side only in this FF build).
+static void *s_orig_take_damage_4_hook = nullptr;
+static void hook_take_damage_4(void *self, void *a1, void *a2, void *a3, void *a4, void *method) {
+    static uint32_t s_td4_cnt = 0;
+    ++s_td4_cnt;
+    LOGI("[TD4-DIAG] TakeDamage(4)#%u self=%p a1=%p a2=%p a3=%p a4=%p",
+         s_td4_cnt, self, a1, a2, a3, a4);
+    using Fn = void (*)(void *, void *, void *, void *, void *, void *);
+    reinterpret_cast<Fn>(s_orig_take_damage_4_hook)(self, a1, a2, a3, a4, method);
+    LOGI("[TD4-DIAG] TakeDamage(4)#%u returned", s_td4_cnt);
 }
 
 // IsInNoHeadShotState — returns true when player is in a state where headshots are blocked
@@ -869,17 +890,40 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
 // ── Aimbot core — shared by UpdateAiming and ODKFDOFOHLN (ADS) hooks ─────────
 // Prefers GetHeadTF (stable transform, no animation jitter) over bone for fast-
 // moving targets; falls back to bone if GetHeadTF returns null/zero.
+// ── Aimbot diagnostic counters (throttled logging) ───────────────────────────
+static uint32_t s_aim_core_fire   = 0;  // times run_aimbot_core ran for local player
+static uint32_t s_aim_core_nolist = 0;  // times no enemy in list
+static uint32_t s_aim_core_norot  = 0;  // times SetAimRotation ptr missing
+static uint32_t s_aim_core_ok     = 0;  // times SetAimRotation fired
+
 static inline void run_aimbot_core(void *self) {
     if (!s_full_aimbot && !s_auto_headshot) return;
     // Require local player to be known; bail for any non-local instance
-    if (!s_local_player || self != s_local_player) return;
-    if (!s_orig_getpos || !s_orig_gettrans) return;
+    if (!s_local_player || self != s_local_player) {
+        static uint32_t s_wrong_self = 0;
+        if ((++s_wrong_self) <= 5 || (s_wrong_self % 300) == 0)
+            LOGI("[AIM-DIAG] core SKIP self=%p local=%p wrong_self#%u fa=%d ah=%d",
+                 self, s_local_player, s_wrong_self, (int)s_full_aimbot, (int)s_auto_headshot);
+        return;
+    }
+    if (!s_orig_getpos || !s_orig_gettrans) {
+        LOGE("[AIM-DIAG] core ABORT: getpos=%p gettrans=%p — transform fns null", s_orig_getpos, s_orig_gettrans);
+        return;
+    }
+
+    ++s_aim_core_fire;
+    bool do_log = (s_aim_core_fire <= 5) || (s_aim_core_fire % 120) == 1;
 
     using GetTransFn = void *(*)(void *, void *);
     void *myT = reinterpret_cast<GetTransFn>(s_orig_gettrans)(self, nullptr);
-    if (!myT) return;
+    if (!myT) {
+        if (do_log) LOGE("[AIM-DIAG] core#%u: get_transform(local) returned null", s_aim_core_fire);
+        return;
+    }
     using GetPosFn = Vec3 (*)(void *, void *);
     Vec3 myPos = reinterpret_cast<GetPosFn>(s_orig_getpos)(myT, nullptr);
+    if (do_log) LOGI("[AIM-DIAG] core#%u: local=(%p) pos=(%.2f,%.2f,%.2f) enemies=%d",
+        s_aim_core_fire, self, myPos.x, myPos.y, myPos.z, s_enemy_count);
 
     void *bestEnemy = nullptr;
     Vec3  bestHead  = {};
@@ -891,14 +935,18 @@ static inline void run_aimbot_core(void *self) {
         if (reinterpret_cast<HasFn>(s_orig_has_heuristic)(self, nullptr)) {
             using GetFn = void *(*)(void *, void *);
             void *he = reinterpret_cast<GetFn>(s_orig_get_heuristic)(self, nullptr);
-            if (he) bestEnemy = he;
+            if (he) {
+                bestEnemy = he;
+                if (do_log) LOGI("[AIM-DIAG] core#%u: heuristic target=%p", s_aim_core_fire, he);
+            }
         }
     }
 
     // Step 2: enemy list scan — covers stationary enemies + fast movers
-    // GetHeadTF is a stable non-animated transform (no jitter on fast movement);
-    // bone is a fallback when GetHeadTF is unavailable or returns zero.
     if (!bestEnemy && (s_orig_get_head_tf || s_orig_get_head_bone)) {
+        if (s_enemy_count == 0 && do_log)
+            LOGE("[AIM-DIAG] core#%u: enemy list EMPTY — no targets (headTF=%p bone=%p)",
+                 s_aim_core_fire, s_orig_get_head_tf, s_orig_get_head_bone);
         for (int i = 0; i < s_enemy_count; ++i) {
             void *ep = s_enemy_list[i];
             if (!ep || ep == self) continue;
@@ -911,15 +959,27 @@ static inline void run_aimbot_core(void *self) {
                 using GetBoneFn = void *(*)(void *, void *);
                 hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(ep, nullptr);
             }
-            if (!hT) continue;
+            if (!hT) {
+                if (do_log) LOGE("[AIM-DIAG] core#%u: enemy[%d]=%p headTF+bone both null", s_aim_core_fire, i, ep);
+                continue;
+            }
             Vec3 hPos = reinterpret_cast<GetPosFn>(s_orig_getpos)(hT, nullptr);
-            if (hPos.x == 0.f && hPos.y == 0.f && hPos.z == 0.f) continue;
+            if (hPos.x == 0.f && hPos.y == 0.f && hPos.z == 0.f) {
+                if (do_log) LOGE("[AIM-DIAG] core#%u: enemy[%d]=%p headPos=zero", s_aim_core_fire, i, ep);
+                continue;
+            }
             float dx2 = hPos.x - myPos.x, dy2 = hPos.y - myPos.y, dz2 = hPos.z - myPos.z;
             float d2  = dx2*dx2 + dy2*dy2 + dz2*dz2;
             if (d2 < bestDist2) { bestDist2 = d2; bestEnemy = ep; bestHead = hPos; }
         }
     }
-    if (!bestEnemy) return;
+
+    if (!bestEnemy) {
+        ++s_aim_core_nolist;
+        if (do_log) LOGE("[AIM-DIAG] core#%u: NO target found enemies=%d headTF=%p bone=%p nolist_total=%u",
+             s_aim_core_fire, s_enemy_count, s_orig_get_head_tf, s_orig_get_head_bone, s_aim_core_nolist);
+        return;
+    }
 
     // Resolve head position for HeuristicTarget path (prefer stable GetHeadTF)
     if (bestDist2 >= 1e20f) {
@@ -932,7 +992,10 @@ static inline void run_aimbot_core(void *self) {
             using GetBoneFn = void *(*)(void *, void *);
             hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(bestEnemy, nullptr);
         }
-        if (!hT) return;
+        if (!hT) {
+            if (do_log) LOGE("[AIM-DIAG] core#%u: heuristic enemy=%p headTF+bone null", s_aim_core_fire, bestEnemy);
+            return;
+        }
         bestHead = reinterpret_cast<GetPosFn>(s_orig_getpos)(hT, nullptr);
     }
 
@@ -940,18 +1003,28 @@ static inline void run_aimbot_core(void *self) {
     float dy    = bestHead.y - myPos.y;
     float dz    = bestHead.z - myPos.z;
     float horiz = sqrtf(dx*dx + dz*dz);
-    // Free Fire uses -Z as player forward direction
     float yaw   =  atan2f(dx, -dz) * (180.0f / 3.14159265f);
     float pitch = -atan2f(dy, horiz) * (180.0f / 3.14159265f);
 
-    if (!s_orig_set_aim_rot) return;
+    if (!s_orig_set_aim_rot) {
+        ++s_aim_core_norot;
+        if (do_log) LOGE("[AIM-DIAG] core#%u: SetAimRotation ptr NULL — aim cannot be set norot=%u", s_aim_core_fire, s_aim_core_norot);
+        return;
+    }
     Vec3 aimRot = {pitch, yaw, 0.0f};
     using SetAimFn = void (*)(void *, Vec3, void *);
     reinterpret_cast<SetAimFn>(s_orig_set_aim_rot)(self, aimRot, nullptr);
+    ++s_aim_core_ok;
+    if (do_log) LOGI("[AIM-DIAG] core#%u: SET yaw=%.1f pitch=%.1f target=%p head=(%.2f,%.2f,%.2f) ok=%u",
+        s_aim_core_fire, yaw, pitch, bestEnemy, bestHead.x, bestHead.y, bestHead.z, s_aim_core_ok);
 }
 
 // UpdateAiming — per-frame full aimbot entry point (hip-fire / normal mode)
 static void hook_update_aiming(void *self, void *method) {
+    static uint32_t s_ua_cnt = 0;
+    if ((++s_ua_cnt) <= 3)
+        LOGI("[AIM-DIAG] UpdateAiming fired#%u self=%p local=%p fa=%d ah=%d",
+             s_ua_cnt, self, s_local_player, (int)s_full_aimbot, (int)s_auto_headshot);
     if (s_orig_update_aiming) {
         using Fn = void (*)(void *, void *);
         reinterpret_cast<Fn>(s_orig_update_aiming)(self, method);
@@ -961,6 +1034,10 @@ static void hook_update_aiming(void *self, void *method) {
 
 // ODKFDOFOHLN — ADS/scope aim update entry point (fired when player is scoped)
 static void hook_update_aiming_ads(void *self, void *method) {
+    static uint32_t s_ads_cnt = 0;
+    if ((++s_ads_cnt) <= 3)
+        LOGI("[AIM-DIAG] ADS-Aiming fired#%u self=%p local=%p fa=%d ah=%d",
+             s_ads_cnt, self, s_local_player, (int)s_full_aimbot, (int)s_auto_headshot);
     if (s_orig_update_aiming_ads) {
         using Fn = void (*)(void *, void *);
         reinterpret_cast<Fn>(s_orig_update_aiming_ads)(self, method);
@@ -1088,9 +1165,27 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         m_mth.checkDamageHitHead,
         m_mth.checkDamageHitHead ? "NULL_method_ptr" : "NULL_mth"); }
 
-    LOGI("AutoHeadshot: %s  center_hook=%p bone=%p collider=%p headTF=%p hithead=%p",
+    // TakeDamage(4) diagnostic — install when AutoHeadshot on so we can see if damage
+    // pipeline calls CheckDamageHitHead or bypasses it entirely
+    if (m_mth.takeDamage4 && m_mth.takeDamage4->methodPointer) {
+        if (enable && !s_orig_take_damage_4_hook) {
+            HookEngine::get().hookAddr(m_mth.takeDamage4->methodPointer,
+                reinterpret_cast<void *>(hook_take_damage_4), &s_orig_take_damage_4_hook, "TD4Diag");
+            LOGI("[HS-GATE] TakeDamage(4) diagnostic hooked: trampoline=%p", s_orig_take_damage_4_hook);
+        } else if (!enable && s_orig_take_damage_4_hook) {
+            HookEngine::get().unhook(m_mth.takeDamage4->methodPointer);
+            s_orig_take_damage_4_hook = nullptr;
+        }
+    } else {
+        LOGE("[HS-GATE] TakeDamage(4) NOT resolved — damage pipeline invisible to us");
+    }
+
+    LOGI("AutoHeadshot: %s  center=%p bone=%p headTF=%p hithead=%p aimRot=%p updAim=%p updADS=%p local_fn=%p",
          enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_get_head_bone,
-         s_orig_get_head_collider, s_orig_get_head_tf, s_orig_check_dmg_hithead);
+         s_orig_get_head_tf, s_orig_check_dmg_hithead, s_orig_set_aim_rot,
+         s_orig_update_aiming, s_orig_update_aiming_ads, s_is_local_player_fn);
+    LOGI("AutoHeadshot: enemy_count=%d local_player=%p getpos=%p gettrans=%p",
+         s_enemy_count, s_local_player, s_orig_getpos, s_orig_gettrans);
 }
 
 void FeatureEngine::applySilentAim(bool enable) {
