@@ -158,6 +158,7 @@ private:
         MethodInfo *gsEnableTeamOL    = nullptr;  // GameSettingData.EnableShowTeamOutline(bool)
         // Headshot / Aimbot — Player class
         MethodInfo *isLocalPlayer     = nullptr;  // Player.IsLocalPlayer() → bool
+        MethodInfo *updateAimingADS   = nullptr;  // ODKFDOFOHLN — ADS/scope aim update
         MethodInfo *getHeadBoneTransform = nullptr; // Player.get_HeadBoneTransform()
         MethodInfo *setAimRotation       = nullptr; // Player.SetAimRotation(Vector3)
         MethodInfo *updateAiming         = nullptr; // Player.UpdateAiming()  (per-frame)

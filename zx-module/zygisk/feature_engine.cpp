@@ -82,6 +82,7 @@ void FeatureEngine::resolveClasses() {
         m_mth.getHeadTF            = Il2CppApi::getMethod(m_cls.Player, "GetHeadTF",             0);
         m_mth.setAimRotation       = Il2CppApi::getMethod(m_cls.Player, "SetAimRotation",        -1);
         m_mth.updateAiming         = Il2CppApi::getMethod(m_cls.Player, "UpdateAiming",          -1);
+        m_mth.updateAimingADS      = Il2CppApi::getMethod(m_cls.Player, "ODKFDOFOHLN",            -1);
         m_mth.hasHeuristicTarget   = Il2CppApi::getMethod(m_cls.Player, "HasHeuristicTarget",     0);
         m_mth.getHeuristicTarget   = Il2CppApi::getMethod(m_cls.Player, "GetHeuristicTarget",     0);
         LOGI("[AIM] GetAttackableCenterWS=%p GetHeadBoneTransform=%p SetAimRotation=%p",
@@ -458,6 +459,7 @@ static void *s_orig_get_head_tf         = nullptr;  // Player.GetHeadTF() — al
 static void *s_orig_collider_get_bounds = nullptr;  // Collider.get_bounds() → Bounds{center,extents}
 static void *s_orig_set_aim_rot         = nullptr;  // Player.SetAimRotation
 static void *s_orig_update_aiming       = nullptr;  // Player.UpdateAiming
+static void *s_orig_update_aiming_ads   = nullptr;  // Player.ODKFDOFOHLN (ADS/scope)
 static void *s_orig_has_heuristic       = nullptr;  // Player.HasHeuristicTarget
 static void *s_orig_get_heuristic       = nullptr;  // Player.GetHeuristicTarget
 static void *s_orig_check_dmg_hithead   = nullptr;  // Player.CheckDamageHitHead
@@ -864,31 +866,25 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
     return reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
 }
 
-// UpdateAiming — per-frame full aimbot: snap aim rotation toward nearest enemy head.
-// Fires only on local player. Enemy list is built in hook_player_update.
-static void hook_update_aiming(void *self, void *method) {
-    if (s_orig_update_aiming) {
-        using Fn = void (*)(void *, void *);
-        reinterpret_cast<Fn>(s_orig_update_aiming)(self, method);
-    }
+// ── Aimbot core — shared by UpdateAiming and ODKFDOFOHLN (ADS) hooks ─────────
+// Prefers GetHeadTF (stable transform, no animation jitter) over bone for fast-
+// moving targets; falls back to bone if GetHeadTF returns null/zero.
+static inline void run_aimbot_core(void *self) {
     if (!s_full_aimbot) return;
-    // Only apply aimbot on the local player — s_local_player is set in hook_player_update
     if (s_local_player && self != s_local_player) return;
-
     if (!s_orig_getpos || !s_orig_gettrans) return;
 
-    // Own position
     using GetTransFn = void *(*)(void *, void *);
     void *myT = reinterpret_cast<GetTransFn>(s_orig_gettrans)(self, nullptr);
     if (!myT) return;
     using GetPosFn = Vec3 (*)(void *, void *);
     Vec3 myPos = reinterpret_cast<GetPosFn>(s_orig_getpos)(myT, nullptr);
 
-    // Step 1: try HeuristicTarget (aim-assist active case)
     void *bestEnemy = nullptr;
     Vec3  bestHead  = {};
     float bestDist2 = 1e20f;
 
+    // Step 1: HeuristicTarget (aim-assist active path)
     if (s_orig_has_heuristic && s_orig_get_heuristic) {
         using HasFn = uint8_t (*)(void *, void *);
         if (reinterpret_cast<HasFn>(s_orig_has_heuristic)(self, nullptr)) {
@@ -898,15 +894,25 @@ static void hook_update_aiming(void *self, void *method) {
         }
     }
 
-    // Step 2: if HeuristicTarget unavailable (stationary/no aim-assist), scan enemy list
-    if (!bestEnemy && s_orig_get_head_bone) {
-        using GetBoneFn = void *(*)(void *, void *);
+    // Step 2: enemy list scan — covers stationary enemies + fast movers
+    // GetHeadTF is a stable non-animated transform (no jitter on fast movement);
+    // bone is a fallback when GetHeadTF is unavailable or returns zero.
+    if (!bestEnemy && (s_orig_get_head_tf || s_orig_get_head_bone)) {
         for (int i = 0; i < s_enemy_count; ++i) {
             void *ep = s_enemy_list[i];
             if (!ep || ep == self) continue;
-            void *hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(ep, nullptr);
+            void *hT = nullptr;
+            if (s_orig_get_head_tf) {
+                using GetTFFn = void *(*)(void *, void *);
+                hT = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(ep, nullptr);
+            }
+            if (!hT && s_orig_get_head_bone) {
+                using GetBoneFn = void *(*)(void *, void *);
+                hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(ep, nullptr);
+            }
             if (!hT) continue;
             Vec3 hPos = reinterpret_cast<GetPosFn>(s_orig_getpos)(hT, nullptr);
+            if (hPos.x == 0.f && hPos.y == 0.f && hPos.z == 0.f) continue;
             float dx2 = hPos.x - myPos.x, dy2 = hPos.y - myPos.y, dz2 = hPos.z - myPos.z;
             float d2  = dx2*dx2 + dy2*dy2 + dz2*dz2;
             if (d2 < bestDist2) { bestDist2 = d2; bestEnemy = ep; bestHead = hPos; }
@@ -914,11 +920,17 @@ static void hook_update_aiming(void *self, void *method) {
     }
     if (!bestEnemy) return;
 
-    // Resolve head position for HeuristicTarget path
+    // Resolve head position for HeuristicTarget path (prefer stable GetHeadTF)
     if (bestDist2 >= 1e20f) {
-        if (!s_orig_get_head_bone) return;
-        using GetBoneFn = void *(*)(void *, void *);
-        void *hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(bestEnemy, nullptr);
+        void *hT = nullptr;
+        if (s_orig_get_head_tf) {
+            using GetTFFn = void *(*)(void *, void *);
+            hT = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(bestEnemy, nullptr);
+        }
+        if (!hT && s_orig_get_head_bone) {
+            using GetBoneFn = void *(*)(void *, void *);
+            hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(bestEnemy, nullptr);
+        }
         if (!hT) return;
         bestHead = reinterpret_cast<GetPosFn>(s_orig_getpos)(hT, nullptr);
     }
@@ -927,7 +939,7 @@ static void hook_update_aiming(void *self, void *method) {
     float dy    = bestHead.y - myPos.y;
     float dz    = bestHead.z - myPos.z;
     float horiz = sqrtf(dx*dx + dz*dz);
-    // Free Fire uses -Z as player forward direction: negate dz so enemy at -Z gives yaw=0
+    // Free Fire uses -Z as player forward direction
     float yaw   =  atan2f(dx, -dz) * (180.0f / 3.14159265f);
     float pitch = -atan2f(dy, horiz) * (180.0f / 3.14159265f);
 
@@ -935,6 +947,24 @@ static void hook_update_aiming(void *self, void *method) {
     Vec3 aimRot = {pitch, yaw, 0.0f};
     using SetAimFn = void (*)(void *, Vec3, void *);
     reinterpret_cast<SetAimFn>(s_orig_set_aim_rot)(self, aimRot, nullptr);
+}
+
+// UpdateAiming — per-frame full aimbot entry point (hip-fire / normal mode)
+static void hook_update_aiming(void *self, void *method) {
+    if (s_orig_update_aiming) {
+        using Fn = void (*)(void *, void *);
+        reinterpret_cast<Fn>(s_orig_update_aiming)(self, method);
+    }
+    run_aimbot_core(self);
+}
+
+// ODKFDOFOHLN — ADS/scope aim update entry point (fired when player is scoped)
+static void hook_update_aiming_ads(void *self, void *method) {
+    if (s_orig_update_aiming_ads) {
+        using Fn = void (*)(void *, void *);
+        reinterpret_cast<Fn>(s_orig_update_aiming_ads)(self, method);
+    }
+    run_aimbot_core(self);
 }
 
 // ── Shared helper: install / remove GetAttackableCenterWS hook ────────────────
@@ -1113,7 +1143,7 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     if (enable) installAimCenterHook(m_mth.calcAimTarget);
     else        removeAimCenterHook(m_mth.calcAimTarget);
 
-    // Hook UpdateAiming for per-frame aim snap
+    // Hook UpdateAiming for per-frame aim snap (hip-fire / normal mode)
     if (m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
         if (enable && !s_orig_update_aiming) {
             HookEngine::get().hookAddr(m_mth.updateAiming->methodPointer,
@@ -1122,7 +1152,6 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         } else if (!enable && s_orig_update_aiming) {
             HookEngine::get().unhook(m_mth.updateAiming->methodPointer);
             s_orig_update_aiming = nullptr;
-            // Clear enemy list and local player cache on aimbot disable
             s_enemy_count = 0;
             s_local_player = nullptr;
             LOGI("[AIM] UpdateAiming unhooked, enemy list cleared");
@@ -1131,10 +1160,36 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         LOGE("[AIM] FullAimbot: UpdateAiming ptr null");
     }
 
-    LOGI("FullAimbot: %s  update=%p center=%p heuristic=%p/%p",
+    // ODKFDOFOHLN — ADS/scope aim update (same aimbot core, different entry point)
+    if (m_mth.updateAimingADS && m_mth.updateAimingADS->methodPointer) {
+        if (enable && !s_orig_update_aiming_ads) {
+            HookEngine::get().hookAddr(m_mth.updateAimingADS->methodPointer,
+                reinterpret_cast<void *>(hook_update_aiming_ads), &s_orig_update_aiming_ads, "AimbotADS");
+            LOGI("[AIM] ODKFDOFOHLN hooked: trampoline=%p", s_orig_update_aiming_ads);
+        } else if (!enable && s_orig_update_aiming_ads) {
+            HookEngine::get().unhook(m_mth.updateAimingADS->methodPointer);
+            s_orig_update_aiming_ads = nullptr;
+        }
+    } else {
+        LOGI("[AIM] ODKFDOFOHLN not found — ADS tracking via UpdateAiming only");
+    }
+
+    // CheckDamageHitHead — ensures stationary enemy headshots register on full aimbot
+    if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer) {
+        if (enable && !s_orig_check_dmg_hithead) {
+            HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,
+                reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
+            LOGI("[AIM] CheckDamageHitHead hooked (FullAimbot): trampoline=%p", s_orig_check_dmg_hithead);
+        } else if (!enable && !s_auto_headshot && !s_silent_aim && s_orig_check_dmg_hithead) {
+            HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
+            s_orig_check_dmg_hithead = nullptr;
+        }
+    }
+
+    LOGI("FullAimbot: %s  update=%p ads=%p center=%p hithead=%p heuristic=%p/%p",
          enable ? "ON" : "OFF",
-         s_orig_update_aiming, s_orig_attackable_ctr,
-         s_orig_has_heuristic, s_orig_get_heuristic);
+         s_orig_update_aiming, s_orig_update_aiming_ads, s_orig_attackable_ctr,
+         s_orig_check_dmg_hithead, s_orig_has_heuristic, s_orig_get_heuristic);
 }
 
 void FeatureEngine::applyAntiAim(bool enable) {
