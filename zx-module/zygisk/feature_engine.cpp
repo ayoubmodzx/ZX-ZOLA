@@ -535,9 +535,11 @@ static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
 }
 
 // ESP: SetOutlineVisible — binary-verified: pc=2 (uint8 visible, int mode).
+// game_val=16 is the native through-wall state (used for teammates). Force 16 on enemies too.
 static void hook_set_outline_vis(void *self, uint8_t visible, int mode, void *method) {
-    // Game natively calls with visible=2 (outline on). Force 2 if game tries to hide (0).
-    uint8_t forced = (s_esp && visible == 0) ? 2 : visible;
+    // 16 = through-wall outline (confirmed from logcat: game uses 16 for team outlines).
+    // Force 16 when game tries to hide (0) or uses a weaker value (<16).
+    uint8_t forced = (s_esp && visible < 16) ? 16 : visible;
     LOGI("[ESP-DBG] SetOutlineVisible: self=%p game_val=%d mode=%d forced=%d esp=%d", self, (int)visible, mode, (int)forced, (int)s_esp);
     using Fn = void (*)(void *, uint8_t, int, void *);
     reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, mode, method);
@@ -549,11 +551,12 @@ static void hook_init_outline(void *self, void *param0, void *method) {
     LOGI("[ESP-DBG] InitOutline fired: self=%p param0=%p esp=%d outline_fn=%p", self, param0, (int)s_esp, s_orig_set_outline_vis);
     using Fn = void (*)(void *, void *, void *);
     reinterpret_cast<Fn>(s_orig_init_outline)(self, param0, method);
-    LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(2,1)");
+    LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(16,0+1)");
     if (s_esp && s_orig_set_outline_vis) {
         using ShowFn = void (*)(void *, uint8_t, int, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, nullptr);
-        LOGI("[ESP-DBG] SetOutlineVisible(2,1) injected for self=%p", self);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 0, nullptr);  // enemy mode
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 1, nullptr);  // team mode
+        LOGI("[ESP-DBG] SetOutlineVisible(16,0+1) injected for self=%p", self);
     } else {
         LOGI("[ESP-DBG] InitOutline: skipped inject (esp=%d fn=%p)", (int)s_esp, s_orig_set_outline_vis);
     }
@@ -607,19 +610,24 @@ static void hook_player_update(void *self, void *method) {
     // Pass nullptr for MethodInfo* — method here is Player.Update's MethodInfo,
     // which is wrong for SetOutlineVisible. nullptr is safe; game ignores it.
     if (s_esp) {
-        if (s_orig_set_outline_vis) {
-            ++s_global_outline_tick;
-            uint32_t slot = ((uintptr_t)self >> 12) & 0x1F;
-            if ((s_global_outline_tick % 30) == (slot % 30)) {
+        ++s_global_outline_tick;
+        uint32_t slot = ((uintptr_t)self >> 12) & 0x1F;
+        if ((s_global_outline_tick % 30) == (slot % 30)) {
+            // value=16 is the through-wall outline state (confirmed from game's own team calls)
+            if (s_orig_set_outline_vis) {
                 using ShowFn = void (*)(void *, uint8_t, int, void *);
-                // mode=0 → enemy outline, mode=1 → teammate outline; call both to cover all cases
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 0, nullptr);
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 2, 1, nullptr);
-                static uint32_t s_sov_fire_cnt = 0;
-                if ((++s_sov_fire_cnt) <= 10)
-                    LOGI("[ESP-DBG] proactive SOV(2,0+1) fire#%u self=%p slot=%u tick=%u",
-                        s_sov_fire_cnt, self, slot, s_global_outline_tick);
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 0, nullptr);  // enemy
+                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 1, nullptr);  // team
             }
+            // SetRenderQ(5000) renders enemy above walls (Overlay queue)
+            if (s_orig_set_render_q) {
+                using SetRQFn = void (*)(void *, int, void *);
+                reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
+            }
+            static uint32_t s_sov_fire_cnt = 0;
+            if ((++s_sov_fire_cnt) <= 10)
+                LOGI("[ESP-DBG] proactive SOV(16,0+1)+RQ(5000) fire#%u self=%p slot=%u tick=%u",
+                    s_sov_fire_cnt, self, slot, s_global_outline_tick);
         }
     }
     // ── Teleport tick ────────────────────────────────────────────────────────
@@ -763,8 +771,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 Vec3 tp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headTF, nullptr);
                 if (do_log) LOGI("[HS-CRASH] aim#%u GetHeadTF.pos=(%.3f,%.3f,%.3f)", s_aim_cnt, tp.x, tp.y, tp.z);
                 if (tp.x != 0.0f || tp.y != 0.0f || tp.z != 0.0f) {
-                    tp.y += 0.15f;
-                    return tp;
+                    return tp;  // GetHeadTF is already at head center — no offset needed
                 }
             }
             if (do_log) LOGI("[HS-CRASH] aim#%u P2 GetHeadTF=null/zero — falling back", s_aim_cnt);
@@ -784,8 +791,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
                 if (do_log) LOGI("[HS-CRASH] aim#%u bone.pos=(%.3f,%.3f,%.3f)", s_aim_cnt, hp.x, hp.y, hp.z);
                 if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
-                    hp.y += 0.15f;
-                    return hp;
+                    return hp;  // head bone position, no offset
                 }
             }
         } else {
