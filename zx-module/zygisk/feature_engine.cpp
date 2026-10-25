@@ -870,8 +870,9 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
 // Prefers GetHeadTF (stable transform, no animation jitter) over bone for fast-
 // moving targets; falls back to bone if GetHeadTF returns null/zero.
 static inline void run_aimbot_core(void *self) {
-    if (!s_full_aimbot) return;
-    if (s_local_player && self != s_local_player) return;
+    if (!s_full_aimbot && !s_auto_headshot) return;
+    // Require local player to be known; bail for any non-local instance
+    if (!s_local_player || self != s_local_player) return;
     if (!s_orig_getpos || !s_orig_gettrans) return;
 
     using GetTransFn = void *(*)(void *, void *);
@@ -1014,6 +1015,34 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         if (!s_res_id_cls)       s_res_id_cls       = m_cls.ResIdDef;
         if (!s_res_id_get_inst && m_mth.resIdGetInstance)
             s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
+        // SetAimRotation + IsLocalPlayer needed for run_aimbot_core (force-aim path)
+        if (!s_orig_set_aim_rot && m_mth.setAimRotation)
+            s_orig_set_aim_rot = m_mth.setAimRotation->methodPointer;
+        if (!s_is_local_player_fn && m_mth.isLocalPlayer)
+            s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
+    }
+
+    // UpdateAiming hook — forces physical aim toward enemy head (hip-fire + ADS)
+    // Without this, AutoHeadshot only redirects aim-assist and can't force aim on body shots.
+    if (m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
+        if (enable && !s_orig_update_aiming) {
+            HookEngine::get().hookAddr(m_mth.updateAiming->methodPointer,
+                reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "AutoHSAim");
+            LOGI("[AIM] AutoHeadshot UpdateAiming hooked: trampoline=%p", s_orig_update_aiming);
+        } else if (!enable && !s_full_aimbot && s_orig_update_aiming) {
+            HookEngine::get().unhook(m_mth.updateAiming->methodPointer);
+            s_orig_update_aiming = nullptr;
+        }
+    }
+    if (m_mth.updateAimingADS && m_mth.updateAimingADS->methodPointer) {
+        if (enable && !s_orig_update_aiming_ads) {
+            HookEngine::get().hookAddr(m_mth.updateAimingADS->methodPointer,
+                reinterpret_cast<void *>(hook_update_aiming_ads), &s_orig_update_aiming_ads, "AutoHSADS");
+            LOGI("[AIM] AutoHeadshot ODKFDOFOHLN hooked: trampoline=%p", s_orig_update_aiming_ads);
+        } else if (!enable && !s_full_aimbot && s_orig_update_aiming_ads) {
+            HookEngine::get().unhook(m_mth.updateAimingADS->methodPointer);
+            s_orig_update_aiming_ads = nullptr;
+        }
     }
 
     // Hook GetAttackableCenterWS → head position
