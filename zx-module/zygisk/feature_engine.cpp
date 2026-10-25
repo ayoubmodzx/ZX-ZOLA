@@ -607,30 +607,6 @@ static void hook_player_update(void *self, void *method) {
     // Pass nullptr for MethodInfo* — method here is Player.Update's MethodInfo,
     // which is wrong for SetOutlineVisible. nullptr is safe; game ignores it.
     if (s_esp) {
-        // ── Once-per-match: call MatchGame.ShowPlayerOutline(true) on the game thread ──
-        // This is the game's own enemy-outline API. Calling it here (inside a hooked Unity
-        // Update) is safe — we're on the managed IL2CPP game thread with a valid context.
-        // s_matchgame_outline_done resets to false on every applyESP(false) call.
-        if (!s_matchgame_outline_done && s_match_get_inst_fn && s_match_show_outline_fn) {
-            using GetMatchFn = void *(*)(void *);  // static method, no this
-            void *mg = reinterpret_cast<GetMatchFn>(s_match_get_inst_fn)(nullptr);
-            if (mg) {
-                if (s_match_try_init_fn) {
-                    using TryInitFn = void (*)(void *, void *);
-                    reinterpret_cast<TryInitFn>(s_match_try_init_fn)(mg, nullptr);
-                    LOGI("[ESP-DBG] TryInitPlayerOutlineRes called mg=%p", mg);
-                }
-                using ShowOLFn = void (*)(void *, uint8_t, void *);
-                reinterpret_cast<ShowOLFn>(s_match_show_outline_fn)(mg, 1, nullptr);
-                LOGI("[ESP-DBG] ShowPlayerOutline(true) called mg=%p", mg);
-                if (s_match_show_team_outline_fn)
-                    reinterpret_cast<ShowOLFn>(s_match_show_team_outline_fn)(mg, 1, nullptr);
-                s_matchgame_outline_done = true;
-            } else {
-                LOGI("[ESP-DBG] GetMatch() returned null — will retry");
-            }
-        }
-
         if (s_orig_set_outline_vis) {
             ++s_global_outline_tick;
             uint32_t slot = ((uintptr_t)self >> 12) & 0x1F;
@@ -787,7 +763,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 Vec3 tp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headTF, nullptr);
                 if (do_log) LOGI("[HS-CRASH] aim#%u GetHeadTF.pos=(%.3f,%.3f,%.3f)", s_aim_cnt, tp.x, tp.y, tp.z);
                 if (tp.x != 0.0f || tp.y != 0.0f || tp.z != 0.0f) {
-                    tp.y -= 0.15f;
+                    tp.y += 0.15f;
                     return tp;
                 }
             }
@@ -808,7 +784,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
                 Vec3 hp = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
                 if (do_log) LOGI("[HS-CRASH] aim#%u bone.pos=(%.3f,%.3f,%.3f)", s_aim_cnt, hp.x, hp.y, hp.z);
                 if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f) {
-                    hp.y -= 0.15f;
+                    hp.y += 0.15f;
                     return hp;
                 }
             }
