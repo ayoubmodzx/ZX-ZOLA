@@ -153,7 +153,11 @@ private:
         MethodInfo *showPlayerOutline = nullptr;  // ResourceIDDef.ShowPlayerOutline(bool)
         // COW::GameSettingData — server-side outline gate
         MethodInfo *enableOutlineMth  = nullptr;  // GameSettingData.EnableShowPlayerOutline(bool)
+        MethodInfo *gsGetInstance     = nullptr;  // GameSettingData.get_Instance() [static]
+        MethodInfo *gsEnablePlayerOL  = nullptr;  // GameSettingData.EnableShowPlayerOutline(bool)
+        MethodInfo *gsEnableTeamOL    = nullptr;  // GameSettingData.EnableShowTeamOutline(bool)
         // Headshot / Aimbot — Player class
+        MethodInfo *isLocalPlayer     = nullptr;  // Player.IsLocalPlayer() → bool
         MethodInfo *getHeadBoneTransform = nullptr; // Player.get_HeadBoneTransform()
         MethodInfo *setAimRotation       = nullptr; // Player.SetAimRotation(Vector3)
         MethodInfo *updateAiming         = nullptr; // Player.UpdateAiming()  (per-frame)

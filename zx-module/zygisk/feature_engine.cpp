@@ -44,6 +44,11 @@ static FieldInfo *s_enable_outline_field = nullptr;
 // Through-wall render queue trampolines (filled by applyESP hook setup)
 static void *s_orig_set_render_q    = nullptr;
 static void *s_orig_revert_render_q = nullptr;
+// GameSettingData game-thread permission gate
+static void  *s_gs_get_instance_fn  = nullptr;  // GameSettingData.get_Instance()
+static void  *s_gs_enable_team_fn   = nullptr;  // GameSettingData.EnableShowTeamOutline()
+// Local-player detection + enemy tracking for aimbot
+static void  *s_is_local_player_fn  = nullptr;  // Player.IsLocalPlayer()
 
 void FeatureEngine::resolveClasses() {
     Il2CppImage *img = Il2CppApi::getImage("Assembly-CSharp");
@@ -87,6 +92,9 @@ void FeatureEngine::resolveClasses() {
              m_mth.updateAiming       ? m_mth.updateAiming->methodPointer       : nullptr,
              m_mth.hasHeuristicTarget ? m_mth.hasHeuristicTarget->methodPointer : nullptr,
              m_mth.getHeuristicTarget ? m_mth.getHeuristicTarget->methodPointer : nullptr);
+        m_mth.isLocalPlayer = Il2CppApi::getMethod(m_cls.Player, "IsLocalPlayer", 0);
+        LOGI("[AIM] IsLocalPlayer=%p",
+             m_mth.isLocalPlayer ? m_mth.isLocalPlayer->methodPointer : nullptr);
         LOGI("[AIM] get_HeadCollider=%p GetHeadTF=%p",
              m_mth.getHeadCollider ? m_mth.getHeadCollider->methodPointer : nullptr,
              m_mth.getHeadTF       ? m_mth.getHeadTF->methodPointer       : nullptr);
@@ -354,13 +362,23 @@ void FeatureEngine::resolveClasses() {
              s_match_show_outline_fn, s_match_show_team_outline_fn);
     }
 
-    // GameSettingData.EnableShowPlayerOutline — call to unlock the outline permission gate
-    Il2CppClass *gsCls2 = Il2CppApi::getClass(img, "COW", "GameSettingData");
-    if (gsCls2) {
-        MethodInfo *enMth = Il2CppApi::getMethod(gsCls2, "EnableShowPlayerOutline", -1);
-        if (enMth && enMth->methodPointer)
-            s_gs_enable_outline_fn = enMth->methodPointer;
-        LOGI("[ESP] GameSettingData.EnableShowPlayerOutline=%p", s_gs_enable_outline_fn);
+    // GameSettingData singleton gate — resolve get_Instance + EnableShow* + EnableTeam*
+    {
+        Il2CppClass *gsCls2 = Il2CppApi::getClass(img, "COW", "GameSettingData");
+        if (gsCls2) {
+            MethodInfo *enMth = Il2CppApi::getMethod(gsCls2, "EnableShowPlayerOutline", -1);
+            if (enMth && enMth->methodPointer)
+                s_gs_enable_outline_fn = enMth->methodPointer;
+            m_mth.gsGetInstance    = Il2CppApi::getMethod(gsCls2, "get_Instance",            0);
+            m_mth.gsEnablePlayerOL = enMth;
+            m_mth.gsEnableTeamOL   = Il2CppApi::getMethod(gsCls2, "EnableShowTeamOutline",   1);
+            if (m_mth.gsGetInstance && m_mth.gsGetInstance->methodPointer)
+                s_gs_get_instance_fn = m_mth.gsGetInstance->methodPointer;
+            if (m_mth.gsEnableTeamOL && m_mth.gsEnableTeamOL->methodPointer)
+                s_gs_enable_team_fn = m_mth.gsEnableTeamOL->methodPointer;
+            LOGI("[ESP] GSD: EnablePlayer=%p get_Instance=%p EnableTeam=%p",
+                 s_gs_enable_outline_fn, s_gs_get_instance_fn, s_gs_enable_team_fn);
+        }
     }
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
@@ -457,6 +475,12 @@ static void        *s_res_id_inst          = nullptr;  // cached singleton insta
 // Flag: ShowPlayerOutline(true) was successfully called this match session.
 // Reset on applyESP(false) so next enable tries again.
 static bool         s_matchgame_outline_done = false;
+
+// GameSettingData game-thread call state + enemy tracking
+static bool   s_gs_outline_done     = false;
+static void  *s_local_player        = nullptr;
+static void  *s_enemy_list[32]      = {};
+static int    s_enemy_count         = 0;
 
 // RecoilFormula — returns float; extra void* params absorb any signature variant
 static float hook_recoil(void *self, void *a1, void *a2, void *a3, void *a4) {
@@ -628,6 +652,34 @@ static void hook_player_update(void *self, void *method) {
             if ((++s_sov_fire_cnt) <= 10)
                 LOGI("[ESP-DBG] proactive SOV(16,0+1)+RQ(5000) fire#%u self=%p slot=%u tick=%u",
                     s_sov_fire_cnt, self, slot, s_global_outline_tick);
+        }
+    }
+    // ── Player classification + GameSettingData permission gate ──────────────
+    if (s_is_local_player_fn) {
+        using IsLocalFn = uint8_t (*)(void *, void *);
+        uint8_t isLocal = reinterpret_cast<IsLocalFn>(s_is_local_player_fn)(self, nullptr);
+        if (isLocal) {
+            s_local_player = self;
+            // Call GameSettingData.EnableShowPlayerOutline/Team once per session from game thread
+            if (s_esp && !s_gs_outline_done && s_gs_get_instance_fn && s_gs_enable_outline_fn) {
+                using GetInstFn = void *(*)(void *);
+                void *gsd = reinterpret_cast<GetInstFn>(s_gs_get_instance_fn)(nullptr);
+                if (gsd) {
+                    using EnableFn = void (*)(void *, uint8_t, void *);
+                    reinterpret_cast<EnableFn>(s_gs_enable_outline_fn)(gsd, 1, nullptr);
+                    if (s_gs_enable_team_fn)
+                        reinterpret_cast<EnableFn>(s_gs_enable_team_fn)(gsd, 1, nullptr);
+                    s_gs_outline_done = true;
+                    LOGI("[ESP] GSD.EnableShowPlayerOutline(true) called gsd=%p", gsd);
+                }
+            }
+        } else {
+            // Track enemy instances for aimbot targeting
+            bool found = false;
+            for (int i = 0; i < s_enemy_count; ++i)
+                if (s_enemy_list[i] == self) { found = true; break; }
+            if (!found && s_enemy_count < 32)
+                s_enemy_list[s_enemy_count++] = self;
         }
     }
     // ── Teleport tick ────────────────────────────────────────────────────────
@@ -812,43 +864,75 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
     return reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
 }
 
-// UpdateAiming — per-frame full aimbot: snap aim rotation toward nearest enemy head
+// UpdateAiming — per-frame full aimbot: snap aim rotation toward nearest enemy head.
+// Fires only on local player. Enemy list is built in hook_player_update.
 static void hook_update_aiming(void *self, void *method) {
     if (s_orig_update_aiming) {
         using Fn = void (*)(void *, void *);
         reinterpret_cast<Fn>(s_orig_update_aiming)(self, method);
     }
     if (!s_full_aimbot) return;
-    if (!s_orig_has_heuristic || !s_orig_get_heuristic) return;
+    // Only apply aimbot on the local player — s_local_player is set in hook_player_update
+    if (s_local_player && self != s_local_player) return;
 
-    using HasFn = uint8_t (*)(void *, void *);
-    if (!reinterpret_cast<HasFn>(s_orig_has_heuristic)(self, nullptr)) return;
+    if (!s_orig_getpos || !s_orig_gettrans) return;
 
-    using GetFn = void *(*)(void *, void *);
-    void *enemy = reinterpret_cast<GetFn>(s_orig_get_heuristic)(self, nullptr);
-    if (!enemy) return;
-
-    if (!s_orig_get_head_bone || !s_orig_getpos || !s_orig_gettrans) return;
-    using GetBoneFn = void *(*)(void *, void *);
-    void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(enemy, nullptr);
-    if (!headT) return;
-    using GetPosFn = Vec3 (*)(void *, void *);
-    Vec3 enemyHead = reinterpret_cast<GetPosFn>(s_orig_getpos)(headT, nullptr);
-
+    // Own position
     using GetTransFn = void *(*)(void *, void *);
     void *myT = reinterpret_cast<GetTransFn>(s_orig_gettrans)(self, nullptr);
     if (!myT) return;
+    using GetPosFn = Vec3 (*)(void *, void *);
     Vec3 myPos = reinterpret_cast<GetPosFn>(s_orig_getpos)(myT, nullptr);
 
-    float dx     = enemyHead.x - myPos.x;
-    float dy     = enemyHead.y - myPos.y;
-    float dz     = enemyHead.z - myPos.z;
-    float horiz  = sqrtf(dx*dx + dz*dz);
-    float yaw    =  atan2f(dx, dz)    * (180.0f / 3.14159265f);
-    float pitch  = -atan2f(dy, horiz) * (180.0f / 3.14159265f);
+    // Step 1: try HeuristicTarget (aim-assist active case)
+    void *bestEnemy = nullptr;
+    Vec3  bestHead  = {};
+    float bestDist2 = 1e20f;
+
+    if (s_orig_has_heuristic && s_orig_get_heuristic) {
+        using HasFn = uint8_t (*)(void *, void *);
+        if (reinterpret_cast<HasFn>(s_orig_has_heuristic)(self, nullptr)) {
+            using GetFn = void *(*)(void *, void *);
+            void *he = reinterpret_cast<GetFn>(s_orig_get_heuristic)(self, nullptr);
+            if (he) bestEnemy = he;
+        }
+    }
+
+    // Step 2: if HeuristicTarget unavailable (stationary/no aim-assist), scan enemy list
+    if (!bestEnemy && s_orig_get_head_bone) {
+        using GetBoneFn = void *(*)(void *, void *);
+        for (int i = 0; i < s_enemy_count; ++i) {
+            void *ep = s_enemy_list[i];
+            if (!ep || ep == self) continue;
+            void *hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(ep, nullptr);
+            if (!hT) continue;
+            Vec3 hPos = reinterpret_cast<GetPosFn>(s_orig_getpos)(hT, nullptr);
+            float dx2 = hPos.x - myPos.x, dy2 = hPos.y - myPos.y, dz2 = hPos.z - myPos.z;
+            float d2  = dx2*dx2 + dy2*dy2 + dz2*dz2;
+            if (d2 < bestDist2) { bestDist2 = d2; bestEnemy = ep; bestHead = hPos; }
+        }
+    }
+    if (!bestEnemy) return;
+
+    // Resolve head position for HeuristicTarget path
+    if (bestDist2 >= 1e20f) {
+        if (!s_orig_get_head_bone) return;
+        using GetBoneFn = void *(*)(void *, void *);
+        void *hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(bestEnemy, nullptr);
+        if (!hT) return;
+        bestHead = reinterpret_cast<GetPosFn>(s_orig_getpos)(hT, nullptr);
+    }
+
+    float dx    = bestHead.x - myPos.x;
+    float dy    = bestHead.y - myPos.y;
+    float dz    = bestHead.z - myPos.z;
+    float horiz = sqrtf(dx*dx + dz*dz);
+    // Free Fire uses -Z as player forward direction: negate dz so enemy at -Z gives yaw=0
+    float yaw   =  atan2f(dx, -dz) * (180.0f / 3.14159265f);
+    float pitch = -atan2f(dy, horiz) * (180.0f / 3.14159265f);
 
     if (!s_orig_set_aim_rot) return;
-    Vec3 aimRot  = {pitch, yaw, 0.0f};
+    Vec3 aimRot = {pitch, yaw, 0.0f};
     using SetAimFn = void (*)(void *, Vec3, void *);
     reinterpret_cast<SetAimFn>(s_orig_set_aim_rot)(self, aimRot, nullptr);
 }
@@ -1022,6 +1106,8 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         if (!s_res_id_cls)      s_res_id_cls      = m_cls.ResIdDef;
         if (!s_res_id_get_inst && m_mth.resIdGetInstance)
             s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
+        if (!s_is_local_player_fn && m_mth.isLocalPlayer)
+            s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
     }
 
     if (enable) installAimCenterHook(m_mth.calcAimTarget);
@@ -1036,7 +1122,10 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         } else if (!enable && s_orig_update_aiming) {
             HookEngine::get().unhook(m_mth.updateAiming->methodPointer);
             s_orig_update_aiming = nullptr;
-            LOGI("[AIM] UpdateAiming unhooked");
+            // Clear enemy list and local player cache on aimbot disable
+            s_enemy_count = 0;
+            s_local_player = nullptr;
+            LOGI("[AIM] UpdateAiming unhooked, enemy list cleared");
         }
     } else {
         LOGE("[AIM] FullAimbot: UpdateAiming ptr null");
@@ -1328,7 +1417,14 @@ void FeatureEngine::applyESP(bool enable) {
     // Calling managed IL2CPP singletons from that thread crashes. The aim hook runs on the
     // game's own update thread which has managed context — safe to call GetMatch() there.
     // Reset the once-flag so the next match session re-enables the outline.
-    if (!enable) s_matchgame_outline_done = false;
+    if (!enable) { s_matchgame_outline_done = false; s_gs_outline_done = false; }
+    // Also cache GSD function pointers so hook_player_update can call them
+    if (enable && !s_gs_get_instance_fn && m_mth.gsGetInstance)
+        s_gs_get_instance_fn = m_mth.gsGetInstance->methodPointer;
+    if (enable && !s_gs_enable_team_fn && m_mth.gsEnableTeamOL)
+        s_gs_enable_team_fn = m_mth.gsEnableTeamOL->methodPointer;
+    if (enable && !s_is_local_player_fn && m_mth.isLocalPlayer)
+        s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
     LOGI("[ESP-DIAG] MatchGame.ShowPlayerOutline deferred to game thread (flag reset=%d)", !enable);
 
     // Layer 7: GetAttackableCenterWS hook — fires on each enemy the aim system processes.
