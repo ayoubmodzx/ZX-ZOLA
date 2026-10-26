@@ -677,6 +677,21 @@ static void hook_player_update(void *self, void *method) {
                     LOGI("[ESP] GSD.EnableShowPlayerOutline(true) called gsd=%p", gsd);
                 }
             }
+            // MatchGame.ShowPlayerOutline(true) — must be called from game main thread
+            if (s_esp && !s_matchgame_outline_done && s_match_get_inst_fn && s_match_show_outline_fn) {
+                using GetMatchFn = void *(*)(void *);
+                void *match = reinterpret_cast<GetMatchFn>(s_match_get_inst_fn)(nullptr);
+                if (match) {
+                    using ShowFn = void (*)(void *, uint8_t, void *);
+                    reinterpret_cast<ShowFn>(s_match_show_outline_fn)(match, 1, nullptr);
+                    if (s_match_show_team_outline_fn)
+                        reinterpret_cast<ShowFn>(s_match_show_team_outline_fn)(match, 1, nullptr);
+                    if (s_match_try_init_fn)
+                        reinterpret_cast<ShowFn>(s_match_try_init_fn)(match, 1, nullptr);
+                    s_matchgame_outline_done = true;
+                    LOGI("[ESP] MatchGame.ShowPlayerOutline(true) called match=%p", match);
+                }
+            }
         } else {
             // Track enemy instances for aimbot targeting
             bool found = false;
@@ -897,7 +912,7 @@ static uint32_t s_aim_core_norot  = 0;  // times SetAimRotation ptr missing
 static uint32_t s_aim_core_ok     = 0;  // times SetAimRotation fired
 
 static inline void run_aimbot_core(void *self) {
-    if (!s_full_aimbot && !s_auto_headshot) return;
+    if (!s_full_aimbot) return;  // AutoHeadshot uses separate non-aim-lock path
     // Require local player to be known; bail for any non-local instance
     if (!s_local_player || self != s_local_player) {
         static uint32_t s_wrong_self = 0;
@@ -1038,11 +1053,14 @@ static void hook_update_aiming_ads(void *self, void *method) {
     if ((++s_ads_cnt) <= 3)
         LOGI("[AIM-DIAG] ADS-Aiming fired#%u self=%p local=%p fa=%d ah=%d",
              s_ads_cnt, self, s_local_player, (int)s_full_aimbot, (int)s_auto_headshot);
-    if (s_orig_update_aiming_ads) {
+    // self=0x8 observed in ADS — ODKFDOFOHLN likely static or non-standard convention
+    if (s_orig_update_aiming_ads && (uintptr_t)self > 0x10000) {
         using Fn = void (*)(void *, void *);
         reinterpret_cast<Fn>(s_orig_update_aiming_ads)(self, method);
     }
-    run_aimbot_core(self);
+    // ADS self may be garbage; use s_local_player directly for aimbot core
+    if (s_full_aimbot && s_local_player)
+        run_aimbot_core(s_local_player);
 }
 
 // ── Shared helper: install / remove GetAttackableCenterWS hook ────────────────
@@ -1097,29 +1115,6 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             s_orig_set_aim_rot = m_mth.setAimRotation->methodPointer;
         if (!s_is_local_player_fn && m_mth.isLocalPlayer)
             s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
-    }
-
-    // UpdateAiming hook — forces physical aim toward enemy head (hip-fire + ADS)
-    // Without this, AutoHeadshot only redirects aim-assist and can't force aim on body shots.
-    if (m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
-        if (enable && !s_orig_update_aiming) {
-            HookEngine::get().hookAddr(m_mth.updateAiming->methodPointer,
-                reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "AutoHSAim");
-            LOGI("[AIM] AutoHeadshot UpdateAiming hooked: trampoline=%p", s_orig_update_aiming);
-        } else if (!enable && !s_full_aimbot && s_orig_update_aiming) {
-            HookEngine::get().unhook(m_mth.updateAiming->methodPointer);
-            s_orig_update_aiming = nullptr;
-        }
-    }
-    if (m_mth.updateAimingADS && m_mth.updateAimingADS->methodPointer) {
-        if (enable && !s_orig_update_aiming_ads) {
-            HookEngine::get().hookAddr(m_mth.updateAimingADS->methodPointer,
-                reinterpret_cast<void *>(hook_update_aiming_ads), &s_orig_update_aiming_ads, "AutoHSADS");
-            LOGI("[AIM] AutoHeadshot ODKFDOFOHLN hooked: trampoline=%p", s_orig_update_aiming_ads);
-        } else if (!enable && !s_full_aimbot && s_orig_update_aiming_ads) {
-            HookEngine::get().unhook(m_mth.updateAimingADS->methodPointer);
-            s_orig_update_aiming_ads = nullptr;
-        }
     }
 
     // Hook GetAttackableCenterWS → head position
