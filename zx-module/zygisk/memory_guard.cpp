@@ -1,5 +1,4 @@
 #include "memory_guard.hpp"
-#include "hook_engine.hpp"
 #include <android/log.h>
 #include <cstdio>
 #include <cstring>
@@ -8,7 +7,6 @@
 #include <sys/prctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
-#include <link.h>
 
 #define TAG "ZX-MEM"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -23,40 +21,6 @@ static struct {
     uintptr_t base;
     size_t    size;
 } g_self_range = {0, 0};
-
-// ── Phase 3: dl_iterate_phdr hook ─────────────────────────────────────────────
-// AnoSDK calls dl_iterate_phdr to enumerate every loaded library and check for
-// injected .so files.  We intercept each callback invocation and silently skip
-// our own entry — the scanner sees a clean library list with no trace of us.
-
-struct DlHideCtx {
-    int  (*user_cb)(struct dl_phdr_info *, size_t, void *);
-    void  *user_data;
-};
-using DlIterateFn = int (*)(int (*)(struct dl_phdr_info *, size_t, void *), void *);
-static DlIterateFn s_orig_dl_iterate = nullptr;
-
-static int dl_hide_trampoline(struct dl_phdr_info *info, size_t sz, void *raw) {
-    auto *ctx = static_cast<DlHideCtx *>(raw);
-    // Skip by load bias — our base is the first mapped page
-    if (g_self_range.base &&
-        info->dlpi_addr >= g_self_range.base &&
-        info->dlpi_addr <  g_self_range.base + g_self_range.size) {
-        return 0;
-    }
-    // Belt-and-suspenders: also skip by name in case the base shifted
-    if (info->dlpi_name && strstr(info->dlpi_name, "libzx_zola")) {
-        return 0;
-    }
-    return ctx->user_cb(info, sz, ctx->user_data);
-}
-
-static int hook_dl_iterate_phdr(
-        int (*cb)(struct dl_phdr_info *, size_t, void *), void *data) {
-    if (!s_orig_dl_iterate) return 0;
-    DlHideCtx ctx{ cb, data };
-    return s_orig_dl_iterate(dl_hide_trampoline, &ctx);
-}
 
 // Walk /proc/self/maps to find our module's full loaded range.
 // MUST use raw syscalls — our openat hook filters out the so_name lines,
@@ -140,18 +104,10 @@ bool MemoryGuard::hideSelf() {
     prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
           reinterpret_cast<void *>(base), sz, nullptr);
 
-    // 3. Hook dl_iterate_phdr so any linker-level library enumeration by AnoSDK
-    //    skips us entirely.  The hook wraps the user-supplied callback and drops
-    //    the invocation for our own phdr entry — invisible to all callers
-    //    including AnoSDK's inline-hook detector and library scanner.
-    //    Both libc.so paths (the exported symbol and the PLT slot in libanogs.so)
-    //    are covered because Dobby patches the export in libc.so itself.
-    HookEngine::get().hookSym("libc.so", "dl_iterate_phdr",
-        reinterpret_cast<void *>(hook_dl_iterate_phdr),
-        reinterpret_cast<void **>(&s_orig_dl_iterate),
-        "DlIterHide");
+    // dl_iterate_phdr is intercepted via GOT patching in anosdk_bypass.cpp
+    // (patched in libanogs.so GOT — no Dobby on libc, undetectable by AnoSDK).
 
-    LOGI("Self hidden: base=0x%lx size=0x%zx — ELF zeroed / VMA renamed / dl_iterate hooked",
+    LOGI("Self hidden: base=0x%lx size=0x%zx — ELF zeroed / VMA renamed",
          base, sz);
     return true;
 }
