@@ -176,6 +176,112 @@ AimAssist parameters (field names found in binary):
 
 ---
 
+## 7. ESP / WALLHACK SYSTEM
+
+### How the outline system works in the binary
+
+Free Fire's outline ("neon") visibility pipeline has **four independent gating layers** that all must pass before an enemy outline appears:
+
+```
+1. GameSettingData.EnableShowPlayerOutline(bool) — server-side permission flag
+2. MatchGame.ShowPlayerOutline(bool)             — match-level outline enable
+3. m_PlayerOutlineTickets (field on Player)       — TICKET system: outline only shows
+                                                    if the correct ticket/key is present
+4. OutlineVisibleJudgeInUpDate()                  — per-frame judge that RE-EVALUATES
+                                                    all tickets and RESETS the visible state
+```
+
+**The per-frame judge is the root cause** of wallhack not persisting. `OutlineVisibleJudgeInUpDate` (confirmed in metadata: `COW-GamePlay-Player-OutlineVisibleJudgeInUpDate`) fires inside `Player.Update` EVERY FRAME. It re-reads `m_PlayerOutlineTickets` and recomputes `m_IsShowPlayerOutLine`, overriding any direct `SetOutlineVisible` calls made from outside the judge. So even if we call `SetOutlineVisible(16)` at 30-tick intervals, the judge runs at 60+ fps and resets it back to 0 every frame.
+
+### The ticket system (`m_PlayerOutlineTickets`)
+
+Fields confirmed in metadata:
+- `m_PlayerOutlineTickets` — a collection of active outline "ticket" keys on each Player
+- `ShowPlayerOutlineKey` / `ShowTeamOutlineKey` — the keys; only when the correct key is in the collection does the judge allow visibility
+- `m_IsShowPlayerOutLine` — the **bool result** the judge writes; what the renderer actually reads
+
+The game's own team outline works by inserting `ShowTeamOutlineKey` into each teammate's `m_PlayerOutlineTickets`. The judge then reads it and sets `m_IsShowPlayerOutLine = true`.
+
+### AvatarOutline component
+
+The outline mesh renderer is NOT directly on the `Player` MonoBehaviour. It lives on a **separate component** `COW.GamePlay.AvatarOutline` (confirmed: `COW-GamePlay-AvatarOutline-EnableOutline0`). This component has:
+- `EnableOutline(bool)` — enables/disables the outline mesh renderer
+- 4 obfuscated methods: `MCKJCPAHJIK`, `DBMHMHJHBFJ`, `GLJDFPLAJGA`, `CCDOEHLDLBI`
+
+`AvatarOutline.EnableOutline(true)` bypasses the ticket system at the renderer level — it forces the shader to run regardless of `m_PlayerOutlineTickets`.
+
+### Through-wall rendering pipeline
+
+Three components handle through-wall (depth-ignore) rendering:
+1. `Player.SetRenderQ(int)` — sets render queue on Player's main mesh
+2. `Player.AvatarTransformer.SetRenderQ(int)` — sets render queue on the body-part transformer sub-object
+3. `AvatarManager.SetRenderQ(int)` — sets render queue on the entire avatar manager
+
+Current code only calls `Player.SetRenderQ` — misses the AvatarTransformer and AvatarManager paths.
+
+`MatchGame.EnableThroughTeamOutline(bool)` (confirmed in metadata) is a dedicated method that activates through-wall rendering for team outlines. Confirmed: `COW-MatchGame-EnableThroughTeamOutline0`.
+
+### `SetOutlineVisible` enum values
+
+The `visible` parameter to `Player.SetOutlineVisible` is an **enum** (`ISOUTLINEVISIBLE_*`), not a raw bool/int:
+- `ISOUTLINEVISIBLE_LOCALPLAYER_ALIVE` — local player visible state
+- `ISOUTLINEVISIBLE_3P_ALIVE` — third-person alive (enemy) state
+- `ISOUTLINEVISIBLE_STEALTH` — cloaked/invisible player
+
+Current code passes `visible=16` based on game team outline observations, which may correspond to `ISOUTLINEVISIBLE_3P_ALIVE`'s int value, but the enum representation can vary. The judge reads from `m_PlayerOutlineTickets`, not from the last call to `SetOutlineVisible`.
+
+### HUD nameplate — correct namespace
+
+The enemy nameplate class is **`COW.HUD.UIHudNameEnemyController`**, NOT in `COW.GamePlay`, `COW.UI`, or `COW`.
+
+Confirmed methods:
+- `UIHudNameEnemyController.BindPlayer` (binds a Player to the HUD element)
+- `UIHudNameEnemyController.OnVisibilityChanged` (fires when the HUD visibility state changes)
+
+Current code iterates generic names across wrong namespaces → `hudCls` is always null → no HUD hook.
+
+### Anti-cheat detection fields
+
+Binary-confirmed fields in the ESP/outline code path:
+- `ESPCheck` — per-player check value
+- `ESPThreshold` — detection threshold
+- `ESPStrength` — measure of outline forcing activity
+- `ESPAct` — action enum triggered on detection
+
+These fields are read by AnoSDK (AntiCheat SDK). Forcing `SetOutlineVisible` in a hot loop with no per-player throttle will increment `ESPStrength` rapidly. The current 30-tick per-player modulo throttle was already added for this reason; hooking the outline judge instead of calling SetOutlineVisible directly produces zero increment (we run AFTER the judge, setting the renderer state directly).
+
+### Current approach (broken layers)
+
+| Layer | Approach | Bug |
+|---|---|---|
+| Layer 3 | Hook `SetOutlineVisible`, force visible=16 | `OutlineVisibleJudgeInUpDate` resets it every frame |
+| Layer 4 | Hook `InitOutline`, inject `SetOutlineVisible(16)` after | Same frame-reset problem |
+| Layer 5 | `hook_player_update`: call `SetOutlineVisible(16)` every 30 ticks | Fires less often than the judge (60+ fps) → judge wins the race |
+| HUD | Search 7 class names across 4 namespaces | Wrong namespaces — `UIHudNameEnemyController` is in `COW.HUD` |
+
+### Fix
+
+1. **Hook `OutlineVisibleJudgeInUpDate`** on Player: run the original (maintain ticket state), then immediately force `SetOutlineVisible(self, 16, 0)` for non-local players. We win the race because we fire AFTER the judge in the same call chain.
+
+2. **Hook `AvatarOutline.EnableOutline`**: force `enable=true` regardless of what the game passes. This bypasses the ticket system at the renderer level, even if the judge doesn't run (e.g. stunned/dead player).
+
+3. **Fix HUD class lookup**: resolve `COW.HUD.UIHudNameEnemyController` directly instead of iterating generic names across wrong namespaces.
+
+4. **Add `EnableThroughTeamOutline` call** on MatchGame from game-thread context (same pattern as `ShowPlayerOutline`).
+
+---
+
+## 8. ESP FIX SUMMARY
+
+| Problem | Root Cause | Fix Applied |
+|---|---|---|
+| Outline resets every frame | `OutlineVisibleJudgeInUpDate` runs after every `SetOutlineVisible` call | Hook judge → run original → force `SetOutlineVisible(16)` after |
+| Outline renderer ignores our call | Ticket system blocks at `AvatarOutline` renderer level | Hook `AvatarOutline.EnableOutline` → force enable=true |
+| HUD nameplate never visible | `UIHudNameEnemyController` in wrong namespace (`COW.HUD` not `COW.GamePlay`) | Resolve directly from `COW.HUD` namespace |
+| Through-wall rendering incomplete | Only `Player.SetRenderQ` called; `AvatarTransformer` and `AvatarManager` paths missed | Hook `AvatarOutline.EnableOutline` (renderer-level bypass covers all paths) |
+
+---
+
 ## 6. VERIFIED METHOD INDICES (global-metadata.dat IL2CPP v31)
 
 | Method | Index | Type Index | Notes |

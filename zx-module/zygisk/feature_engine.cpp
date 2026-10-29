@@ -427,6 +427,55 @@ void FeatureEngine::resolveClasses() {
         }
     }
 
+    // AvatarOutline — outline renderer component (separate from Player; confirmed in metadata)
+    // EnableOutline bypasses the ticket system at the renderer level.
+    {
+        m_cls.AvatarOutline = Il2CppApi::getClass(img, "COW.GamePlay", "AvatarOutline");
+        if (m_cls.AvatarOutline) {
+            m_mth.enableAvatarOutline = Il2CppApi::getMethod(m_cls.AvatarOutline, "EnableOutline", -1);
+            LOGI("[ESP] AvatarOutline.EnableOutline=%p",
+                 m_mth.enableAvatarOutline ? m_mth.enableAvatarOutline->methodPointer : nullptr);
+        } else {
+            LOGE("[ESP] AvatarOutline NOT found (COW.GamePlay)");
+        }
+    }
+
+    // OutlineVisibleJudgeInUpDate — per-frame judge on Player that is the ROOT CAUSE of
+    // wallhack not persisting. It resets m_IsShowPlayerOutLine every frame via ticket check.
+    // Hooking it lets us win the race: run original (update tickets), then force visible=16.
+    if (m_cls.Player) {
+        m_mth.outlineJudge = Il2CppApi::getMethod(m_cls.Player, "OutlineVisibleJudgeInUpDate", -1);
+        LOGI("[ESP] OutlineVisibleJudgeInUpDate=%p",
+             m_mth.outlineJudge ? m_mth.outlineJudge->methodPointer : nullptr);
+    }
+
+    // EnableThroughTeamOutline — dedicated through-wall outline enable on MatchGame
+    if (m_cls.ResIdDef) {
+        m_mth.enableThroughOutline = Il2CppApi::getMethod(m_cls.ResIdDef, "EnableThroughTeamOutline", -1);
+        LOGI("[ESP] EnableThroughTeamOutline=%p",
+             m_mth.enableThroughOutline ? m_mth.enableThroughOutline->methodPointer : nullptr);
+    }
+
+    // UIHudNameEnemyController — REAL enemy HUD class; namespace is COW.HUD (binary-verified).
+    // Previous search iterated generic names across COW.GamePlay/COW.UI/COW — all wrong.
+    // Confirmed: COW-HUD-UIHudNameEnemyController-BindPlayer0 and OnVisibilityChanged0.
+    {
+        m_cls.HudNameEnemy = Il2CppApi::getClass(img, "COW.HUD", "UIHudNameEnemyController");
+        if (m_cls.HudNameEnemy) {
+            m_mth.hudBindPlayer = Il2CppApi::getMethod(m_cls.HudNameEnemy, "BindPlayer",           -1);
+            m_mth.hudVisChanged = Il2CppApi::getMethod(m_cls.HudNameEnemy, "OnVisibilityChanged",  -1);
+            // Use OnVisibilityChanged as the SetVisible hook target — it fires whenever the
+            // game decides to show/hide the nameplate; forcing true makes it always render.
+            if (!m_mth.hudSetVisible && m_mth.hudVisChanged)
+                m_mth.hudSetVisible = m_mth.hudVisChanged;
+            LOGI("[ESP] UIHudNameEnemyController: BindPlayer=%p OnVisibilityChanged=%p",
+                 m_mth.hudBindPlayer ? m_mth.hudBindPlayer->methodPointer : nullptr,
+                 m_mth.hudVisChanged ? m_mth.hudVisChanged->methodPointer : nullptr);
+        } else {
+            LOGE("[ESP] UIHudNameEnemyController NOT found in COW.HUD — nameplate invisible");
+        }
+    }
+
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
     LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p cam_fov:%p",
          m_cls.Player, m_cls.Weapon, m_cls.Grass, m_cls.Vehicle,
@@ -516,6 +565,9 @@ static void *s_orig_set_scatter_max     = nullptr;  // PlayerAttributes.set_Scat
 static void *s_orig_set_scatter_num     = nullptr;  // PlayerAttributes.set_ScatterNum
 // InitOutline hooked target address — calling this address goes through our hook
 static void *s_initoutline_hooked_addr  = nullptr;
+// v2.15 ESP fix — outline judge + avatar outline renderer
+static void *s_orig_outline_judge  = nullptr;  // Player.OutlineVisibleJudgeInUpDate
+static void *s_orig_avatar_outline = nullptr;  // AvatarOutline.EnableOutline
 // ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
 static void        *s_res_id_get_inst      = nullptr;  // ResourceIDDef.GetInstance()
 static void        *s_res_id_try_init      = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
@@ -1634,6 +1686,32 @@ void FeatureEngine::applyAntiDamage(bool enable) {
 // ─────────────────────────────────────────────────────────────────────────────
 // ── New feature implementations ──────────────────────────────────────────────
 
+// OutlineVisibleJudgeInUpDate — per-frame visibility judge that is the ROOT CAUSE of wallhack
+// not persisting. It runs every frame inside Player.Update and re-evaluates m_PlayerOutlineTickets,
+// resetting m_IsShowPlayerOutLine to the ticket-computed value (usually 0 for enemies).
+// Fix: run the original judge first (keeps internal ticket accounting correct), then immediately
+// force SetOutlineVisible(self, 16, 0) for every non-local player so we ALWAYS win the race.
+// ARM64: x0=this(Player*), x1=MethodInfo* → void
+static void hook_outline_judge(void *self, void *method) {
+    using Fn = void (*)(void *, void *);
+    reinterpret_cast<Fn>(s_orig_outline_judge)(self, method);
+    // After judge ran, if ESP on and this is not our local player → force enemy outline visible
+    if (s_esp && s_local_player && self != s_local_player && s_orig_set_outline_vis) {
+        using ShowFn = void (*)(void *, uint8_t, int, void *);
+        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 0, nullptr);
+    }
+}
+
+// AvatarOutline.EnableOutline — outline renderer on the avatar component (not on Player itself).
+// This bypasses the ticket system at the renderer level: even if the judge writes 0,
+// forcing EnableOutline(true) keeps the shader mesh enabled.
+// ARM64: x0=this(AvatarOutline*), w1=enable(bool), x2=MethodInfo* → void
+static void hook_avatar_outline(void *self, uint8_t enable, void *method) {
+    uint8_t forced = s_esp ? 1 : enable;
+    using Fn = void (*)(void *, uint8_t, void *);
+    reinterpret_cast<Fn>(s_orig_avatar_outline)(self, forced, method);
+}
+
 void FeatureEngine::applyESP(bool enable) {
     s_esp     = enable;
     s_esp_hud = enable;
@@ -1785,9 +1863,52 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("[ESP-DIAG] Layer7 SKIP — calcAimTarget ptr null");
     }
 
-    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p initoutline=%p update=%p renderQ=%p",
-         (int)enable, s_orig_hud_show, s_orig_set_outline_vis, s_orig_init_outline,
-         s_orig_update, s_orig_set_render_q);
+    // Layer 8: OutlineVisibleJudgeInUpDate — hook the per-frame judge so we win the
+    // tick-reset race. We run the original first (ticket state preserved), then force
+    // visible=16 for enemy players right after. This is the v2.15 root-cause fix.
+    if (m_mth.outlineJudge && m_mth.outlineJudge->methodPointer) {
+        if (enable && !s_orig_outline_judge) {
+            HookEngine::get().hookAddr(m_mth.outlineJudge->methodPointer,
+                reinterpret_cast<void *>(hook_outline_judge), &s_orig_outline_judge, "ESP-OutlineJudge");
+            LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate HOOKED trampoline=%p", s_orig_outline_judge);
+        } else if (!enable && s_orig_outline_judge) {
+            HookEngine::get().unhook(m_mth.outlineJudge->methodPointer);
+            s_orig_outline_judge = nullptr;
+            LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate unhooked");
+        }
+    } else {
+        LOGE("[ESP-DIAG] Layer8 SKIP — OutlineVisibleJudgeInUpDate not resolved");
+    }
+
+    // Layer 9: AvatarOutline.EnableOutline — force the renderer component always enabled.
+    // Bypasses the ticket system at renderer level regardless of the judge's output.
+    if (m_mth.enableAvatarOutline && m_mth.enableAvatarOutline->methodPointer) {
+        if (enable && !s_orig_avatar_outline) {
+            HookEngine::get().hookAddr(m_mth.enableAvatarOutline->methodPointer,
+                reinterpret_cast<void *>(hook_avatar_outline), &s_orig_avatar_outline, "ESP-AvatarOutline");
+            LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline HOOKED trampoline=%p", s_orig_avatar_outline);
+        } else if (!enable && s_orig_avatar_outline) {
+            HookEngine::get().unhook(m_mth.enableAvatarOutline->methodPointer);
+            s_orig_avatar_outline = nullptr;
+            LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline unhooked");
+        }
+    } else {
+        LOGE("[ESP-DIAG] Layer9 SKIP — AvatarOutline.EnableOutline not resolved");
+    }
+
+    // EnableThroughTeamOutline — through-wall rendering gate on MatchGame; call once per match
+    // from game thread (same pattern as ShowPlayerOutline deferred to hook_player_update).
+    // Cache the fn pointer so the Update hook can pick it up.
+    if (enable && m_mth.enableThroughOutline && m_mth.enableThroughOutline->methodPointer) {
+        // Store in match_show_team_outline_fn slot so the existing game-thread call in
+        // hook_player_update reaches it alongside ShowTeamOutline.
+        if (!s_match_show_team_outline_fn)
+            s_match_show_team_outline_fn = m_mth.enableThroughOutline->methodPointer;
+    }
+
+    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p judge=%p avatar_outline=%p renderQ=%p",
+         (int)enable, s_orig_hud_show, s_orig_set_outline_vis,
+         s_orig_outline_judge, s_orig_avatar_outline, s_orig_set_render_q);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {

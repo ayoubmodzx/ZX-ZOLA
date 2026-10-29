@@ -102,6 +102,8 @@ private:
         Il2CppClass *UnityTransform = nullptr; // UnityEngine.Transform — for Teleport
         Il2CppClass *ResIdDef     = nullptr;  // COW::ResourceIDDef — singleton outline manager
         Il2CppClass *HitDetect    = nullptr;  // COW.GamePlay.HitDetectColliderHelper — real headshot gate
+        Il2CppClass *AvatarOutline = nullptr; // COW.GamePlay.AvatarOutline — outline renderer component
+        Il2CppClass *HudNameEnemy  = nullptr; // COW.HUD.UIHudNameEnemyController — enemy nameplate
     } m_cls;
 
     struct Fields {
@@ -184,6 +186,12 @@ private:
         MethodInfo *setScatterMove       = nullptr; // PlayerAttributes.set_ScatterMove(float)
         MethodInfo *setScatterSpeed      = nullptr; // PlayerAttributes.set_ScatterSpeed(float)
         MethodInfo *setScatterRecoverSpd = nullptr; // PlayerAttributes.set_ScatterRecoverSpeed(float)
+        // ESP — outline system fix (v2.15)
+        MethodInfo *outlineJudge         = nullptr; // Player.OutlineVisibleJudgeInUpDate — per-frame reset gate
+        MethodInfo *enableAvatarOutline  = nullptr; // AvatarOutline.EnableOutline(bool) — renderer-level bypass
+        MethodInfo *enableThroughOutline = nullptr; // MatchGame.EnableThroughTeamOutline(bool)
+        MethodInfo *hudBindPlayer        = nullptr; // UIHudNameEnemyController.BindPlayer
+        MethodInfo *hudVisChanged        = nullptr; // UIHudNameEnemyController.OnVisibilityChanged
     } m_mth;
 
     void resolveClasses();
