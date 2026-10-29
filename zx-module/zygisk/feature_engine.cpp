@@ -80,7 +80,17 @@ void FeatureEngine::resolveClasses() {
         // GetHeadTF returns a Transform at the head (may differ from bone crown)
         m_mth.getHeadCollider      = Il2CppApi::getMethod(m_cls.Player, "get_HeadCollider",      0);
         m_mth.getHeadTF            = Il2CppApi::getMethod(m_cls.Player, "GetHeadTF",             0);
-        m_mth.setAimRotation       = Il2CppApi::getMethod(m_cls.Player, "SetAimRotation",        -1);
+        // SetAimRotation: try multiple names — method may be renamed per build
+        {
+            static const char *kAimRotNames[] = {
+                "SetAimRotation", "SetRotation", "SetLookRotation", "SetBodyRotation",
+                "SetAimDir", "SetAimEuler", nullptr
+            };
+            for (int i = 0; kAimRotNames[i]; ++i) {
+                MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kAimRotNames[i], -1);
+                if (m && m->methodPointer) { m_mth.setAimRotation = m; break; }
+            }
+        }
         m_mth.updateAiming         = Il2CppApi::getMethod(m_cls.Player, "UpdateAiming",          -1);
         m_mth.updateAimingADS      = Il2CppApi::getMethod(m_cls.Player, "ODKFDOFOHLN",            -1);
         m_mth.hasHeuristicTarget   = Il2CppApi::getMethod(m_cls.Player, "HasHeuristicTarget",     0);
@@ -93,7 +103,11 @@ void FeatureEngine::resolveClasses() {
              m_mth.updateAiming       ? m_mth.updateAiming->methodPointer       : nullptr,
              m_mth.hasHeuristicTarget ? m_mth.hasHeuristicTarget->methodPointer : nullptr,
              m_mth.getHeuristicTarget ? m_mth.getHeuristicTarget->methodPointer : nullptr);
-        m_mth.isLocalPlayer = Il2CppApi::getMethod(m_cls.Player, "IsLocalPlayer", 0);
+        // IsLocalPlayer: use param_count=-1 (wildcard) — internal IL2CPP counts differ by build.
+        // Falls back to IsLocalPlayerInMatch if primary name absent.
+        m_mth.isLocalPlayer = Il2CppApi::getMethod(m_cls.Player, "IsLocalPlayer", -1);
+        if (!m_mth.isLocalPlayer || !m_mth.isLocalPlayer->methodPointer)
+            m_mth.isLocalPlayer = Il2CppApi::getMethod(m_cls.Player, "IsLocalPlayerInMatch", -1);
         LOGI("[AIM] IsLocalPlayer=%p",
              m_mth.isLocalPlayer ? m_mth.isLocalPlayer->methodPointer : nullptr);
         LOGI("[AIM] get_HeadCollider=%p GetHeadTF=%p",
@@ -269,6 +283,37 @@ void FeatureEngine::resolveClasses() {
     }
     if (!hudCls || !m_mth.hudSetVisible)
         LOGE("ESP: HUD class/method not found — IsVisible-only mode (no visible boxes)");
+
+    // HitDetectColliderHelper — binary-verified REAL client-side headshot gate
+    // IsPlayerHead(Collider) checks hit collider against player.m_HeadCollider — only valid gate.
+    // CheckDamageHitHead does NOT exist in this FF build (verified: absent from string table).
+    {
+        m_cls.HitDetect = Il2CppApi::getClass(img, "COW.GamePlay", "HitDetectColliderHelper");
+        if (m_cls.HitDetect) {
+            m_mth.isPlayerHead = Il2CppApi::getMethod(m_cls.HitDetect, "IsPlayerHead", -1);
+            LOGI("[HS] HitDetectColliderHelper.IsPlayerHead=%p",
+                 m_mth.isPlayerHead ? m_mth.isPlayerHead->methodPointer : nullptr);
+        } else {
+            LOGE("[HS] HitDetectColliderHelper NOT found — headshot gate unavailable");
+        }
+    }
+
+    // PlayerAttributes scatter field methods (type 0x86e8, verified via global-metadata.dat)
+    // GetScatterRate() computes the final scatter cone from 6 scalar fields.
+    // Zeroing GetScatterRate return value eliminates all bullet spread at once.
+    if (m_cls.Character) {
+        m_mth.getScatterRate       = Il2CppApi::getMethod(m_cls.Character, "GetScatterRate",          -1);
+        m_mth.setScatterMax        = Il2CppApi::getMethod(m_cls.Character, "set_ScatterMax",            1);
+        m_mth.setScatterNum        = Il2CppApi::getMethod(m_cls.Character, "set_ScatterNum",            1);
+        m_mth.setScatterMove       = Il2CppApi::getMethod(m_cls.Character, "set_ScatterMove",           1);
+        m_mth.setScatterSpeed      = Il2CppApi::getMethod(m_cls.Character, "set_ScatterSpeed",          1);
+        m_mth.setScatterRecoverSpd = Il2CppApi::getMethod(m_cls.Character, "set_ScatterRecoverSpeed",   1);
+        LOGI("[SCATTER] GetScatterRate=%p set_ScatterMax=%p set_ScatterNum=%p set_ScatterMove=%p",
+             m_mth.getScatterRate      ? m_mth.getScatterRate->methodPointer      : nullptr,
+             m_mth.setScatterMax       ? m_mth.setScatterMax->methodPointer       : nullptr,
+             m_mth.setScatterNum       ? m_mth.setScatterNum->methodPointer       : nullptr,
+             m_mth.setScatterMove      ? m_mth.setScatterMove->methodPointer      : nullptr);
+    }
 
     // InfiniteAmmo — get_IsAmmoFree (bool) on PlayerAttributes (index 245979)
     // WeaponPropertyUtil has 0 exposed methods in this build; PlayerAttributes is the right target
@@ -465,6 +510,10 @@ static void *s_orig_get_heuristic       = nullptr;  // Player.GetHeuristicTarget
 static void *s_orig_check_dmg_hithead   = nullptr;  // Player.CheckDamageHitHead
 static void *s_orig_no_headshot_state   = nullptr;  // Player.IsInNoHeadShotState
 static void *s_orig_take_damage_4       = nullptr;  // Player.TakeDamage(4) — enemy client-side prediction
+static void *s_orig_is_player_head      = nullptr;  // HitDetectColliderHelper.IsPlayerHead — REAL HS gate
+static void *s_orig_scatter_rate        = nullptr;  // PlayerAttributes.GetScatterRate — scatter cone
+static void *s_orig_set_scatter_max     = nullptr;  // PlayerAttributes.set_ScatterMax
+static void *s_orig_set_scatter_num     = nullptr;  // PlayerAttributes.set_ScatterNum
 // InitOutline hooked target address — calling this address goes through our hook
 static void *s_initoutline_hooked_addr  = nullptr;
 // ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
@@ -727,6 +776,48 @@ static void hook_player_update(void *self, void *method) {
     reinterpret_cast<Fn>(s_orig_update)(self, method);
 }
 
+// HitDetectColliderHelper.IsPlayerHead — REAL client-side headshot gate.
+// The game calls this with the Collider that was actually hit by the bullet;
+// it returns true only if that collider == player.m_HeadCollider (the head physics box).
+// Forcing true means every bullet hit counts as a headshot regardless of collider.
+// This is the method CheckDamageHitHead was supposed to be (but doesn't exist in this build).
+// ARM64: x0=this(HitDetectColliderHelper*), x1=collider(Collider*), x2=MethodInfo* → w0=bool
+static uint8_t hook_is_player_head(void *self, void *collider, void *method) {
+    static uint32_t s_iph_cnt = 0;
+    ++s_iph_cnt;
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
+        if (s_iph_cnt <= 5 || (s_iph_cnt % 300) == 1)
+            LOGI("[HS-GATE] IsPlayerHead#%u FORCED=1 self=%p col=%p", s_iph_cnt, self, collider);
+        return 1;
+    }
+    using Fn = uint8_t (*)(void *, void *, void *);
+    return reinterpret_cast<Fn>(s_orig_is_player_head)(self, collider, method);
+}
+
+// PlayerAttributes.GetScatterRate — returns the current scatter cone half-angle in degrees.
+// Zeroing this return value eliminates ALL bullet spread at the computation root,
+// covering ScatterMax/ScatterNum/ScatterMove/ScatterSpeed in one hook.
+// ARM64: x0=this(PlayerAttributes*), x1=weapon_type?, x2=MethodInfo* → s0=float
+static float hook_get_scatter_rate(void *self, void *a1, void *method) {
+    if (s_no_spread || s_anti_recoil) return 0.0f;
+    using Fn = float (*)(void *, void *, void *);
+    return reinterpret_cast<Fn>(s_orig_scatter_rate)(self, a1, method);
+}
+
+// set_ScatterMax / set_ScatterNum — belt-and-suspenders: zero at weapon-equip time.
+// These fire when a weapon is equipped/swapped, not every frame.
+// ARM64: x0=this, s0=value(float), x1=MethodInfo* → void
+static void hook_set_scatter_max(void *self, float val, void *method) {
+    if (s_no_spread || s_anti_recoil) val = 0.0f;
+    using Fn = void (*)(void *, float, void *);
+    reinterpret_cast<Fn>(s_orig_set_scatter_max)(self, val, method);
+}
+static void hook_set_scatter_num(void *self, float val, void *method) {
+    if (s_no_spread || s_anti_recoil) val = 0.0f;
+    using Fn = void (*)(void *, float, void *);
+    reinterpret_cast<Fn>(s_orig_set_scatter_num)(self, val, method);
+}
+
 // ── Feature implementations ───────────────────────────────────────────────────
 
 void FeatureEngine::applyAntiRecoil(bool enable) {
@@ -744,15 +835,56 @@ void FeatureEngine::applyAntiRecoil(bool enable) {
 
 void FeatureEngine::applyNoSpread(bool enable) {
     s_no_spread = enable;
-    if (!m_mth.recoilFormula || !m_mth.recoilFormula->methodPointer) return;
-    if (enable && !s_orig_recoil) {
-        HookEngine::get().hookAddr(m_mth.recoilFormula->methodPointer,
-            reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "NoSpread");
-    } else if (!enable && !s_anti_recoil && s_orig_recoil) {
-        HookEngine::get().unhook(m_mth.recoilFormula->methodPointer);
-        s_orig_recoil = nullptr;
+
+    // Primary: hook GetScatterRate → return 0.0f — covers all 6 scatter scalar fields at once.
+    // GetScatterRate is on PlayerAttributes (type 0x86e8, verified in global-metadata.dat).
+    if (m_mth.getScatterRate && m_mth.getScatterRate->methodPointer) {
+        if (enable && !s_orig_scatter_rate) {
+            HookEngine::get().hookAddr(m_mth.getScatterRate->methodPointer,
+                reinterpret_cast<void *>(hook_get_scatter_rate), &s_orig_scatter_rate, "NoSpread-ScatterRate");
+            LOGI("[SCATTER] GetScatterRate hooked: trampoline=%p", s_orig_scatter_rate);
+        } else if (!enable && !s_anti_recoil && s_orig_scatter_rate) {
+            HookEngine::get().unhook(m_mth.getScatterRate->methodPointer);
+            s_orig_scatter_rate = nullptr;
+        }
+    } else {
+        LOGE("[SCATTER] GetScatterRate NOT resolved — scatter zeroing unavailable");
     }
-    LOGI("NoSpread: %s", enable ? "ON" : "OFF");
+
+    // Belt-and-suspenders: zero ScatterMax + ScatterNum at weapon-equip time.
+    if (m_mth.setScatterMax && m_mth.setScatterMax->methodPointer) {
+        if (enable && !s_orig_set_scatter_max) {
+            HookEngine::get().hookAddr(m_mth.setScatterMax->methodPointer,
+                reinterpret_cast<void *>(hook_set_scatter_max), &s_orig_set_scatter_max, "NoSpread-Max");
+        } else if (!enable && !s_anti_recoil && s_orig_set_scatter_max) {
+            HookEngine::get().unhook(m_mth.setScatterMax->methodPointer);
+            s_orig_set_scatter_max = nullptr;
+        }
+    }
+    if (m_mth.setScatterNum && m_mth.setScatterNum->methodPointer) {
+        if (enable && !s_orig_set_scatter_num) {
+            HookEngine::get().hookAddr(m_mth.setScatterNum->methodPointer,
+                reinterpret_cast<void *>(hook_set_scatter_num), &s_orig_set_scatter_num, "NoSpread-Num");
+        } else if (!enable && !s_anti_recoil && s_orig_set_scatter_num) {
+            HookEngine::get().unhook(m_mth.setScatterNum->methodPointer);
+            s_orig_set_scatter_num = nullptr;
+        }
+    }
+
+    // Legacy: also try recoilFormula if resolved (older builds / other formula variants)
+    if (m_mth.recoilFormula && m_mth.recoilFormula->methodPointer) {
+        if (enable && !s_orig_recoil) {
+            HookEngine::get().hookAddr(m_mth.recoilFormula->methodPointer,
+                reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "NoSpread-Legacy");
+        } else if (!enable && !s_anti_recoil && s_orig_recoil) {
+            HookEngine::get().unhook(m_mth.recoilFormula->methodPointer);
+            s_orig_recoil = nullptr;
+        }
+    }
+
+    LOGI("NoSpread: %s  scatter_rate=%p scatter_max=%p scatter_num=%p legacy_recoil=%p",
+         enable ? "ON" : "OFF", s_orig_scatter_rate, s_orig_set_scatter_max,
+         s_orig_set_scatter_num, s_orig_recoil);
 }
 
 void FeatureEngine::applyRapidFire(bool enable) {
@@ -975,7 +1107,11 @@ static inline void run_aimbot_core(void *self) {
                 hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(ep, nullptr);
             }
             if (!hT) {
-                if (do_log) LOGE("[AIM-DIAG] core#%u: enemy[%d]=%p headTF+bone both null", s_aim_core_fire, i, ep);
+                if (do_log) LOGE("[AIM-DIAG] core#%u: enemy[%d]=%p headTF+bone null — evicting stale ptr", s_aim_core_fire, i, ep);
+                // Evict stale pointer (dead/despawned enemy) by swapping with last entry
+                s_enemy_list[i] = s_enemy_list[--s_enemy_count];
+                s_enemy_list[s_enemy_count] = nullptr;
+                --i;
                 continue;
             }
             Vec3 hPos = reinterpret_cast<GetPosFn>(s_orig_getpos)(hT, nullptr);
@@ -1143,7 +1279,24 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             else        LOGI("[AIM] set_OnlyHeadshot(0) skipped — no inst (feature was never active in-match)");
         }
     }
+    // IsPlayerHead — REAL client-side headshot gate (HitDetectColliderHelper).
+    // CheckDamageHitHead does NOT exist in this FF build — this is the correct replacement.
+    if (m_mth.isPlayerHead && m_mth.isPlayerHead->methodPointer) {
+        if (enable && !s_orig_is_player_head) {
+            HookEngine::get().hookAddr(m_mth.isPlayerHead->methodPointer,
+                reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
+            LOGI("[HS-GATE] IsPlayerHead hooked: trampoline=%p", s_orig_is_player_head);
+        } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_is_player_head) {
+            HookEngine::get().unhook(m_mth.isPlayerHead->methodPointer);
+            s_orig_is_player_head = nullptr;
+        }
+    } else {
+        LOGE("[HS-GATE] IsPlayerHead NOT resolved — headshot gate hook unavailable");
+    }
+
     // CheckDamageHitHead / IsInNoHeadShotState — direct damage-gate hooks
+    // NOTE: CheckDamageHitHead does NOT exist in this build (verified via global-metadata.dat).
+    // These hooks install only if the method resolves (legacy builds / future updates).
     if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer) {
         if (enable && !s_orig_check_dmg_hithead) {
             LOGI("[HS-CRASH] BEFORE hookAddr CheckDamageHitHead ptr=%p hook_fn=%p",
@@ -1156,9 +1309,7 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
             s_orig_check_dmg_hithead = nullptr;
         }
-    } else { LOGE("[HS-CRASH] CheckDamageHitHead mth=%p ptr=%s — fallback to aim-center only",
-        m_mth.checkDamageHitHead,
-        m_mth.checkDamageHitHead ? "NULL_method_ptr" : "NULL_mth"); }
+    } else { LOGI("[HS-GATE] CheckDamageHitHead absent in this build (expected) — IsPlayerHead hook covers it"); }
 
     // TakeDamage(4) diagnostic — install when AutoHeadshot on so we can see if damage
     // pipeline calls CheckDamageHitHead or bypasses it entirely
@@ -1204,7 +1355,13 @@ void FeatureEngine::applySilentAim(bool enable) {
         if (!s_res_id_cls)      s_res_id_cls      = m_cls.ResIdDef;
         if (!s_res_id_get_inst && m_mth.resIdGetInstance)
             s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
-        // Share the damage-gate hooks with AutoHeadshot
+        // IsPlayerHead — REAL headshot gate (shared with AutoHeadshot)
+        if (m_mth.isPlayerHead && m_mth.isPlayerHead->methodPointer && !s_orig_is_player_head) {
+            HookEngine::get().hookAddr(m_mth.isPlayerHead->methodPointer,
+                reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
+            LOGI("[HS-GATE] IsPlayerHead hooked (SilentAim): trampoline=%p", s_orig_is_player_head);
+        }
+        // CheckDamageHitHead fallback (does not exist in this build but kept for forward compat)
         if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer
                 && !s_orig_check_dmg_hithead) {
             LOGI("[HS-CRASH] BEFORE hookAddr CheckDamageHitHead (SilentAim) ptr=%p",
@@ -1215,6 +1372,10 @@ void FeatureEngine::applySilentAim(bool enable) {
         }
     } else {
         if (!s_auto_headshot && !s_full_aimbot) {
+            if (s_orig_is_player_head && m_mth.isPlayerHead) {
+                HookEngine::get().unhook(m_mth.isPlayerHead->methodPointer);
+                s_orig_is_player_head = nullptr;
+            }
             if (s_orig_check_dmg_hithead && m_mth.checkDamageHitHead) {
                 HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
                 s_orig_check_dmg_hithead = nullptr;
@@ -1293,7 +1454,18 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         LOGI("[AIM] ODKFDOFOHLN not found — ADS tracking via UpdateAiming only");
     }
 
-    // CheckDamageHitHead — ensures stationary enemy headshots register on full aimbot
+    // IsPlayerHead — ensures stationary enemy headshots register (REAL gate in this build)
+    if (m_mth.isPlayerHead && m_mth.isPlayerHead->methodPointer) {
+        if (enable && !s_orig_is_player_head) {
+            HookEngine::get().hookAddr(m_mth.isPlayerHead->methodPointer,
+                reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
+            LOGI("[AIM] IsPlayerHead hooked (FullAimbot): trampoline=%p", s_orig_is_player_head);
+        } else if (!enable && !s_auto_headshot && !s_silent_aim && s_orig_is_player_head) {
+            HookEngine::get().unhook(m_mth.isPlayerHead->methodPointer);
+            s_orig_is_player_head = nullptr;
+        }
+    }
+    // CheckDamageHitHead fallback (does not exist in this build — forward compat only)
     if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer) {
         if (enable && !s_orig_check_dmg_hithead) {
             HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,

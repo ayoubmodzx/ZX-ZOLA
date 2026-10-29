@@ -101,6 +101,7 @@ private:
         Il2CppClass *UnityCamera  = nullptr;  // UnityEngine.Camera — for WidePOV
         Il2CppClass *UnityTransform = nullptr; // UnityEngine.Transform — for Teleport
         Il2CppClass *ResIdDef     = nullptr;  // COW::ResourceIDDef — singleton outline manager
+        Il2CppClass *HitDetect    = nullptr;  // COW.GamePlay.HitDetectColliderHelper — real headshot gate
     } m_cls;
 
     struct Fields {
@@ -174,6 +175,15 @@ private:
         MethodInfo *getHeadTF            = nullptr; // Player.GetHeadTF() → Transform* (head transform)
         MethodInfo *colliderGetBounds    = nullptr; // UnityEngine.Collider.get_bounds() → Bounds struct
         MethodInfo *takeDamage4          = nullptr; // Player.TakeDamage(4 params) [210713] — client prediction
+        // HitDetectColliderHelper — REAL client-side headshot gate (binary verified)
+        MethodInfo *isPlayerHead         = nullptr; // HitDetectColliderHelper.IsPlayerHead(Collider) → bool
+        // PlayerAttributes scatter system — verified from global-metadata.dat (type 0x86e8)
+        MethodInfo *getScatterRate       = nullptr; // PlayerAttributes.GetScatterRate() → float (computed cone)
+        MethodInfo *setScatterMax        = nullptr; // PlayerAttributes.set_ScatterMax(float)
+        MethodInfo *setScatterNum        = nullptr; // PlayerAttributes.set_ScatterNum(float)
+        MethodInfo *setScatterMove       = nullptr; // PlayerAttributes.set_ScatterMove(float)
+        MethodInfo *setScatterSpeed      = nullptr; // PlayerAttributes.set_ScatterSpeed(float)
+        MethodInfo *setScatterRecoverSpd = nullptr; // PlayerAttributes.set_ScatterRecoverSpeed(float)
     } m_mth;
 
     void resolveClasses();
