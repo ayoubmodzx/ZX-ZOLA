@@ -386,21 +386,19 @@ static void *gotWatcherThread(void *) {
         if (!anogs_done) {
             uintptr_t base = findLibBase("libanogs.so");
             if (base) {
-                int n = patchLibGot(base,
-                                    kAnogsEntries,
-                                    sizeof(kAnogsEntries) / sizeof(kAnogsEntries[0]));
-                LOGI("libanogs.so GOT: %d slots patched (base=0x%lx)", n, base);
-                anogs_done = (n > 0);
+                static const int kAnogsExpected = (int)(sizeof(kAnogsEntries)/sizeof(kAnogsEntries[0]));
+                int n = patchLibGot(base, kAnogsEntries, kAnogsExpected);
+                LOGI("libanogs.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnogsExpected, base);
+                anogs_done = (n >= kAnogsExpected);
             }
         }
         if (!anort_done) {
             uintptr_t base = findLibBase("libanort.so");
             if (base) {
-                int n = patchLibGot(base,
-                                    kAnortEntries,
-                                    sizeof(kAnortEntries) / sizeof(kAnortEntries[0]));
-                LOGI("libanort.so GOT: %d slots patched (base=0x%lx)", n, base);
-                anort_done = (n > 0);
+                static const int kAnortExpected = (int)(sizeof(kAnortEntries)/sizeof(kAnortEntries[0]));
+                int n = patchLibGot(base, kAnortEntries, kAnortExpected);
+                LOGI("libanort.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnortExpected, base);
+                anort_done = (n >= kAnortExpected);
             }
         }
     }
@@ -424,6 +422,9 @@ void AnoBypass::installEarly() {
 }
 
 void AnoBypass::startWatcher() {
+    static bool s_started = false;
+    if (s_started) return;
+    s_started = true;
     pthread_t tid;
     pthread_attr_t attr;
     pthread_attr_init(&attr);

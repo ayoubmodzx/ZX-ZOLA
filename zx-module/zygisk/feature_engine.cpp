@@ -546,9 +546,13 @@ static bool  s_auto_revive   = false;
 static bool  s_noclip        = false;
 // Teleport saved position (Vec3 stored as plain floats — no Unity dep)
 struct Vec3 { float x, y, z; };
-static Vec3  s_tp_saved      = {0, 0, 0};
-static bool  s_tp_has_save   = false;
-static bool  s_tp_pending    = false;  // set by applyTeleport, cleared by tick hook
+static Vec3  s_tp_saved          = {0, 0, 0};
+static bool  s_tp_has_save       = false;
+static bool  s_tp_save_requested = false;  // set only by applyTeleportSave(), not auto-triggered
+static bool  s_tp_pending        = false;  // set by applyTeleport, cleared by tick hook
+// Per-frame throttle counters (shared across all Update ticks on the main thread)
+static uint32_t s_max_health_tick  = 0;
+static uint32_t s_auto_revive_tick = 0;
 
 // Aimbot / headshot flags
 static bool  s_auto_headshot = false;
@@ -640,9 +644,9 @@ static float hook_rof(void *self, void *a1, void *a2, void *a3, void *a4) {
     return reinterpret_cast<Fn>(s_orig_rof)(self, a1, a2, a3, a4);
 }
 
-// TakeDamage — returns void; no-op when anti_damage active
+// TakeDamage — returns void; no-op when anti_damage active (local player only)
 static void hook_dmg(void *self, void *info, void *a2, void *a3, void *method) {
-    if (s_anti_damage) return;
+    if (s_anti_damage && s_local_player && self == s_local_player) return;
     using Fn = void (*)(void *, void *, void *, void *, void *);
     reinterpret_cast<Fn>(s_orig_dmg)(self, info, a2, a3, method);
 }
@@ -730,13 +734,6 @@ static void hook_init_outline(void *self, void *param0, void *method) {
     }
 }
 
-// SetIsInvincibleByImmortalitySkill — force invincibility flag on when GodMode/AntiDamage active
-static void hook_set_invincible(void *self, uint8_t en, void *method) {
-    uint8_t forced = s_anti_damage ? 1 : en;
-    using Fn = void (*)(void *, uint8_t, void *);
-    reinterpret_cast<Fn>(s_orig_invincible)(self, forced, method);
-}
-
 // InfiniteAmmo: get_IsAmmoFree (bool) → 1 = ammo is free/unlimited
 static uint8_t hook_get_ammo(void *self, void *method) {
     if (s_inf_ammo) return 1;
@@ -758,9 +755,9 @@ static uint8_t hook_wall_hit(void *self, void *method) {
     return reinterpret_cast<Fn>(s_orig_wallhit)(self, method);
 }
 
-// AutoRevive: get_IsPendingRevive → always true so game triggers revive logic immediately
+// AutoRevive: get_IsPendingRevive → always true so game triggers revive logic immediately (local player only)
 static uint8_t hook_is_knockdown(void *self, void *method) {
-    if (s_auto_revive) return 1;
+    if (s_auto_revive && s_local_player && self == s_local_player) return 1;
     using Fn = uint8_t (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_knockdown)(self, method);
 }
@@ -810,24 +807,34 @@ static void hook_player_update(void *self, void *method) {
         using IsLocalFn = uint8_t (*)(void *, void *);
         uint8_t isLocal = reinterpret_cast<IsLocalFn>(s_is_local_player_fn)(self, nullptr);
         if (isLocal) {
-            if (s_local_player != self)
-                LOGI("[PLAYER-DIAG] LocalPlayer SET self=%p (was %p)", self, s_local_player);
-            s_local_player = self;
-            // MaxHealth: keep HP at maximum every frame
+            if (s_local_player != self) {
+                LOGI("[PLAYER-DIAG] LocalPlayer SET self=%p (was %p) — clearing enemy list", self, s_local_player);
+                s_local_player = self;
+                // New match / new Player* instance → stale enemy pointers are invalid
+                s_enemy_count = 0;
+                __builtin_memset(s_enemy_list, 0, sizeof(s_enemy_list));
+            }
+            // MaxHealth: keep HP at maximum — throttled to every 30 frames to avoid detection patterns
             if (s_max_health) {
-                if (s_set_max_hp_fn) {
-                    using SetHPFn = void (*)(void *, float, void *);
-                    reinterpret_cast<SetHPFn>(s_set_max_hp_fn)(self, 999.f, nullptr);
-                }
-                if (s_set_cur_hp_fn) {
-                    using SetHPFn = void (*)(void *, float, void *);
-                    reinterpret_cast<SetHPFn>(s_set_cur_hp_fn)(self, 999.f, nullptr);
+                ++s_max_health_tick;
+                if ((s_max_health_tick % 30) == 0) {
+                    if (s_set_max_hp_fn) {
+                        using SetHPFn = void (*)(void *, float, void *);
+                        reinterpret_cast<SetHPFn>(s_set_max_hp_fn)(self, 999.f, nullptr);
+                    }
+                    if (s_set_cur_hp_fn) {
+                        using SetHPFn = void (*)(void *, float, void *);
+                        reinterpret_cast<SetHPFn>(s_set_cur_hp_fn)(self, 999.f, nullptr);
+                    }
                 }
             }
-            // AutoRevive active call: push SetIsPendingRevive(true) from game thread
+            // AutoRevive active call — throttled to every 60 frames
             if (s_auto_revive && s_set_is_pending_revive_fn) {
-                using SetRevFn = void (*)(void *, uint8_t, void *);
-                reinterpret_cast<SetRevFn>(s_set_is_pending_revive_fn)(self, 1, nullptr);
+                ++s_auto_revive_tick;
+                if ((s_auto_revive_tick % 60) == 0) {
+                    using SetRevFn = void (*)(void *, uint8_t, void *);
+                    reinterpret_cast<SetRevFn>(s_set_is_pending_revive_fn)(self, 1, nullptr);
+                }
             }
             // Call GameSettingData.EnableShowPlayerOutline/Team once per session from game thread
             if (s_esp && !s_gs_outline_done && s_gs_get_instance_fn && s_gs_enable_outline_fn) {
@@ -873,10 +880,12 @@ static void hook_player_update(void *self, void *method) {
         using GetTransFn = void *(*)(void *, void *);
         void *tr = reinterpret_cast<GetTransFn>(s_orig_gettrans)(self, nullptr);
         if (tr) {
-            if (!s_tp_has_save) {
+            // Only capture when user explicitly called applyTeleportSave(), not on every Update
+            if (s_tp_save_requested && !s_tp_has_save) {
                 using GetPosFn = Vec3 (*)(void *, void *);
-                s_tp_saved   = reinterpret_cast<GetPosFn>(s_orig_getpos)(tr, nullptr);
-                s_tp_has_save = true;
+                s_tp_saved        = reinterpret_cast<GetPosFn>(s_orig_getpos)(tr, nullptr);
+                s_tp_has_save     = true;
+                s_tp_save_requested = false;
                 LOGI("TeleportSave: pos=(%.2f,%.2f,%.2f)",
                      s_tp_saved.x, s_tp_saved.y, s_tp_saved.z);
             }
@@ -911,13 +920,12 @@ static uint8_t hook_is_player_head(void *self, void *collider, void *method) {
 }
 
 // PlayerAttributes.GetScatterRate — returns the current scatter cone half-angle in degrees.
-// Zeroing this return value eliminates ALL bullet spread at the computation root,
-// covering ScatterMax/ScatterNum/ScatterMove/ScatterSpeed in one hook.
-// ARM64: x0=this(PlayerAttributes*), x1=weapon_type?, x2=MethodInfo* → s0=float
-static float hook_get_scatter_rate(void *self, void *a1, void *method) {
+// Zeroing this return value eliminates ALL bullet spread at the computation root.
+// GetScatterRate() has 0 params → ARM64: x0=this, x1=MethodInfo* → s0=float
+static float hook_get_scatter_rate(void *self, void *method) {
     if (s_no_spread || s_anti_recoil) return 0.0f;
-    using Fn = float (*)(void *, void *, void *);
-    return reinterpret_cast<Fn>(s_orig_scatter_rate)(self, a1, method);
+    using Fn = float (*)(void *, void *);
+    return reinterpret_cast<Fn>(s_orig_scatter_rate)(self, method);
 }
 
 // set_ScatterMax / set_ScatterNum — belt-and-suspenders: zero at weapon-equip time.
@@ -1761,17 +1769,7 @@ void FeatureEngine::applyAntiDamage(bool enable) {
             s_orig_dmg = nullptr;
         }
     }
-    // SetIsInvincibleByImmortalitySkill — GodMode belt-and-suspenders (v2.16)
-    if (m_mth.setInvincible && m_mth.setInvincible->methodPointer) {
-        if (enable && !s_orig_invincible)
-            HookEngine::get().hookAddr(m_mth.setInvincible->methodPointer,
-                reinterpret_cast<void *>(hook_set_invincible), &s_orig_invincible, "GodInvincible");
-        else if (!enable && s_orig_invincible) {
-            HookEngine::get().unhook(m_mth.setInvincible->methodPointer);
-            s_orig_invincible = nullptr;
-        }
-    }
-    LOGI("AntiDamage: %s  dmg=%p invincible=%p", enable ? "ON" : "OFF", s_orig_dmg, s_orig_invincible);
+    LOGI("AntiDamage: %s  dmg=%p", enable ? "ON" : "OFF", s_orig_dmg);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2107,7 +2105,8 @@ void FeatureEngine::applyTeleportSave() {
     if (m_mth.getPosition) s_orig_getpos  = m_mth.getPosition->methodPointer;
     if (m_mth.getTransform) s_orig_gettrans = m_mth.getTransform->methodPointer;
     // Signal tick hook to capture position on next Player.Update call
-    s_tp_has_save = false;
+    s_tp_has_save       = false;
+    s_tp_save_requested = true;
     // Install tick hook if not already there
     if (!s_orig_update) {
         HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
@@ -2169,7 +2168,7 @@ void FeatureEngine::dispatch(uint8_t cmd, bool enable, float intensity) {
 
         // ── Survival ────────────────────────────────────────────────────────
         case ZX_ANTI_DAMAGE:   applyAntiDamage(enable); break;
-        case ZX_GOD_MODE:      applyAntiDamage(enable); break; // god = block all damage
+        case ZX_GOD_MODE:      applyAntiDamage(enable); applyMaxHealth(enable); break;
 
         // ── New features ─────────────────────────────────────────────────────
         case ZX_ESP:           applyESP(enable); break;
