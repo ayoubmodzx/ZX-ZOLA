@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.13 — GOT patching, zero libc inline hooks
+// AnoSDK bypass v2.18 — GOT patching, zero libc inline hooks
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -87,6 +87,39 @@ static int make_filtered_maps() {
     return mem_fd;
 }
 
+// Build a filtered /proc/self/status that hides TracerPid (debugger detection).
+// Zygisk injection leaves TracerPid != 0 in the process status — AnoSDK reads this.
+static int make_filtered_status(const char *real_path) {
+    int real_fd = (int)syscall(SYS_openat, AT_FDCWD, real_path, O_RDONLY, 0);
+    if (real_fd < 0) return -1;
+    int mem_fd = (int)syscall(SYS_memfd_create, "status", 0U);
+    if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
+    char buf[4096], line[512];
+    int llen = 0;
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, real_fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (llen < (int)sizeof(line) - 1) line[llen++] = c;
+            if (c == '\n' || llen >= (int)sizeof(line) - 1) {
+                line[llen] = '\0';
+                if (strncmp(line, "TracerPid:", 10) == 0) {
+                    const char *zeroed = "TracerPid:\t0\n";
+                    syscall(SYS_write, mem_fd, zeroed, __builtin_strlen(zeroed));
+                } else {
+                    syscall(SYS_write, mem_fd, line, (size_t)llen);
+                }
+                llen = 0;
+            }
+        }
+    }
+    if (llen > 0) syscall(SYS_write, mem_fd, line, (size_t)llen);
+    syscall(SYS_close, real_fd);
+    syscall(SYS_lseek, mem_fd, 0, SEEK_SET);
+    return mem_fd;
+}
+
 static bool is_self_maps(const char *path) {
     if (!path) return false;
     if (strcmp(path, "/proc/self/maps")  == 0) return true;
@@ -95,7 +128,19 @@ static bool is_self_maps(const char *path) {
     int pid = (int)getpid();
     snprintf(buf, sizeof(buf), "/proc/%d/maps",  pid); if (strcmp(path, buf) == 0) return true;
     snprintf(buf, sizeof(buf), "/proc/%d/smaps", pid); if (strcmp(path, buf) == 0) return true;
+    // Per-thread maps (AnoSDK may scan each thread's maps separately)
+    snprintf(buf, sizeof(buf), "/proc/%d/task/",  pid);
+    if (path && strncmp(path, buf, strlen(buf)) == 0 && strstr(path, "/maps")) return true;
     return false;
+}
+
+static bool is_self_status(const char *path) {
+    if (!path) return false;
+    if (strcmp(path, "/proc/self/status") == 0) return true;
+    char buf[64];
+    int pid = (int)getpid();
+    snprintf(buf, sizeof(buf), "/proc/%d/status", pid);
+    return strcmp(path, buf) == 0;
 }
 
 // ── GOT hook functions ────────────────────────────────────────────────────────
@@ -103,41 +148,33 @@ static bool is_self_maps(const char *path) {
 // Every forwarding call goes through libzx_zola.so's own unpatched PLT/GOT,
 // which resolves directly to the real libc — no cross-library re-entrancy.
 
-// Protection 2: maps file access — open() family
+// Protection 2: maps + status file access — open() family
 static int hook_open(const char *path, int flags, mode_t mode) {
-    if (is_self_maps(path)) {
-        int fd = make_filtered_maps();
-        if (fd >= 0) return fd;
-    }
+    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     return ::open(path, flags, mode);
 }
 
-// __open_2 is open(path, flags) without the mode arg — safety-checked variant
 static int hook_open2(const char *path, int flags) {
-    if (is_self_maps(path)) {
-        int fd = make_filtered_maps();
-        if (fd >= 0) return fd;
-    }
+    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     return ::open(path, flags);
 }
 
-// __openat_2 is openat(dirfd, path, flags) — safety-checked variant
 static int hook_openat2(int dirfd, const char *path, int flags) {
-    if (is_self_maps(path)) {
-        int fd = make_filtered_maps();
-        if (fd >= 0) return fd;
-    }
+    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     return ::openat(dirfd, path, flags);
 }
 
 static FILE *hook_fopen(const char *path, const char *mode) {
     if (is_self_maps(path)) {
         int fd = make_filtered_maps();
-        if (fd >= 0) {
-            FILE *f = ::fdopen(fd, "r");
-            if (f) return f;
-            ::close(fd);
-        }
+        if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
+    }
+    if (is_self_status(path)) {
+        int fd = make_filtered_status(path);
+        if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
     }
     return ::fopen(path, mode);
 }
@@ -203,10 +240,44 @@ static pid_t hook_fork() {
 // Protection 7: raw syscall bypass — intercept SYS_openat targeting /proc/self/maps
 // AArch64 ABI: syscall(nr, a0, a1, a2, ...) → x0=nr, x1=a0, x2=a1=path, x3=a2=flags
 static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
-    if (nr == __NR_openat && a1 != 0 && is_self_maps((const char *)a1)) {
-        return (long)make_filtered_maps();
+    if (nr == __NR_openat && a1 != 0) {
+        const char *path = (const char *)a1;
+        if (is_self_maps(path))   return (long)make_filtered_maps();
+        if (is_self_status(path)) return (long)make_filtered_status(path);
     }
     return syscall(nr, a0, a1, a2, a3, a4, a5);
+}
+
+// Protection 9: ioctl interception — AnoSDK sends ban-triggering detection reports via ioctl.
+// cmd layout (AnoSDK v4.x+): cmd < 0x10 = init/heartbeat (MUST pass through).
+//                              cmd >= 0x10 = detection report → zero out payload, block ban.
+// We log every call so logcat shows exactly what AnoSDK is trying to report.
+// Note: AnoSDK opens its own fd (usually /dev/anoSDK or a socket) — we can't know which fd
+// it uses, so we intercept ALL ioctl and pass non-AnoSDK calls through unchanged.
+#include <sys/ioctl.h>
+static int hook_ioctl(int fd, unsigned long req, void *arg) {
+    // AnoSDK detection cmds are in the 0x10–0xFF range (internal protocol).
+    // Heartbeat/init cmds < 0x10 must pass through untouched.
+    unsigned long cmd = req & 0xFF;
+    if (cmd >= 0x10) {
+        // Log first 32 bytes of payload so we can diagnose what was detected
+        if (arg) {
+            const uint8_t *p = (const uint8_t *)arg;
+            LOGI("[IOCTL-BAN] fd=%d req=0x%lx cmd=0x%lx payload: "
+                 "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+                 "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+                 fd, req, cmd,
+                 p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
+                 p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
+                 p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],
+                 p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]);
+            // Zero out the detection payload so the report carries no ban data
+            __builtin_memset(arg, 0, 64);
+        } else {
+            LOGI("[IOCTL-BAN] fd=%d req=0x%lx cmd=0x%lx (null arg)", fd, req, cmd);
+        }
+    }
+    return ::ioctl(fd, req, arg);
 }
 
 // Protection 3: dl_iterate_phdr library enumeration — wrap callback, drop our entry
@@ -357,6 +428,8 @@ static const PatchEntry kAnogsEntries[] = {
     { "syscall",          reinterpret_cast<void *>(hook_syscall_got)     },
     // Protection 3: dl_iterate_phdr library enumeration
     { "dl_iterate_phdr",  reinterpret_cast<void *>(hook_dl_iterate_phdr) },
+    // Protection 9: ioctl detection-report interception
+    { "ioctl",            reinterpret_cast<void *>(hook_ioctl)           },
 };
 
 static const PatchEntry kAnortEntries[] = {
@@ -369,19 +442,20 @@ static const PatchEntry kAnortEntries[] = {
     { "ptrace",           reinterpret_cast<void *>(hook_ptrace)      },
     { "fork",             reinterpret_cast<void *>(hook_fork)        },
     { "syscall",          reinterpret_cast<void *>(hook_syscall_got) },
+    { "ioctl",            reinterpret_cast<void *>(hook_ioctl)       },
 };
 
 // ── Watcher thread ────────────────────────────────────────────────────────────
 
 static void *gotWatcherThread(void *) {
-    constexpr int       kMaxAttempts = 600;  // 60 s at 100 ms intervals
-    constexpr useconds_t kInterval   = 100000;
-
+    // First 50 attempts: 10ms intervals (0–500ms) — catches early AnoSDK load.
+    // Remaining up to 600 total: 100ms intervals (50–60s window).
+    constexpr int kMaxAttempts = 650;
     bool anogs_done = false;
     bool anort_done = false;
 
     for (int attempt = 0; attempt < kMaxAttempts && (!anogs_done || !anort_done); attempt++) {
-        usleep(kInterval);
+        usleep(attempt < 50 ? 10000u : 100000u);
 
         if (!anogs_done) {
             uintptr_t base = findLibBase("libanogs.so");
@@ -418,7 +492,7 @@ void AnoBypass::installEarly() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("AnoBypass v2.13: signal handlers installed (no libc Dobby, GOT-only)");
+    LOGI("AnoBypass v2.18: signal handlers installed (no libc Dobby, GOT-only)");
 }
 
 void AnoBypass::startWatcher() {
