@@ -315,26 +315,61 @@ void FeatureEngine::resolveClasses() {
              m_mth.setScatterMove      ? m_mth.setScatterMove->methodPointer      : nullptr);
     }
 
-    // InfiniteAmmo — get_IsAmmoFree (bool) on PlayerAttributes (index 245979)
-    // WeaponPropertyUtil has 0 exposed methods in this build; PlayerAttributes is the right target
+    // MaxHealth / AutoRevive active call / GodMode invincibility — confirmed in metadata
+    if (m_cls.Player) {
+        m_mth.setCurHP           = Il2CppApi::getMethod(m_cls.Player, "set_CurHP",            1);
+        m_mth.setMaxHP           = Il2CppApi::getMethod(m_cls.Player, "set_MaxHP",            1);
+        m_mth.setIsPendingRevive = Il2CppApi::getMethod(m_cls.Player, "SetIsPendingRevive",   1);
+        LOGI("[FIX] set_CurHP=%p set_MaxHP=%p SetIsPendingRevive=%p",
+             m_mth.setCurHP ? m_mth.setCurHP->methodPointer : nullptr,
+             m_mth.setMaxHP ? m_mth.setMaxHP->methodPointer : nullptr,
+             m_mth.setIsPendingRevive ? m_mth.setIsPendingRevive->methodPointer : nullptr);
+    }
     if (m_cls.Character)
-        m_mth.getCurrentAmmo = Il2CppApi::getMethod(m_cls.Character, "get_IsAmmoFree", 0);
+        m_mth.setInvincible = Il2CppApi::getMethod(m_cls.Character, "SetIsInvincibleByImmortalitySkill", -1);
+    LOGI("[FIX] setInvincible=%p", m_mth.setInvincible ? m_mth.setInvincible->methodPointer : nullptr);
+
+    // InfiniteAmmo — search multiple names across PlayerAttributes, Player, WeaponPropertyUtil
+    {
+        static const char *kAmmoNames[] = {
+            "get_IsAmmoFree","get_InfiniteAmmo","IsAmmoFree","get_IsInfiniteAmmo",
+            "get_IsUnlimitedAmmo","get_HasInfiniteAmmo",nullptr
+        };
+        Il2CppClass *ammoTgts[] = { m_cls.Character, m_cls.Player, m_cls.Weapon, nullptr };
+        for (int t = 0; !m_mth.getCurrentAmmo && ammoTgts[t]; ++t)
+            for (int i = 0; kAmmoNames[i]; ++i) {
+                MethodInfo *m = Il2CppApi::getMethod(ammoTgts[t], kAmmoNames[i], -1);
+                if (m && m->methodPointer) { m_mth.getCurrentAmmo = m; break; }
+            }
+        if (!m_mth.getCurrentAmmo) LOGE("InfiniteAmmo: ammo method not found in any class");
+    }
 
     // NoReload — IsReloading on Player (index 210813)
     if (m_cls.Player)
         m_mth.isNeedReload = Il2CppApi::getMethod(m_cls.Player, "IsReloading", 0);
 
-    // WallShoot — search multiple names on VerticleBulletController
-    if (m_cls.Bullet) {
+    // WallShoot — search VerticleBulletController first, then Player.CanFireByCurrentState
+    // VerticleBulletController has no CanFire in OB47; Player.CanFireByCurrentState is the real gate
+    {
         static const char *kFireNames[] = {
             "CanFire","CheckCanFire","IsCanFire","get_CanFire",
-            "CanShoot","IsAllowedToFire","CheckWallPenetration", nullptr
+            "CanShoot","IsAllowedToFire","CheckWallPenetration",nullptr
         };
-        for (int i = 0; kFireNames[i]; ++i) {
-            MethodInfo *m = Il2CppApi::getMethod(m_cls.Bullet, kFireNames[i], -1);
-            if (m && m->methodPointer) { m_mth.checkWallHit = m; break; }
+        if (m_cls.Bullet)
+            for (int i = 0; kFireNames[i]; ++i) {
+                MethodInfo *m = Il2CppApi::getMethod(m_cls.Bullet, kFireNames[i], -1);
+                if (m && m->methodPointer) { m_mth.checkWallHit = m; break; }
+            }
+        if (!m_mth.checkWallHit && m_cls.Player) {
+            static const char *kPlayerFireNames[] = {
+                "CanFireByCurrentState","CanFire","CheckCanFire","IsCanFire","CanShoot",nullptr
+            };
+            for (int i = 0; kPlayerFireNames[i]; ++i) {
+                MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kPlayerFireNames[i], -1);
+                if (m && m->methodPointer) { m_mth.checkWallHit = m; break; }
+            }
         }
-        if (!m_mth.checkWallHit) LOGE("WallShoot: no method found on VerticleBulletController");
+        if (!m_mth.checkWallHit) LOGE("WallShoot: no CanFire method on Bullet or Player — wall-shoot disabled");
     }
 
     // AutoRevive — get_IsPendingRevive on Player (index 210262); return 1 triggers revive logic
@@ -568,6 +603,12 @@ static void *s_initoutline_hooked_addr  = nullptr;
 // v2.15 ESP fix — outline judge + avatar outline renderer
 static void *s_orig_outline_judge  = nullptr;  // Player.OutlineVisibleJudgeInUpDate
 static void *s_orig_avatar_outline = nullptr;  // AvatarOutline.EnableOutline
+// v2.16 feature fixes
+static bool  s_max_health                  = false;
+static void *s_orig_invincible             = nullptr;  // PlayerAttributes.SetIsInvincibleByImmortalitySkill
+static void *s_set_is_pending_revive_fn    = nullptr;  // Player.SetIsPendingRevive (cached for Update hook)
+static void *s_set_max_hp_fn               = nullptr;  // Player.set_MaxHP
+static void *s_set_cur_hp_fn               = nullptr;  // Player.set_CurHP
 // ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
 static void        *s_res_id_get_inst      = nullptr;  // ResourceIDDef.GetInstance()
 static void        *s_res_id_try_init      = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
@@ -689,6 +730,13 @@ static void hook_init_outline(void *self, void *param0, void *method) {
     }
 }
 
+// SetIsInvincibleByImmortalitySkill — force invincibility flag on when GodMode/AntiDamage active
+static void hook_set_invincible(void *self, uint8_t en, void *method) {
+    uint8_t forced = s_anti_damage ? 1 : en;
+    using Fn = void (*)(void *, uint8_t, void *);
+    reinterpret_cast<Fn>(s_orig_invincible)(self, forced, method);
+}
+
 // InfiniteAmmo: get_IsAmmoFree (bool) → 1 = ammo is free/unlimited
 static uint8_t hook_get_ammo(void *self, void *method) {
     if (s_inf_ammo) return 1;
@@ -765,6 +813,22 @@ static void hook_player_update(void *self, void *method) {
             if (s_local_player != self)
                 LOGI("[PLAYER-DIAG] LocalPlayer SET self=%p (was %p)", self, s_local_player);
             s_local_player = self;
+            // MaxHealth: keep HP at maximum every frame
+            if (s_max_health) {
+                if (s_set_max_hp_fn) {
+                    using SetHPFn = void (*)(void *, float, void *);
+                    reinterpret_cast<SetHPFn>(s_set_max_hp_fn)(self, 999.f, nullptr);
+                }
+                if (s_set_cur_hp_fn) {
+                    using SetHPFn = void (*)(void *, float, void *);
+                    reinterpret_cast<SetHPFn>(s_set_cur_hp_fn)(self, 999.f, nullptr);
+                }
+            }
+            // AutoRevive active call: push SetIsPendingRevive(true) from game thread
+            if (s_auto_revive && s_set_is_pending_revive_fn) {
+                using SetRevFn = void (*)(void *, uint8_t, void *);
+                reinterpret_cast<SetRevFn>(s_set_is_pending_revive_fn)(self, 1, nullptr);
+            }
             // Call GameSettingData.EnableShowPlayerOutline/Team once per session from game thread
             if (s_esp && !s_gs_outline_done && s_gs_get_instance_fn && s_gs_enable_outline_fn) {
                 using GetInstFn = void *(*)(void *);
@@ -1001,11 +1065,13 @@ static uint8_t hook_no_headshot_state(void *self, void *method) {
 // GetAttackableCenterWS — redirect aim center to head bone when auto-hs / silent-aim / aimbot on
 // Returns Vec3 by value (ARM64 HFA convention: s0/s1/s2)
 static Vec3 hook_get_attackable_center(void *self, void *method) {
-    // Lazy-init MatchGame singleton for ESP outline.
-    // MatchGame.GetMatch() is the static accessor (confirmed via global-metadata.dat).
-    // Fires when enemy is visible to aim system — guaranteed in-match with enemies nearby.
-    // MatchGame lazy-init intentionally removed from hook context (crash in IL2CPP hook thread).
-    // MatchGame.ShowPlayerOutline is called once in applyESP() from safe main-thread context.
+    // AntiAim: when enemy aim-assist calls GetAttackableCenterWS on OUR player,
+    // return a position far away so their bullet-prediction misses entirely.
+    if (s_anti_aim && s_local_player && self == s_local_player) {
+        using Fn = Vec3 (*)(void *, void *);
+        Vec3 orig = reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
+        return {orig.x + 9000.f, orig.y + 9000.f, orig.z + 9000.f};
+    }
 
     // ESP: set enemy render queue to Transparent layer (renders above walls).
     // Per-enemy InitOutline + SetOutlineVisible(1) is injected every ~90 calls via the
@@ -1261,7 +1327,7 @@ static void installAimCenterHook(MethodInfo *mth) {
 }
 static void removeAimCenterHook(MethodInfo *mth) {
     if (!mth || !mth->methodPointer || !s_orig_attackable_ctr) return;
-    if (s_auto_headshot || s_silent_aim || s_full_aimbot || s_esp) return; // another feature still needs it
+    if (s_auto_headshot || s_silent_aim || s_full_aimbot || s_esp || s_anti_aim) return; // another feature still needs it
     HookEngine::get().unhook(mth->methodPointer);
     s_orig_attackable_ctr = nullptr;
     LOGI("[AIM] GetAttackableCenterWS unhooked");
@@ -1537,11 +1603,13 @@ void FeatureEngine::applyFullAimbot(bool enable) {
 
 void FeatureEngine::applyAntiAim(bool enable) {
     s_anti_aim = enable;
-    // Anti-aim: jam enemy aim assist by making our attackable center return zero/far position.
-    // The hook_get_attackable_center already handles this when anti_aim flag is set —
-    // for our own player object we return a far-away position.
-    // No separate hook needed; the existing center hook covers it.
-    LOGI("AntiAim: %s", enable ? "ON" : "OFF");
+    // Anti-aim: hook GetAttackableCenterWS on our local player; hook_get_attackable_center
+    // returns a 9000m-offset position so enemy aim-assist predictions miss entirely.
+    if (m_mth.calcAimTarget) {
+        if (enable) installAimCenterHook(m_mth.calcAimTarget);
+        else        removeAimCenterHook(m_mth.calcAimTarget);
+    }
+    LOGI("AntiAim: %s  center_hook=%p", enable ? "ON" : "OFF", s_orig_attackable_ctr);
 }
 
 void FeatureEngine::applySpeedHack(bool enable, float multiplier) {
@@ -1665,22 +1733,45 @@ void FeatureEngine::applyNoGrass(bool enable) {
 }
 
 void FeatureEngine::applyMaxHealth(bool enable) {
-    // TakeDamage hook already caps damage to 0; MaxHealth kept as separate toggle
-    // pending actual HP field offset from obfuscated PlayerAttributes fields
-    LOGI("MaxHealth: %s (pending obfuscated field offset)", enable ? "ON" : "OFF");
+    s_max_health = enable;
+    if (enable) {
+        s_set_max_hp_fn = m_mth.setMaxHP ? m_mth.setMaxHP->methodPointer : nullptr;
+        s_set_cur_hp_fn = m_mth.setCurHP ? m_mth.setCurHP->methodPointer : nullptr;
+        // Ensure Player.Update hook is installed for the per-frame HP restore
+        if (!s_orig_update && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
+            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+                reinterpret_cast<void *>(hook_player_update), &s_orig_update, "MaxHPTick");
+        }
+        if (!s_is_local_player_fn && m_mth.isLocalPlayer)
+            s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
+    }
+    LOGI("MaxHealth: %s  set_MaxHP=%p set_CurHP=%p", enable ? "ON" : "OFF",
+         s_set_max_hp_fn, s_set_cur_hp_fn);
 }
 
 void FeatureEngine::applyAntiDamage(bool enable) {
     s_anti_damage = enable;
-    if (!m_mth.takeDamage || !m_mth.takeDamage->methodPointer) return;
-    if (enable && !s_orig_dmg) {
-        HookEngine::get().hookAddr(m_mth.takeDamage->methodPointer,
-            reinterpret_cast<void *>(hook_dmg), &s_orig_dmg, "AntiDamage");
-    } else if (!enable && s_orig_dmg) {
-        HookEngine::get().unhook(m_mth.takeDamage->methodPointer);
-        s_orig_dmg = nullptr;
+    // TakeDamage no-op
+    if (m_mth.takeDamage && m_mth.takeDamage->methodPointer) {
+        if (enable && !s_orig_dmg)
+            HookEngine::get().hookAddr(m_mth.takeDamage->methodPointer,
+                reinterpret_cast<void *>(hook_dmg), &s_orig_dmg, "AntiDamage");
+        else if (!enable && s_orig_dmg) {
+            HookEngine::get().unhook(m_mth.takeDamage->methodPointer);
+            s_orig_dmg = nullptr;
+        }
     }
-    LOGI("AntiDamage: %s", enable ? "ON" : "OFF");
+    // SetIsInvincibleByImmortalitySkill — GodMode belt-and-suspenders (v2.16)
+    if (m_mth.setInvincible && m_mth.setInvincible->methodPointer) {
+        if (enable && !s_orig_invincible)
+            HookEngine::get().hookAddr(m_mth.setInvincible->methodPointer,
+                reinterpret_cast<void *>(hook_set_invincible), &s_orig_invincible, "GodInvincible");
+        else if (!enable && s_orig_invincible) {
+            HookEngine::get().unhook(m_mth.setInvincible->methodPointer);
+            s_orig_invincible = nullptr;
+        }
+    }
+    LOGI("AntiDamage: %s  dmg=%p invincible=%p", enable ? "ON" : "OFF", s_orig_dmg, s_orig_invincible);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1961,18 +2052,33 @@ void FeatureEngine::applyWallShoot(bool enable) {
 
 void FeatureEngine::applyAutoRevive(bool enable) {
     s_auto_revive = enable;
-    if (!m_mth.isKnockDown || !m_mth.isKnockDown->methodPointer) {
-        LOGE("AutoRevive: knockdown getter not resolved");
-        return;
+    // Getter hook: get_IsPendingRevive → always 1 (primary path)
+    if (m_mth.isKnockDown && m_mth.isKnockDown->methodPointer) {
+        if (enable && !s_orig_knockdown)
+            HookEngine::get().hookAddr(m_mth.isKnockDown->methodPointer,
+                reinterpret_cast<void *>(hook_is_knockdown), &s_orig_knockdown, "AutoRevive");
+        else if (!enable && s_orig_knockdown) {
+            HookEngine::get().unhook(m_mth.isKnockDown->methodPointer);
+            s_orig_knockdown = nullptr;
+        }
+    } else {
+        LOGE("AutoRevive: get_IsPendingRevive not resolved — active-call path only");
     }
-    if (enable && !s_orig_knockdown) {
-        HookEngine::get().hookAddr(m_mth.isKnockDown->methodPointer,
-            reinterpret_cast<void *>(hook_is_knockdown), &s_orig_knockdown, "AutoRevive");
-    } else if (!enable && s_orig_knockdown) {
-        HookEngine::get().unhook(m_mth.isKnockDown->methodPointer);
-        s_orig_knockdown = nullptr;
+    // Active call: SetIsPendingRevive(true) from game Update tick — more reliable than getter hook alone
+    if (enable) {
+        s_set_is_pending_revive_fn = m_mth.setIsPendingRevive
+            ? m_mth.setIsPendingRevive->methodPointer : nullptr;
+        if (!s_orig_update && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
+            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+                reinterpret_cast<void *>(hook_player_update), &s_orig_update, "ReviveTick");
+        }
+        if (!s_is_local_player_fn && m_mth.isLocalPlayer)
+            s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
+    } else {
+        s_set_is_pending_revive_fn = nullptr;
     }
-    LOGI("AutoRevive: %s", enable ? "ON" : "OFF");
+    LOGI("AutoRevive: %s  getter=%p active_call=%p", enable ? "ON" : "OFF",
+         s_orig_knockdown, s_set_is_pending_revive_fn);
 }
 
 void FeatureEngine::applyNoClip(bool enable) {

@@ -192,6 +192,11 @@ private:
         MethodInfo *enableThroughOutline = nullptr; // MatchGame.EnableThroughTeamOutline(bool)
         MethodInfo *hudBindPlayer        = nullptr; // UIHudNameEnemyController.BindPlayer
         MethodInfo *hudVisChanged        = nullptr; // UIHudNameEnemyController.OnVisibilityChanged
+        // v2.16 bug fixes
+        MethodInfo *setCurHP             = nullptr; // Player.set_CurHP(float)            — MaxHealth
+        MethodInfo *setMaxHP             = nullptr; // Player.set_MaxHP(float)            — MaxHealth
+        MethodInfo *setIsPendingRevive   = nullptr; // Player.SetIsPendingRevive(bool)    — AutoRevive active call
+        MethodInfo *setInvincible        = nullptr; // PlayerAttributes.SetIsInvincibleByImmortalitySkill(bool) — GodMode
     } m_mth;
 
     void resolveClasses();
