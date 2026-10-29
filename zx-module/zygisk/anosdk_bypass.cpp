@@ -245,6 +245,15 @@ static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a
         if (is_self_maps(path))   return (long)make_filtered_maps();
         if (is_self_status(path)) return (long)make_filtered_status(path);
     }
+    // Direct SYS_ioctl — same filtering as hook_ioctl (a0=fd, a1=req, a2=arg)
+    if (nr == __NR_ioctl) {
+        unsigned long req  = (unsigned long)a1;
+        unsigned long type = (req >> 8) & 0xFF;
+        unsigned long num  = req & 0xFF;
+        bool is_system = type == 0x54 || type == 0x66 || type == 0x53 || type == 0x89 || type == 0x00;
+        if (!is_system && a2 != 0 && num >= 0x10)
+            __builtin_memset((void *)a2, 0, 64);
+    }
     return syscall(nr, a0, a1, a2, a3, a4, a5);
 }
 
@@ -256,25 +265,36 @@ static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a
 // it uses, so we intercept ALL ioctl and pass non-AnoSDK calls through unchanged.
 #include <sys/ioctl.h>
 static int hook_ioctl(int fd, unsigned long req, void *arg) {
-    // AnoSDK detection cmds are in the 0x10–0xFF range (internal protocol).
-    // Heartbeat/init cmds < 0x10 must pass through untouched.
-    unsigned long cmd = req & 0xFF;
-    if (cmd >= 0x10) {
-        // Log first 32 bytes of payload so we can diagnose what was detected
+    // ioctl encoding: bits[15:8] = type/magic (device), bits[7:0] = number (cmd)
+    // Standard Linux ioctls use type bytes like 'T'(0x54), 'f'(0x66), 'S'(0x53), etc.
+    // AnoSDK uses a private type byte — log ALL calls first time to discover it.
+    // Only zero payload when type byte is NOT a known system type.
+    unsigned long type = (req >> 8) & 0xFF;
+    unsigned long num  = req & 0xFF;
+
+    // Known safe system ioctl type bytes — never zero these
+    bool is_system_ioctl =
+        type == 0x54 || // 'T' — terminal ioctls (TIOCGWINSZ etc.)
+        type == 0x66 || // 'f' — file ioctls (FIONREAD etc.)
+        type == 0x53 || // 'S' — socket ioctls
+        type == 0x89 || // socket/network ioctls
+        type == 0x00;   // anonymous ioctls
+
+    if (!is_system_ioctl) {
         if (arg) {
             const uint8_t *p = (const uint8_t *)arg;
-            LOGI("[IOCTL-BAN] fd=%d req=0x%lx cmd=0x%lx payload: "
+            LOGI("[IOCTL-BAN] fd=%d req=0x%lx type=0x%lx num=0x%lx payload: "
                  "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
                  "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-                 fd, req, cmd,
+                 fd, req, type, num,
                  p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
                  p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
                  p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],
                  p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]);
-            // Zero out the detection payload so the report carries no ban data
-            __builtin_memset(arg, 0, 64);
+            if (num >= 0x10)
+                __builtin_memset(arg, 0, 64);
         } else {
-            LOGI("[IOCTL-BAN] fd=%d req=0x%lx cmd=0x%lx (null arg)", fd, req, cmd);
+            LOGI("[IOCTL-BAN] fd=%d req=0x%lx type=0x%lx num=0x%lx (null arg)", fd, req, type, num);
         }
     }
     return ::ioctl(fd, req, arg);
@@ -287,7 +307,11 @@ struct DlHideCtx {
 };
 static int dl_hide_trampoline(struct dl_phdr_info *info, size_t sz, void *raw) {
     auto *ctx = static_cast<DlHideCtx *>(raw);
-    if (info->dlpi_name && strstr(info->dlpi_name, "libzx_zola"))
+    // Zygisk module path: /data/adb/modules/zx_zola_v2/zygisk/arm64-v8a.so
+    // Hide by module name AND by the generic arm64-v8a.so filename to catch both
+    if (info->dlpi_name &&
+        (strstr(info->dlpi_name, "zx_zola") ||
+         strstr(info->dlpi_name, "arm64-v8a.so")))
         return 0;
     return ctx->user_cb(info, sz, ctx->user_data);
 }
@@ -410,6 +434,7 @@ static const PatchEntry kAnogsEntries[] = {
     // Protection 2: maps reads (all open variants + fopen)
     { "open",             reinterpret_cast<void *>(hook_open)            },
     { "__open_2",         reinterpret_cast<void *>(hook_open2)           },
+    { "openat",           reinterpret_cast<void *>(hook_openat2)         },
     { "__openat_2",       reinterpret_cast<void *>(hook_openat2)         },
     { "fopen",            reinterpret_cast<void *>(hook_fopen)           },
     // Protection 6: shell execution
@@ -441,6 +466,7 @@ static const PatchEntry kAnortEntries[] = {
     { "_exit",            reinterpret_cast<void *>(hook__exit)       },
     { "ptrace",           reinterpret_cast<void *>(hook_ptrace)      },
     { "fork",             reinterpret_cast<void *>(hook_fork)        },
+    { "openat",           reinterpret_cast<void *>(hook_openat2)     },
     { "syscall",          reinterpret_cast<void *>(hook_syscall_got) },
     { "ioctl",            reinterpret_cast<void *>(hook_ioctl)       },
 };
