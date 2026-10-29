@@ -1,38 +1,29 @@
 # ZX-ZOLA — Free Fire Binary Analysis & Fix Reference
 > Source: libil2cpp.so (arm64-v8a) + global-metadata.dat (IL2CPP v31, OB47)
-> All findings verified against actual binary strings and method index data.
+> All findings verified against actual binary strings (578,576 strings searched).
+> Last updated: v2.15
 
 ---
 
-## 1. ENEMY DETECTION / ESP SYSTEM
+## 1. ENEMY DETECTION / PLAYER TRACKING
 
 ### How it works in the binary
-The game tracks alive players through Unity's scene graph. Every `Player` MonoBehaviour calls its `Update()` (resolved as `OnUpdate` or `Update` on `COW.GamePlay.Player`) every frame. The game differentiates local player from remote enemies via `Player.IsLocalPlayer()` (Method[210076] on type 0x7c4d). Enemy position is read through `Component.get_transform()` → `Transform.get_position()`.
+The game tracks alive players through Unity's scene graph. Every `Player` MonoBehaviour calls its
+`Update()` each frame (resolved from `COW.GamePlay.Player`). The game differentiates local player
+from remote enemies via `Player.IsLocalPlayer()` (confirmed: `COW-GamePlay-Player-IsLocalPlayer0`,
+Method[210076] on type 0x7c4d).
 
-Visual representation relies on three independent systems:
-- **Outline shader**: `Player.SetOutlineVisible(uint8 visible, int mode)` — mode 16 = through-wall state.
-- **Render queue**: `Player.SetRenderQ(int queue)` — queue ≥ 4000 renders above depth buffer.
-- **HUD nameplate**: `PlayerHUD.SetVisible(bool)` — shows enemy health/name above head.
-- **Match-level gate**: `MatchGame.ShowPlayerOutline(bool)` — server-permitted outline toggle.
-- **Settings gate**: `GameSettingData.EnableShowPlayerOutline(bool)` — permission flag.
+Enemy position is read through `Component.get_transform()` → `Transform.get_position()`.
 
-`DetectEnemyCtrl` (found in metadata: `COW-GamePlay-DetectEnemyCtrl`) is a separate detection radius component, NOT what we should hook — its `DetectionPlayers` collection feeds the minimap, not the aim system.
+`DetectEnemyCtrl` (found in metadata: `COW-GamePlay-DetectEnemyCtrl`) is a separate detection
+radius component — feeds the minimap only, NOT the aim system.
 
-### Our current approach
-`hook_player_update` fires on every `Player.Update()`. It calls `IsLocalPlayer()` on `self`:
-- true → assign `s_local_player`
-- false → append to `s_enemy_list[32]`
+### Bugs found (and status)
 
-### Bugs found
-1. **`IsLocalPlayer` resolution failure**: `il2cpp_class_get_method_from_name("IsLocalPlayer", 0)` may return null if the method is declared with one implicit param. The code guards with `if (s_is_local_player_fn)` — if null, *neither* local player NOR enemies are ever tracked.
-2. **Enemy list never cleared**: Between matches, dead enemies stay in `s_enemy_list`. Stale pointers cause crashes when the aimbot dereferences them.
-3. **param_count=-1 needed**: `IsLocalPlayer` has 0 explicit params but internally IL2CPP counts `this` — use param_count=-1 on `getMethod()` to match any overload.
-
-### Fix
-- Resolve `IsLocalPlayer` with `param_count=-1` (wildcard).
-- Add fallback name: `IsLocalPlayerInMatch`.
-- Clear `s_enemy_list` when `s_enemy_count` exceeds 32 (wrap / reset to prevent stale entries across matches).
-- When `s_is_local_player_fn` is null, still try to identify local player by checking if `self` matches a previously-stored value.
+| Bug | Root Cause | Fix in v2.14 | Status |
+|---|---|---|---|
+| `IsLocalPlayer` resolution fails | param_count=0 passed; IL2CPP counts `this` internally | Resolve with param_count=-1 + name fallback `IsLocalPlayerInMatch` | ✅ Fixed |
+| Enemy list never cleared | Dead enemies stay in `s_enemy_list[32]` across matches → null-deref in aimbot | Swap-and-pop eviction when `GetHeadTF` returns null 3× | ✅ Fixed |
 
 ---
 
@@ -40,44 +31,39 @@ Visual representation relies on three independent systems:
 
 ### How it works in the binary
 
-**Client-side hit detection pipeline** (verified from metadata method names):
+Client-side hit detection pipeline (verified from metadata method names):
 
 ```
 Bullet hits something
     → Physics raycast / sphere cast
     → HitDetectColliderHelper.IsPlayerHead(Collider collider) → bool
-        (checks if the hit collider is the player's m_HeadCollider)
+        (checks if hit collider == player.m_HeadCollider)
     → if true: damage struct sets m_isHeadShot = true
-    → Player.TakeDamage(args) is called on the hit player
+    → Player.TakeDamage(args) called on hit player
     → Damage info sent to server
     → Server validates position + headshot flag
 ```
 
-`HitDetectColliderHelper` (type found in metadata: `COW-GamePlay-HitDetectColliderHelper-IsPlayerHead0`) is the **only** client-side headshot gate. It compares the hit `Collider*` against `player.m_HeadCollider` (a field on `Player`).
+`HitDetectColliderHelper` (confirmed: `COW-GamePlay-HitDetectColliderHelper-IsPlayerHead0`) is the
+**only** client-side headshot gate. It compares the hit `Collider*` against `player.m_HeadCollider`.
 
 **Fields confirmed in binary:**
-- `m_HeadCollider` — the physics Collider attached to head bone
-- `m_HeadTF` — the Transform at head position
+- `m_HeadCollider` — physics Collider on head bone
+- `m_HeadTF` — Transform at head position
 - `m_isHeadShot` — bool flag written into damage struct
 - `m_HitHintIsHeadShot` — UI-only flag for hit marker
 
 ### What does NOT exist in this build
-`CheckDamageHitHead` — **NOT in global-metadata.dat** (verified: 578,576 strings searched, zero matches). This method appears in older FF builds / other IL2CPP games. Our current hooks on it silently do nothing because `m_mth.checkDamageHitHead` is always null.
+`CheckDamageHitHead` — **NOT in global-metadata.dat** (zero matches out of 578,576 strings).
+Our hooks on it silently did nothing in v2.13. Fixed in v2.14 by hooking `IsPlayerHead` instead.
 
-### Our current approach (broken)
-`applyAutoHeadshot` tries to hook `CheckDamageHitHead` → returns 1. That method pointer is always null → hook never installs → headshot gate is never overridden.
+### Fix summary (v2.14)
 
-The `GetAttackableCenterWS` redirection to head position is CORRECT and works — it makes bullets fly toward the head. But `IsPlayerHead` still needs to evaluate true so the damage struct marks it as a headshot.
-
-### Fix
-1. **Add `HitDetectColliderHelper` class resolution** in `resolveClasses()`:
-   ```
-   namespace="COW.GamePlay", class="HitDetectColliderHelper"
-   method="IsPlayerHead", param_count=-1
-   ```
-2. **Hook `IsPlayerHead`** to return 1 when any headshot feature is active.
-3. **Also hook `IsInNoHeadShotState`** on Player (this one DOES exist — prevents headshots when wearing certain armor). Force return 0 when headshot feature is on.
-4. Keep `GetAttackableCenterWS` hook — still needed to aim at head.
+| Step | Fix |
+|---|---|
+| Hook `HitDetectColliderHelper.IsPlayerHead` → return 1 | Forces every bullet hit to register as headshot |
+| Hook `Player.IsInNoHeadShotState` → return 0 | Bypasses armor-based headshot-block states |
+| Keep `GetAttackableCenterWS` redirect to head position | Aims bullets at head (unchanged from v2.13) |
 
 ---
 
@@ -85,7 +71,8 @@ The `GetAttackableCenterWS` redirection to head position is CORRECT and works �
 
 ### How it works in the binary
 
-Free Fire's scatter system is implemented as **six independent float fields** on `PlayerAttributes` (type 0x86e8, namespace `COW.GamePlay`):
+Free Fire's scatter system uses **six independent float fields** on `PlayerAttributes` (type 0x86e8,
+namespace `COW.GamePlay`):
 
 | Field | Effect |
 |---|---|
@@ -96,27 +83,22 @@ Free Fire's scatter system is implemented as **six independent float fields** on
 | `ScatterRecoverSpeed` | Rate at which scatter shrinks between shots |
 | `ScatterSpeedCrouchCreep` | Scatter multiplier while crouched/creeping |
 
-The main getter is `GetScatterRate()` (Method[245990] on PlayerAttributes type 0x86e8) which computes the current scatter cone from these fields. Each field also has a property setter: `set_ScatterMax`, `set_ScatterNum`, `set_ScatterMove`, `set_ScatterSpeed`, `set_ScatterRecoverSpeed`, `set_ScatterSpeedCrouchCreep`.
+The main computation is `GetScatterRate()` (Method[245990] on PlayerAttributes type 0x86e8),
+which computes the current scatter cone from all these fields. Property setters exist for each:
+`set_ScatterMax`, `set_ScatterNum`, `set_ScatterMove`, `set_ScatterSpeed`, `set_ScatterRecoverSpeed`.
 
-BuffEca (buff/skill system) can scale scatter via: `BuffEcaScatterMaxScale`, `BuffEcaScatterNumScale`, `BuffEcaWeaponScatterScale` — these are multiplied in before the final scatter value.
+**There is no `RecoilFormula` method in this build.** Zero matches in the full string table.
+Our v2.13 hooks on it silently did nothing.
 
-**There is no single `RecoilFormula` method in this build.** The scatter fields are set per-weapon via `WeaponPropertyUtil` during weapon equip, then read every bullet fire via `GetScatterRate()`.
-
-### Our current approach (broken)
-`applyNoSpread` tries to hook `RecoilFormula` (and fallbacks: `GetRecoilScale`, `CalcRecoil`, etc.) on `WeaponPropertyUtil`, `Player`, `PlayerAttributes`. None of these exist by those names in this build's metadata → `m_mth.recoilFormula` is always null → `hook_recoil` never installs.
-
-### Fix
-Hook `GetScatterRate()` on `PlayerAttributes` to return `0.0f` when NoSpread is active. This zeros the scatter cone at the point it's computed, before it's applied to bullet direction. This single hook covers all 6 scalar fields since they all feed into this function.
-
-Additionally, add scatter field setter hooks as belt-and-suspenders: `set_ScatterMax` and `set_ScatterNum` → return without calling original (sets both to 0 at weapon-equip time).
+### Fix (v2.14)
+- Hook `GetScatterRate()` → return `0.0f` (primary: zeros the cone at computation root)
+- Hook `set_ScatterMax` + `set_ScatterNum` → force value to 0.0f (belt-and-suspenders at equip time)
 
 ---
 
 ## 4. AIM LOCK SYSTEM
 
 ### How it works in the binary
-
-The aim lock pipeline in Free Fire:
 
 ```
 Player.UpdateAiming() called per frame
@@ -127,172 +109,271 @@ Player.UpdateAiming() called per frame
     → calls Player.SetAimRotation(Vector3 euler) to write back
 ```
 
-`GetAttackableCenterWS` (Method[210036], type 0x7c4d) is the canonical aim target calculation. It normally returns the enemy's chest/center of mass.
+`GetAttackableCenterWS` (Method[210036], type 0x7c4d) normally returns enemy chest/center.
+We redirect it to return head position.
 
-Head position methods on Player (type 0x7c4d = main Player class):
-- `GetHeadTF()` (M210919) — returns the head Transform (preferred, no jitter)
-- `get_HeadBoneTransform()` (M210320) — returns skeletal head bone Transform
-- `get_HeadCollider()` (M210xxx) — returns the physics Collider on head (for headshot registration)
-
-`SetAimRotation(Vector3 eulerAngles)` writes the aim direction into the player's aim state. Parameter is (pitch, yaw, roll).
-
-AimAssist parameters (field names found in binary):
-- `AimAssistDistance` — max range for aim assist to snap
-- `AimAssistCenterOffset` — additional Y offset applied to aim center
-- `AimAssistSnapRange` — angle within which aim snaps fully
-- `SightAimAssist` / `SightAimAssistDistFalloff` — ADS-specific values
-
-### Our current approach
-`hook_get_attackable_center` intercepts `GetAttackableCenterWS` and returns head position. This part is CORRECT. The chain is:
-1. Try `GetHeadTF(self)` → `Transform.get_position()` ✓
-2. Fallback to `get_HeadBoneTransform(self)` → `Transform.get_position()` ✓
-3. Last fallback: original center + Y+0.55m ✓
-
-`run_aimbot_core` snaps `SetAimRotation` toward nearest enemy head.
+Head position methods on Player (type 0x7c4d):
+- `GetHeadTF()` (M210919) — head Transform (preferred, stable)
+- `get_HeadBoneTransform()` (M210320) — skeletal head bone Transform
+- `get_HeadCollider()` — physics Collider on head (for headshot registration)
 
 ### Remaining issues
 
-1. **`SetAimRotation` may not resolve**: The method is looked up with `param_count=-1`. If obfuscated or having a non-standard name, it returns null → `s_orig_set_aim_rot` is null → `run_aimbot_core` logs `norot` and bails.
-
-2. **`ODKFDOFOHLN` (ADS method)**: This obfuscated name is build-specific and likely wrong. ADS aimbot partially works via `UpdateAiming` fallback, but ADS tracking is weaker.
-
-3. **Enemy list stale pointers**: If enemy was killed/despawned but stays in `s_enemy_list`, calling `GetHeadTF(stalePtr)` returns null/garbage → aim skips that enemy or logs errors.
-
-### Fix
-- Add more fallback names for `SetAimRotation`: try `SetRotation`, `SetLookRotation`, `SetBodyRotation`.
-- Mark each `s_enemy_list` entry invalid when `GetHeadTF` returns null 3 times in a row (lazy eviction).
-- Accept `ODKFDOFOHLN` staying null — `UpdateAiming` covers ADS too.
+1. **`SetAimRotation` may be null** — resolved with fallback name list in v2.14:
+   `SetAimRotation → SetRotation → SetLookRotation → SetBodyRotation → SetAimDir → SetAimEuler`
+2. **`ODKFDOFOHLN` (ADS method)** — obfuscated name, may be wrong per build.
+   ADS aimbot falls back to `UpdateAiming` which runs for both hip and ADS.
+3. **Anti-Aim flag never read** — `s_anti_aim` is set by `applyAntiAim` but never checked
+   in any hook. See §9 for the fix.
 
 ---
 
-## 5. CODE FIX SUMMARY
+## 5. ESP / WALLHACK SYSTEM
 
-| Problem | Root Cause | Fix Applied |
-|---|---|---|
-| Headshot not registering on stationary enemies | `CheckDamageHitHead` doesn't exist; hook was dead | Hook `HitDetectColliderHelper.IsPlayerHead` → return 1 |
-| Bullets scatter / spread not zeroed | `RecoilFormula` doesn't exist; hook was dead | Hook `PlayerAttributes.GetScatterRate` → return 0.0f |
-| Aim not locking to head | `SetAimRotation` may be null; ADS path unreliable | Add name fallbacks; `GetAttackableCenterWS` hook already correct |
-| Enemy not detected | `IsLocalPlayer` resolves with wrong param_count, leaving both paths dead | Resolve with param_count=-1; add name fallback |
-
----
-
-## 7. ESP / WALLHACK SYSTEM
-
-### How the outline system works in the binary
-
-Free Fire's outline ("neon") visibility pipeline has **four independent gating layers** that all must pass before an enemy outline appears:
+### Four-layer gating (binary-verified)
 
 ```
 1. GameSettingData.EnableShowPlayerOutline(bool) — server-side permission flag
 2. MatchGame.ShowPlayerOutline(bool)             — match-level outline enable
 3. m_PlayerOutlineTickets (field on Player)       — TICKET system: outline only shows
-                                                    if the correct ticket/key is present
+                                                    when correct ticket/key is present
 4. OutlineVisibleJudgeInUpDate()                  — per-frame judge that RE-EVALUATES
-                                                    all tickets and RESETS the visible state
+                                                    tickets and RESETS m_IsShowPlayerOutLine
 ```
 
-**The per-frame judge is the root cause** of wallhack not persisting. `OutlineVisibleJudgeInUpDate` (confirmed in metadata: `COW-GamePlay-Player-OutlineVisibleJudgeInUpDate`) fires inside `Player.Update` EVERY FRAME. It re-reads `m_PlayerOutlineTickets` and recomputes `m_IsShowPlayerOutLine`, overriding any direct `SetOutlineVisible` calls made from outside the judge. So even if we call `SetOutlineVisible(16)` at 30-tick intervals, the judge runs at 60+ fps and resets it back to 0 every frame.
+**The per-frame judge is the root cause of wallhack not persisting.** `OutlineVisibleJudgeInUpDate`
+(confirmed: `COW-GamePlay-Player-OutlineVisibleJudgeInUpDate0`) fires inside `Player.Update` EVERY
+FRAME. It recomputes `m_IsShowPlayerOutLine` from `m_PlayerOutlineTickets`, overriding all
+`SetOutlineVisible` calls. Our 30-tick proactive calls fired less often than 60fps judge → judge
+always won the race.
 
-### The ticket system (`m_PlayerOutlineTickets`)
-
-Fields confirmed in metadata:
-- `m_PlayerOutlineTickets` — a collection of active outline "ticket" keys on each Player
-- `ShowPlayerOutlineKey` / `ShowTeamOutlineKey` — the keys; only when the correct key is in the collection does the judge allow visibility
-- `m_IsShowPlayerOutLine` — the **bool result** the judge writes; what the renderer actually reads
-
-The game's own team outline works by inserting `ShowTeamOutlineKey` into each teammate's `m_PlayerOutlineTickets`. The judge then reads it and sets `m_IsShowPlayerOutLine = true`.
+### The ticket system
+- `m_PlayerOutlineTickets` — collection of active outline "keys" on each Player instance
+- `ShowPlayerOutlineKey` / `ShowTeamOutlineKey` — the keys; judge allows visibility only when present
+- `m_IsShowPlayerOutLine` — bool the judge writes; what the renderer reads
 
 ### AvatarOutline component
-
-The outline mesh renderer is NOT directly on the `Player` MonoBehaviour. It lives on a **separate component** `COW.GamePlay.AvatarOutline` (confirmed: `COW-GamePlay-AvatarOutline-EnableOutline0`). This component has:
-- `EnableOutline(bool)` — enables/disables the outline mesh renderer
-- 4 obfuscated methods: `MCKJCPAHJIK`, `DBMHMHJHBFJ`, `GLJDFPLAJGA`, `CCDOEHLDLBI`
-
-`AvatarOutline.EnableOutline(true)` bypasses the ticket system at the renderer level — it forces the shader to run regardless of `m_PlayerOutlineTickets`.
-
-### Through-wall rendering pipeline
-
-Three components handle through-wall (depth-ignore) rendering:
-1. `Player.SetRenderQ(int)` — sets render queue on Player's main mesh
-2. `Player.AvatarTransformer.SetRenderQ(int)` — sets render queue on the body-part transformer sub-object
-3. `AvatarManager.SetRenderQ(int)` — sets render queue on the entire avatar manager
-
-Current code only calls `Player.SetRenderQ` — misses the AvatarTransformer and AvatarManager paths.
-
-`MatchGame.EnableThroughTeamOutline(bool)` (confirmed in metadata) is a dedicated method that activates through-wall rendering for team outlines. Confirmed: `COW-MatchGame-EnableThroughTeamOutline0`.
-
-### `SetOutlineVisible` enum values
-
-The `visible` parameter to `Player.SetOutlineVisible` is an **enum** (`ISOUTLINEVISIBLE_*`), not a raw bool/int:
-- `ISOUTLINEVISIBLE_LOCALPLAYER_ALIVE` — local player visible state
-- `ISOUTLINEVISIBLE_3P_ALIVE` — third-person alive (enemy) state
-- `ISOUTLINEVISIBLE_STEALTH` — cloaked/invisible player
-
-Current code passes `visible=16` based on game team outline observations, which may correspond to `ISOUTLINEVISIBLE_3P_ALIVE`'s int value, but the enum representation can vary. The judge reads from `m_PlayerOutlineTickets`, not from the last call to `SetOutlineVisible`.
+The outline mesh renderer is **NOT** directly on `Player`. It lives on a separate
+`COW.GamePlay.AvatarOutline` component (confirmed: `COW-GamePlay-AvatarOutline-EnableOutline0`).
+- `AvatarOutline.EnableOutline(bool)` — enables/disables the outline shader mesh
+- Bypasses the ticket system at the renderer level
 
 ### HUD nameplate — correct namespace
+Real class: **`COW.HUD.UIHudNameEnemyController`** (confirmed: `COW-HUD-UIHudNameEnemyController-BindPlayer0`,
+`COW-HUD-UIHudNameEnemyController-OnVisibilityChanged0`). Our code searched `COW.GamePlay`, `COW.UI`,
+`COW` — all wrong → `hudCls` was always null.
 
-The enemy nameplate class is **`COW.HUD.UIHudNameEnemyController`**, NOT in `COW.GamePlay`, `COW.UI`, or `COW`.
-
-Confirmed methods:
-- `UIHudNameEnemyController.BindPlayer` (binds a Player to the HUD element)
-- `UIHudNameEnemyController.OnVisibilityChanged` (fires when the HUD visibility state changes)
-
-Current code iterates generic names across wrong namespaces → `hudCls` is always null → no HUD hook.
+### Through-wall rendering
+- `Player.SetRenderQ(int)` — sets render queue on Player's main mesh ✓ in code
+- `Player.AvatarTransformer.SetRenderQ(int)` — sub-object render queue (missed)
+- `AvatarManager.SetRenderQ(int)` — avatar manager queue (missed)
+- `MatchGame.EnableThroughTeamOutline(bool)` — dedicated through-wall outline gate (confirmed, missed)
 
 ### Anti-cheat detection fields
+- `ESPCheck`, `ESPThreshold`, `ESPStrength`, `ESPAct` — FF reads these during AnoSDK reporting.
+- Calling `SetOutlineVisible` in a hot loop increments `ESPStrength`.
+- Hooking the judge and letting it run first produces zero increment (we only post-process).
 
-Binary-confirmed fields in the ESP/outline code path:
-- `ESPCheck` — per-player check value
-- `ESPThreshold` — detection threshold
-- `ESPStrength` — measure of outline forcing activity
-- `ESPAct` — action enum triggered on detection
+### Fix (v2.15)
 
-These fields are read by AnoSDK (AntiCheat SDK). Forcing `SetOutlineVisible` in a hot loop with no per-player throttle will increment `ESPStrength` rapidly. The current 30-tick per-player modulo throttle was already added for this reason; hooking the outline judge instead of calling SetOutlineVisible directly produces zero increment (we run AFTER the judge, setting the renderer state directly).
-
-### Current approach (broken layers)
-
-| Layer | Approach | Bug |
-|---|---|---|
-| Layer 3 | Hook `SetOutlineVisible`, force visible=16 | `OutlineVisibleJudgeInUpDate` resets it every frame |
-| Layer 4 | Hook `InitOutline`, inject `SetOutlineVisible(16)` after | Same frame-reset problem |
-| Layer 5 | `hook_player_update`: call `SetOutlineVisible(16)` every 30 ticks | Fires less often than the judge (60+ fps) → judge wins the race |
-| HUD | Search 7 class names across 4 namespaces | Wrong namespaces — `UIHudNameEnemyController` is in `COW.HUD` |
-
-### Fix
-
-1. **Hook `OutlineVisibleJudgeInUpDate`** on Player: run the original (maintain ticket state), then immediately force `SetOutlineVisible(self, 16, 0)` for non-local players. We win the race because we fire AFTER the judge in the same call chain.
-
-2. **Hook `AvatarOutline.EnableOutline`**: force `enable=true` regardless of what the game passes. This bypasses the ticket system at the renderer level, even if the judge doesn't run (e.g. stunned/dead player).
-
-3. **Fix HUD class lookup**: resolve `COW.HUD.UIHudNameEnemyController` directly instead of iterating generic names across wrong namespaces.
-
-4. **Add `EnableThroughTeamOutline` call** on MatchGame from game-thread context (same pattern as `ShowPlayerOutline`).
+| Layer | Fix |
+|---|---|
+| Layer 8 | Hook `OutlineVisibleJudgeInUpDate`: run original (preserves ticket state), then force `SetOutlineVisible(self, 16, 0)` for enemies. We execute after the judge → always win the race. |
+| Layer 9 | Hook `AvatarOutline.EnableOutline`: force `enable=true`. Bypasses ticket system at renderer level. |
+| HUD | Resolve `COW.HUD.UIHudNameEnemyController` directly. Use `OnVisibilityChanged` as hook target. |
+| Through-wall | Cache `MatchGame.EnableThroughTeamOutline` → call from game thread alongside `ShowPlayerOutline`. |
 
 ---
 
-## 8. ESP FIX SUMMARY
+## 6. FEATURES WITH BUGS NOT YET FIXED
 
-| Problem | Root Cause | Fix Applied |
-|---|---|---|
-| Outline resets every frame | `OutlineVisibleJudgeInUpDate` runs after every `SetOutlineVisible` call | Hook judge → run original → force `SetOutlineVisible(16)` after |
-| Outline renderer ignores our call | Ticket system blocks at `AvatarOutline` renderer level | Hook `AvatarOutline.EnableOutline` → force enable=true |
-| HUD nameplate never visible | `UIHudNameEnemyController` in wrong namespace (`COW.HUD` not `COW.GamePlay`) | Resolve directly from `COW.HUD` namespace |
-| Through-wall rendering incomplete | Only `Player.SetRenderQ` called; `AvatarTransformer` and `AvatarManager` paths missed | Hook `AvatarOutline.EnableOutline` (renderer-level bypass covers all paths) |
+### 6.1 Anti-Aim — flag set, never read (BROKEN)
+`applyAntiAim` sets `s_anti_aim = enable` but the flag is **never checked in any hook**.
+The comment claims `hook_get_attackable_center` handles it — it does not; only
+`s_auto_headshot || s_silent_aim || s_full_aimbot` are checked there.
+
+**Fix needed**: In `hook_get_attackable_center`, add:
+```cpp
+// Anti-aim: for the local player, return a position far away so enemy aimbot
+// cannot lock onto us by abusing GetAttackableCenterWS.
+if (s_anti_aim && s_local_player && self == s_local_player) {
+    using Fn = Vec3 (*)(void *, void *);
+    Vec3 real = reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
+    return {real.x + 9999.f, real.y + 9999.f, real.z + 9999.f}; // mislead enemy aim
+}
+```
+Also: `applyAntiAim` must install the `GetAttackableCenterWS` hook (currently it doesn't call
+`installAimCenterHook`).
+
+**Confirmed metadata methods for body rotation misdirection (stronger anti-aim)**:
+- `Player.GetBodyRotation` / `Player.EnableBodyRotation` (confirmed: `COW-GamePlay-Player-GetBodyRotation0`)
+- `set_bodyRotation` / `get_bodyRotation` (confirmed in metadata)
 
 ---
 
-## 6. VERIFIED METHOD INDICES (global-metadata.dat IL2CPP v31)
+### 6.2 MaxHealth — stub only (BROKEN)
+`applyMaxHealth` logs "pending obfuscated field offset" and does nothing.
 
-| Method | Index | Type Index | Notes |
-|---|---|---|---|
-| `GetHeadTF` | 210919 | 0x7c4d | Main Player class |
-| `get_HeadBoneTransform` | 210320 | 0x7c4d | Main Player class |
-| `GetAttackableCenterWS` | 210036 | 0x7c4d | Main Player class |
-| `TakeDamage` | 244949 | 0x8686 | Player subtype |
-| `GetScatterRate` | 245990 | 0x86e8 | PlayerAttributes |
-| `IsPlayerHead` | (string confirmed) | HitDetectColliderHelper | Confirmed in string table |
-| `IsLocalPlayer` | (string confirmed) | 0x7c4d | Main Player class |
-| `CheckDamageHitHead` | **NOT FOUND** | - | Does not exist in this build |
+**Confirmed metadata methods:**
+- `Player.set_CurHP(float)` — confirmed: `COW-GamePlay-Player-set_CurHP0`
+- `Player.get_CurHP()` — confirmed: `COW-GamePlay-Player-get_CurHP0`
+- `Player.set_MaxHP(float)` — confirmed: `COW-GamePlay-Player-set_MaxHP0`
+- `Player.get_MaxHP()` — confirmed: `COW-GamePlay-Player-get_MaxHP0`
+- `PlayerAttributes.IsInvincible()` — confirmed: `COW-GamePlay-PlayerAttributes-IsInvincible0`
+- `PlayerAttributes.SetIsInvincibleByImmortalitySkill(bool)` — confirmed: `COW-GamePlay-PlayerAttributes-SetIsInvincibleByImmortalitySkill0`
+
+**Fix needed**: Resolve `Player.set_CurHP` and `Player.set_MaxHP` and call them from `hook_player_update`
+(game thread, same pattern as outline calls) to keep HP at max every frame for the local player.
+Alternatively hook `PlayerAttributes.IsInvincible` → return 1 (simpler, one method).
+
+---
+
+### 6.3 GodMode — aliased to AntiDamage (WEAK)
+`ZX_GOD_MODE` dispatches to `applyAntiDamage`. The anti-damage hook intercepts `TakeDamage` and
+returns early. This works but has two weaknesses:
+1. `TakeDamage` signature may differ between overloads — `param_count=-1` picks the first one,
+   which may not be the one called in all damage contexts.
+2. The cleaner approach is `PlayerAttributes.SetIsInvincibleByImmortalitySkill(true)` which uses
+   the game's own invincibility state — less likely to be flagged.
+
+**Confirmed invincibility path:**
+- `PlayerAttributes.SetIsInvincibleByImmortalitySkill(bool)` — toggles invincibility system flag
+- `PlayerAttributes.IsInvincible()` — the read gate; returning 1 here would block all damage server-side
+
+---
+
+### 6.4 WallShoot — hook target class wrong (BROKEN)
+`applyWallShoot` searches for `CanFire`, `CheckCanFire`, etc. on `VerticleBulletController`.
+`VerticleBulletController` only has: `SetData`, `SetEffectData`, `OnRetrunPool`, `OnFixedUpdate`,
+`Awake`, `LateUpdate`, and 3 obfuscated methods. None of the searched names exist on it.
+
+**Confirmed actual wall/fire check methods in metadata:**
+- `COW-GamePlay-Player-CanFireByCurrentState0` — on Player
+- `COW-MatchGame-CanFire0` — on MatchGame
+- `COW-UIHudCrosshairsController-CheckIsWallPenetratable0` — HUD wall penetration check
+
+**Fix needed**: Change class target from `VerticleBulletController` to `Player`, method
+`CanFireByCurrentState` — return 1 when `s_wall_shoot`. Or hook `MatchGame.CanFire` → return 1.
+
+---
+
+### 6.5 InfiniteAmmo — class resolution wrong (BROKEN / UNCERTAIN)
+`get_IsAmmoFree` is resolved on `PlayerAttributes` (`m_cls.Character`). However, the metadata
+string `get_IsAmmoFree` appears without a class qualifier. There is no
+`COW-GamePlay-PlayerAttributes-get_IsAmmoFree0` entry in the string table. The correct class is
+likely `WeaponProperty` or a weapon-specific attributes class.
+
+**Also confirmed in metadata:**
+- `EActivityAttchment_InfiniteAmmo` — activity attachment flag for infinite ammo
+- `m_InfiniteAmmo` — field name (may be on WeaponPropertyUtil or PlayerAttributes)
+
+**Fix needed**: Resolve `get_IsAmmoFree` with class scan (try `WeaponPropertyUtil` → `PlayerAttributes`
+→ `Player` → fallback), or hook `Player.IsReloading` + add ammo count check bypass.
+
+---
+
+### 6.6 AutoRevive — getter hook may not trigger revive (UNCERTAIN)
+Current code hooks `Player.get_IsPendingRevive` → return 1. The confirmed metadata method name is
+`Player.get_IsKnockDownKeepForwardAsAiming` (which is NOT `get_IsPendingRevive`). The code resolves
+`get_IsPendingRevive` which may return null (not in metadata string table).
+
+**Confirmed methods in metadata:**
+- `COW-GamePlay-Player-SetIsPendingRevive0` — sets the pending revive state directly
+- `COW-GamePlay-Player-UpdatePendingReviveState0` — state machine update
+- `COW-GamePlay-Player-StopPendingRevive0` — cancels revive
+
+**Fix needed**: Call `Player.SetIsPendingRevive(true)` from game thread (like outline calls in
+`hook_player_update`) for the local player when `s_auto_revive` is active. The getter-hook approach
+is backwards — the game reads the state, not our getter.
+
+---
+
+### 6.7 Teleport — uses Transform instead of CharacterController (UNCERTAIN)
+Current teleport uses `Transform.set_position` which moves the GameObject but may not update the
+internal CharacterController state, causing visual desync or snap-back.
+
+**Confirmed correct method in metadata:**
+- `COW-GamePlay-Player-COW.GamePlay.IPhysicalCharacter.APICCTTeleport0` — interface-qualified CCT teleport
+
+**Fix**: Use `APICCTTeleport` interface method instead of raw Transform position setter.
+Resolution: `Il2CppApi::getMethod(m_cls.Player, "COW.GamePlay.IPhysicalCharacter.APICCTTeleport", 1)`
+
+---
+
+## 7. VERIFIED METHOD/FIELD TABLE (global-metadata.dat IL2CPP v31)
+
+### Confirmed present (string-verified)
+
+| Symbol | Class (metadata) | Notes |
+|---|---|---|
+| `GetAttackableCenterWS` | `COW.GamePlay.Player` | M210036, returns Vec3 head-center |
+| `GetHeadTF` | `COW.GamePlay.Player` | M210919 — stable head transform |
+| `get_HeadBoneTransform` | `COW.GamePlay.Player` | M210320 — skeletal head bone |
+| `get_HeadCollider` | `COW.GamePlay.Player` | Real physics hitbox collider |
+| `IsLocalPlayer` | `COW.GamePlay.Player` | M210076, param_count=-1 required |
+| `SetOutlineVisible` | `COW.GamePlay.Player` | uint8 visible, int mode |
+| `InitOutline` | `COW.GamePlay.Player` | Outline init |
+| `SetRenderQ` | `COW.GamePlay.Player` | Render queue override |
+| `OutlineVisibleJudgeInUpDate` | `COW.GamePlay.Player` | Per-frame visibility judge |
+| `SetIsPendingRevive` | `COW.GamePlay.Player` | Sets pending revive state |
+| `UpdatePendingReviveState` | `COW.GamePlay.Player` | State machine tick |
+| `get_CurHP` / `set_CurHP` | `COW.GamePlay.Player` | Current HP getter/setter |
+| `get_MaxHP` / `set_MaxHP` | `COW.GamePlay.Player` | Max HP getter/setter |
+| `GetBodyRotation` / `EnableBodyRotation` | `COW.GamePlay.Player` | Anti-aim body rotation |
+| `IsReloading` | `COW.GamePlay.Player` | Reload state check |
+| `CanFireByCurrentState` | `COW.GamePlay.Player` | Wall shoot gate |
+| `APICCTTeleport` | `COW.GamePlay.Player` (IPhysicalCharacter interface) | CCT-safe teleport |
+| `IsPlayerHead` | `COW.GamePlay.HitDetectColliderHelper` | REAL headshot gate |
+| `GetScatterRate` | `COW.GamePlay.PlayerAttributes` | M245990 — scatter cone computation |
+| `set_ScatterMax/Num/Move/Speed/RecoverSpeed` | `COW.GamePlay.PlayerAttributes` | Scatter field setters |
+| `IsInvincible` | `COW.GamePlay.PlayerAttributes` | Invincibility gate |
+| `SetIsInvincibleByImmortalitySkill` | `COW.GamePlay.PlayerAttributes` | Sets invincibility flag |
+| `EnableOutline` | `COW.GamePlay.AvatarOutline` | Outline renderer enable |
+| `ShowPlayerOutline` | `COW.MatchGame` | Match-level outline enable |
+| `TryInitPlayerOutlineRes` | `COW.MatchGame` | Outline resource init |
+| `EnableThroughTeamOutline` | `COW.MatchGame` | Through-wall outline toggle |
+| `CanFire` | `COW.MatchGame` | Global fire permission gate |
+| `EnableShowPlayerOutline` | `COW.GameSettingData` | Permission flag |
+| `EnableShowTeamOutline` | `COW.GameSettingData` | Team outline permission |
+| `BindPlayer` | `COW.HUD.UIHudNameEnemyController` | Binds enemy HUD to player |
+| `OnVisibilityChanged` | `COW.HUD.UIHudNameEnemyController` | HUD visibility hook target |
+
+### Confirmed ABSENT in this build (OB47)
+
+| Symbol | Notes |
+|---|---|
+| `CheckDamageHitHead` | Not in metadata — hooks were dead in v2.13 |
+| `RecoilFormula` | Not in metadata — hooks were dead in v2.13 |
+| `GetRecoilScale` / `CalcRecoil` | Not present |
+| `get_IsPendingRevive` | Not confirmed — use `SetIsPendingRevive` instead |
+
+---
+
+## 8. FIX STATUS SUMMARY
+
+| Feature | Status | Issue |
+|---|---|---|
+| AntiRecoil | ⚠️ Partial | RecoilFormula missing; relies on GetScatterRate hook fallback |
+| NoSpread | ✅ Fixed v2.14 | GetScatterRate + ScatterMax/Num hooks |
+| RapidFire | ⚠️ Unknown | RateOfFire method not confirmed in binary |
+| WidePOV | ✅ Works | Camera.set_fieldOfView — UnityEngine confirmed |
+| ESP / Wallhack | ✅ Fixed v2.15 | OutlineJudge + AvatarOutline hooks |
+| SpeedHack | ⚠️ Unknown | SetSpecialRunSpeedScale — name not confirmed in metadata |
+| HighJump | ⚠️ Unknown | GiveDeltaSpeedScaleByKeyAndValue — name not confirmed |
+| VehicleSpeed | ⚠️ Unknown | GetCurrentMaxSpeed — name not confirmed |
+| AntiDamage | ✅ Works | TakeDamage no-op (works, any sig) |
+| GodMode | ⚠️ Weak | Same as AntiDamage; IsInvincible hook would be stronger |
+| MaxHealth | ❌ Broken | Stub only; set_CurHP/set_MaxHP hooks needed |
+| InfiniteAmmo | ❌ Broken | get_IsAmmoFree class resolution wrong |
+| NoReload | ✅ Likely works | IsReloading confirmed on Player |
+| WallShoot | ❌ Broken | VerticleBulletController has no CanFire; use Player.CanFireByCurrentState |
+| AutoRevive | ❌ Broken | get_IsPendingRevive not confirmed; use SetIsPendingRevive |
+| NoClip | ✅ Correct | OnControllerColliderHit interface method confirmed |
+| Teleport | ⚠️ Weak | Transform.set_position works but APICCTTeleport is safer |
+| SilentAim | ✅ Fixed v2.14 | GetAttackableCenterWS → head + IsPlayerHead hook |
+| AutoHeadshot | ✅ Fixed v2.14 | IsPlayerHead + IsInNoHeadShotState hooks |
+| FullAimbot | ✅ Works | UpdateAiming + GetAttackableCenterWS hooks |
+| AntiAim | ❌ Broken | Flag set but never read in any hook |
+| AutoRevive | ❌ Broken | Getter-hook approach wrong; call SetIsPendingRevive instead |
 
 ---
