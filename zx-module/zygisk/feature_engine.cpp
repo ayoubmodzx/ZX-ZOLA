@@ -706,32 +706,27 @@ static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
     reinterpret_cast<Fn>(s_orig_hud_show)(self, forced, method);
 }
 
-// ESP: SetOutlineVisible — binary-verified: pc=2 (uint8 visible, int mode).
-// game_val=16 is the native through-wall state (used for teammates). Force 16 on enemies too.
-static void hook_set_outline_vis(void *self, uint8_t visible, int mode, void *method) {
-    // 16 = through-wall outline (confirmed from logcat: game uses 16 for team outlines).
-    // Force 16 when game tries to hide (0) or uses a weaker value (<16).
+// ESP: SetOutlineVisible — force visible=16 (through-wall) when ESP is active.
+// Signature kept as (void*, uint8_t, void*, void*) to handle both pc=1 and pc=2 builds:
+//   pc=1: arg2 = MethodInfo*, method = unused reg (garbage ok — function ignores it)
+//   pc=2: arg2 = int mode,    method = MethodInfo*
+// Passing args through unchanged (except visible) preserves the correct MethodInfo*
+// in whichever register position the function actually reads it from — no null deref.
+static void hook_set_outline_vis(void *self, uint8_t visible, void *arg2, void *method) {
     uint8_t forced = (s_esp && visible < 16) ? 16 : visible;
-    LOGI("[ESP-DBG] SetOutlineVisible: self=%p game_val=%d mode=%d forced=%d esp=%d", self, (int)visible, mode, (int)forced, (int)s_esp);
-    using Fn = void (*)(void *, uint8_t, int, void *);
-    reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, mode, method);
+    using Fn = void (*)(void *, uint8_t, void *, void *);
+    reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, arg2, method);
 }
 
 // ESP: InitOutline() — binary-verified: pc=1 (one explicit param before MethodInfo*).
 // Inject SetOutlineVisible(self, 1, 0) right after each player's outline init.
 static void hook_init_outline(void *self, void *param0, void *method) {
-    LOGI("[ESP-DBG] InitOutline fired: self=%p param0=%p esp=%d outline_fn=%p", self, param0, (int)s_esp, s_orig_set_outline_vis);
+    // Run original InitOutline — the game will call SetOutlineVisible as part of init,
+    // which our hook_set_outline_vis will intercept and force to visible=16.
+    // Do NOT proactively call SetOutlineVisible here with nullptr method — that crashes
+    // if the function reads the MethodInfo* argument (null deref / wrong signature).
     using Fn = void (*)(void *, void *, void *);
     reinterpret_cast<Fn>(s_orig_init_outline)(self, param0, method);
-    LOGI("[ESP-DBG] InitOutline orig done — now calling SetOutlineVisible(16,0+1)");
-    if (s_esp && s_orig_set_outline_vis) {
-        using ShowFn = void (*)(void *, uint8_t, int, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 0, nullptr);  // enemy mode
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 1, nullptr);  // team mode
-        LOGI("[ESP-DBG] SetOutlineVisible(16,0+1) injected for self=%p", self);
-    } else {
-        LOGI("[ESP-DBG] InitOutline: skipped inject (esp=%d fn=%p)", (int)s_esp, s_orig_set_outline_vis);
-    }
 }
 
 // InfiniteAmmo: get_IsAmmoFree (bool) → 1 = ammo is free/unlimited
@@ -785,21 +780,20 @@ static void hook_player_update(void *self, void *method) {
         ++s_global_outline_tick;
         uint32_t slot = ((uintptr_t)self >> 12) & 0x1F;
         if ((s_global_outline_tick % 30) == (slot % 30)) {
-            // value=16 is the through-wall outline state (confirmed from game's own team calls)
-            if (s_orig_set_outline_vis) {
-                using ShowFn = void (*)(void *, uint8_t, int, void *);
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 0, nullptr);  // enemy
-                reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 1, nullptr);  // team
-            }
-            // SetRenderQ(5000) renders enemy above walls (Overlay queue)
+            // SetRenderQ(5000) renders this player above walls (Unity Overlay queue).
+            // Direct call with nullptr method is safe — SetRenderQ is a simple renderer
+            // property setter that does not use MethodInfo*.
+            // SetOutlineVisible is NOT called here: proactive calls with nullptr method crash
+            // when the function reads MethodInfo* (null deref). hook_set_outline_vis intercepts
+            // the game's own SetOutlineVisible calls and forces visible=16 safely.
             if (s_orig_set_render_q) {
                 using SetRQFn = void (*)(void *, int, void *);
                 reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
             }
-            static uint32_t s_sov_fire_cnt = 0;
-            if ((++s_sov_fire_cnt) <= 10)
-                LOGI("[ESP-DBG] proactive SOV(16,0+1)+RQ(5000) fire#%u self=%p slot=%u tick=%u",
-                    s_sov_fire_cnt, self, slot, s_global_outline_tick);
+            static uint32_t s_rq_tick_cnt = 0;
+            if ((++s_rq_tick_cnt) <= 5)
+                LOGI("[ESP-DBG] proactive RQ(5000) fire#%u self=%p slot=%u tick=%u",
+                    s_rq_tick_cnt, self, slot, s_global_outline_tick);
         }
     }
     // ── Player classification + GameSettingData permission gate ──────────────

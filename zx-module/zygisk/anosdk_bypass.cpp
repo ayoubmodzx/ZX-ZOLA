@@ -682,7 +682,7 @@ void AnoBypass::installEarly() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("AnoBypass v2.22: signal handlers installed (mprotect GOT write, no /proc/self/mem)");
+    LOGI("AnoBypass v2.23: signal handlers installed (mprotect GOT write, no /proc/self/mem)");
 }
 
 void AnoBypass::startWatcher() {
