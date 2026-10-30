@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.21 — GOT patching, zero libc inline hooks
+// AnoSDK bypass v2.22 — GOT patching, zero libc inline hooks
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -419,8 +419,14 @@ static int patchLibGot(uintptr_t base, const PatchEntry *entries, size_t count) 
             const char *name = strtab + symtab[sidx].st_name;
             for (size_t j = 0; j < count; j++) {
                 if (strcmp(name, entries[j].sym_name) == 0) {
-                    uintptr_t slot = base + rel[i].r_offset;
-                    if (patchGotSlot(slot, reinterpret_cast<uintptr_t>(entries[j].new_fn))) {
+                    uintptr_t slot    = base + rel[i].r_offset;
+                    uintptr_t new_val = reinterpret_cast<uintptr_t>(entries[j].new_fn);
+                    uintptr_t cur_val;
+                    __builtin_memcpy(&cur_val, reinterpret_cast<const void *>(slot), sizeof(cur_val));
+                    if (cur_val == new_val) {
+                        // Slot already points at our hook — count it, don't re-write or re-log
+                        patched++;
+                    } else if (patchGotSlot(slot, new_val)) {
                         LOGI("GOT[%s] slot=0x%lx → %p", name, slot, entries[j].new_fn);
                         patched++;
                     } else {
@@ -589,8 +595,9 @@ static void *gotWatcherThread(void *) {
 
     bool anogs_done = false, anort_done = false;
     bool anogs_diag = false, anort_diag = false;
-    int  anogs_zero = 0,     anort_zero = 0;
-    int  anogs_prev = -1,    anort_prev = -1;
+    int  anogs_zero   = 0,     anort_zero   = 0;
+    int  anogs_prev   = -1,    anort_prev   = -1;
+    int  anogs_stable = 0,     anort_stable = 0;
 
     for (int attempt = 0; attempt < kMaxAttempts && (!anogs_done || !anort_done); attempt++) {
         usleep(attempt < 50 ? 10000u : 100000u);
@@ -599,10 +606,10 @@ static void *gotWatcherThread(void *) {
             uintptr_t base = findLibBase("libanogs.so");
             if (base) {
                 int n = patchLibGot(base, kAnogsEntries, kAnogsExp);
-                // Only log when n changes — prevents repeat spam
                 if (n != anogs_prev) {
                     LOGI("libanogs.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnogsExp, base);
-                    anogs_prev = n;
+                    anogs_prev   = n;
+                    anogs_stable = 0;
                 }
                 if (n == 0) {
                     anogs_zero++;
@@ -616,7 +623,13 @@ static void *gotWatcherThread(void *) {
                     }
                 } else {
                     anogs_zero = 0;
-                    if (n >= kAnogsExp) anogs_done = true;
+                    if (n >= kAnogsExp) {
+                        anogs_done = true;
+                    } else if (++anogs_stable >= 3) {
+                        // n > 0 but stuck below expected — some symbols absent from this lib's GOT
+                        LOGI("libanogs.so GOT: stable at %d/%d — marking done", n, kAnogsExp);
+                        anogs_done = true;
+                    }
                 }
             }
         }
@@ -627,7 +640,8 @@ static void *gotWatcherThread(void *) {
                 int n = patchLibGot(base, kAnortEntries, kAnortExp);
                 if (n != anort_prev) {
                     LOGI("libanort.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnortExp, base);
-                    anort_prev = n;
+                    anort_prev   = n;
+                    anort_stable = 0;
                 }
                 if (n == 0) {
                     anort_zero++;
@@ -641,7 +655,12 @@ static void *gotWatcherThread(void *) {
                     }
                 } else {
                     anort_zero = 0;
-                    if (n >= kAnortExp) anort_done = true;
+                    if (n >= kAnortExp) {
+                        anort_done = true;
+                    } else if (++anort_stable >= 3) {
+                        LOGI("libanort.so GOT: stable at %d/%d — marking done", n, kAnortExp);
+                        anort_done = true;
+                    }
                 }
             }
         }
@@ -663,7 +682,7 @@ void AnoBypass::installEarly() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("AnoBypass v2.21: signal handlers installed (mprotect GOT write, no /proc/self/mem)");
+    LOGI("AnoBypass v2.22: signal handlers installed (mprotect GOT write, no /proc/self/mem)");
 }
 
 void AnoBypass::startWatcher() {
