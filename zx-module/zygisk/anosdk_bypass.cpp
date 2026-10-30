@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.18 — GOT patching, zero libc inline hooks
+// AnoSDK bypass v2.20 — GOT patching, zero libc inline hooks
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -417,6 +417,8 @@ static int patchLibGot(uintptr_t base, const PatchEntry *entries, size_t count) 
                     if (patchGotSlot(slot, reinterpret_cast<uintptr_t>(entries[j].new_fn))) {
                         LOGI("GOT[%s] slot=0x%lx → %p", name, slot, entries[j].new_fn);
                         patched++;
+                    } else {
+                        LOGE("GOT[%s] PATCH FAILED slot=0x%lx errno=%d", name, slot, errno);
                     }
                     break;
                 }
@@ -426,6 +428,103 @@ static int patchLibGot(uintptr_t base, const PatchEntry *entries, size_t count) 
     scanRela(plt_rela, plt_sz);
     scanRela(dyn_rela, dyn_sz);
     return patched;
+}
+
+// ── One-shot GOT diagnostic ──────────────────────────────────────────────────
+// Called once per library when the first GOT patch attempt returns 0.
+// Dumps ELF structure + actual symbol names so we can discover mismatches.
+static void diagLibGot(const char *lib_name, uintptr_t base) {
+    LOGI("[DIAG] === %s base=0x%lx ===", lib_name, base);
+
+    auto *ehdr = reinterpret_cast<Elf64_Ehdr *>(base);
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0) {
+        LOGE("[DIAG] %s: BAD ELF magic — findLibBase returned wrong address", lib_name);
+        return;
+    }
+    LOGI("[DIAG] %s: ELF OK e_type=%u e_phnum=%u", lib_name, ehdr->e_type, ehdr->e_phnum);
+
+    Elf64_Dyn *dyn = nullptr;
+    auto *phdr = reinterpret_cast<Elf64_Phdr *>(base + ehdr->e_phoff);
+    for (int i = 0; i < ehdr->e_phnum; i++) {
+        if (phdr[i].p_type == PT_DYNAMIC) {
+            dyn = reinterpret_cast<Elf64_Dyn *>(base + phdr[i].p_vaddr);
+            break;
+        }
+    }
+    if (!dyn) { LOGE("[DIAG] %s: NO PT_DYNAMIC", lib_name); return; }
+
+    Elf64_Rela *plt_rela = nullptr; size_t plt_sz = 0;
+    Elf64_Rela *dyn_rela = nullptr; size_t dyn_sz = 0;
+    Elf64_Sym  *symtab   = nullptr;
+    const char *strtab   = nullptr;
+
+    for (Elf64_Dyn *d = dyn; d->d_tag != DT_NULL; d++) {
+        switch (d->d_tag) {
+        case DT_JMPREL:   plt_rela = reinterpret_cast<Elf64_Rela *>(base + d->d_un.d_ptr); break;
+        case DT_PLTRELSZ: plt_sz   = d->d_un.d_val; break;
+        case DT_RELA:     dyn_rela = reinterpret_cast<Elf64_Rela *>(base + d->d_un.d_ptr); break;
+        case DT_RELASZ:   dyn_sz   = d->d_un.d_val; break;
+        case DT_SYMTAB:   symtab   = reinterpret_cast<Elf64_Sym  *>(base + d->d_un.d_ptr); break;
+        case DT_STRTAB:   strtab   = reinterpret_cast<const char *>(base + d->d_un.d_ptr); break;
+        default: break;
+        }
+    }
+    LOGI("[DIAG] %s: JMPREL=%p plt_sz=%zu RELA=%p rela_sz=%zu SYMTAB=%p STRTAB=%p",
+         lib_name, plt_rela, plt_sz, dyn_rela, dyn_sz, symtab, strtab);
+
+    if (!symtab || !strtab) {
+        LOGE("[DIAG] %s: MISSING SYMTAB or STRTAB — cannot scan GOT symbols", lib_name);
+        return;
+    }
+
+    // Test whether pwrite64 to /proc/self/mem works at all
+    if (plt_rela && plt_sz >= sizeof(Elf64_Rela)) {
+        uintptr_t test_slot = base + plt_rela[0].r_offset;
+        uintptr_t cur_val;
+        __builtin_memcpy(&cur_val, reinterpret_cast<void *>(test_slot), sizeof(cur_val));
+        int mem_fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem", O_RDWR, 0);
+        if (mem_fd < 0) {
+            LOGE("[DIAG] %s: OPEN /proc/self/mem FAILED errno=%d — pwrite path dead", lib_name, errno);
+        } else {
+            ssize_t r = (ssize_t)syscall(SYS_pwrite64, mem_fd, &cur_val, sizeof(cur_val), (off_t)test_slot);
+            int saved = errno;
+            syscall(SYS_close, mem_fd);
+            LOGI("[DIAG] %s: pwrite64 test slot=0x%lx result=%zd errno=%d (%s)",
+                 lib_name, test_slot, r, (r < 0 ? saved : 0), (r == 8 ? "OK" : "FAILED"));
+        }
+    }
+
+    // Dump first 40 PLT (JUMP_SLOT) symbol names
+    if (plt_rela && plt_sz > 0) {
+        size_t nrela = plt_sz / sizeof(Elf64_Rela);
+        LOGI("[DIAG] %s: JMPREL count=%zu — first symbols:", lib_name, nrela);
+        for (size_t i = 0; i < nrela && i < 40; i++) {
+            uint32_t sidx = ELF64_R_SYM(plt_rela[i].r_info);
+            uint32_t type = ELF64_R_TYPE(plt_rela[i].r_info);
+            const char *name = strtab + symtab[sidx].st_name;
+            LOGI("[DIAG]   PLT[%02zu] type=%u  %s", i, type, name);
+        }
+    } else {
+        LOGI("[DIAG] %s: NO JMPREL section (plt_rela=null or sz=0)", lib_name);
+    }
+
+    // Dump first 40 GLOB_DAT symbol names
+    if (dyn_rela && dyn_sz > 0) {
+        size_t nrela = dyn_sz / sizeof(Elf64_Rela);
+        int shown = 0;
+        LOGI("[DIAG] %s: RELA count=%zu — GLOB_DAT symbols:", lib_name, nrela);
+        for (size_t i = 0; i < nrela && shown < 40; i++) {
+            uint32_t type = ELF64_R_TYPE(dyn_rela[i].r_info);
+            if (type != R_AARCH64_GLOB_DAT) continue;
+            uint32_t sidx = ELF64_R_SYM(dyn_rela[i].r_info);
+            const char *name = strtab + symtab[sidx].st_name;
+            LOGI("[DIAG]   DYN[%02zu] GLOB_DAT  %s", i, name);
+            shown++;
+        }
+    } else {
+        LOGI("[DIAG] %s: NO RELA section", lib_name);
+    }
+    LOGI("[DIAG] === %s END ===", lib_name);
 }
 
 // ── Patch tables (symbol name → hook function) ───────────────────────────────
@@ -474,11 +573,20 @@ static const PatchEntry kAnortEntries[] = {
 // ── Watcher thread ────────────────────────────────────────────────────────────
 
 static void *gotWatcherThread(void *) {
-    // First 50 attempts: 10ms intervals (0–500ms) — catches early AnoSDK load.
-    // Remaining up to 600 total: 100ms intervals (50–60s window).
-    constexpr int kMaxAttempts = 650;
-    bool anogs_done = false;
-    bool anort_done = false;
+    // Phase 1 (attempts 0–49):  10ms sleep → library usually loads within ~200ms
+    // Phase 2 (attempts 50–199): 100ms sleep → covers slow JIT/dex load paths
+    // Give-up: if library IS found but 0 slots patch for 50 consecutive attempts
+    //          → run one-shot diagnostic then stop retrying that library.
+    constexpr int kMaxAttempts  = 200;
+    constexpr int kZeroGiveUp   = 50;
+
+    static const int kAnogsExp = (int)(sizeof(kAnogsEntries)/sizeof(kAnogsEntries[0]));
+    static const int kAnortExp = (int)(sizeof(kAnortEntries)/sizeof(kAnortEntries[0]));
+
+    bool anogs_done = false, anort_done = false;
+    bool anogs_diag = false, anort_diag = false;
+    int  anogs_zero = 0,     anort_zero = 0;
+    int  anogs_prev = -1,    anort_prev = -1;
 
     for (int attempt = 0; attempt < kMaxAttempts && (!anogs_done || !anort_done); attempt++) {
         usleep(attempt < 50 ? 10000u : 100000u);
@@ -486,25 +594,58 @@ static void *gotWatcherThread(void *) {
         if (!anogs_done) {
             uintptr_t base = findLibBase("libanogs.so");
             if (base) {
-                static const int kAnogsExpected = (int)(sizeof(kAnogsEntries)/sizeof(kAnogsEntries[0]));
-                int n = patchLibGot(base, kAnogsEntries, kAnogsExpected);
-                LOGI("libanogs.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnogsExpected, base);
-                anogs_done = (n >= kAnogsExpected);
+                int n = patchLibGot(base, kAnogsEntries, kAnogsExp);
+                // Only log when n changes — prevents repeat spam
+                if (n != anogs_prev) {
+                    LOGI("libanogs.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnogsExp, base);
+                    anogs_prev = n;
+                }
+                if (n == 0) {
+                    anogs_zero++;
+                    if (!anogs_diag) {
+                        anogs_diag = true;
+                        diagLibGot("libanogs.so", base);
+                    }
+                    if (anogs_zero >= kZeroGiveUp) {
+                        LOGE("libanogs.so: GIVING UP after %d zero-patch attempts — AnoSDK may statically link libc", kZeroGiveUp);
+                        anogs_done = true;
+                    }
+                } else {
+                    anogs_zero = 0;
+                    if (n >= kAnogsExp) anogs_done = true;
+                }
             }
         }
+
         if (!anort_done) {
             uintptr_t base = findLibBase("libanort.so");
             if (base) {
-                static const int kAnortExpected = (int)(sizeof(kAnortEntries)/sizeof(kAnortEntries[0]));
-                int n = patchLibGot(base, kAnortEntries, kAnortExpected);
-                LOGI("libanort.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnortExpected, base);
-                anort_done = (n >= kAnortExpected);
+                int n = patchLibGot(base, kAnortEntries, kAnortExp);
+                if (n != anort_prev) {
+                    LOGI("libanort.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnortExp, base);
+                    anort_prev = n;
+                }
+                if (n == 0) {
+                    anort_zero++;
+                    if (!anort_diag) {
+                        anort_diag = true;
+                        diagLibGot("libanort.so", base);
+                    }
+                    if (anort_zero >= kZeroGiveUp) {
+                        LOGE("libanort.so: GIVING UP after %d zero-patch attempts — AnoSDK may statically link libc", kZeroGiveUp);
+                        anort_done = true;
+                    }
+                } else {
+                    anort_zero = 0;
+                    if (n >= kAnortExp) anort_done = true;
+                }
             }
         }
     }
 
-    if (!anogs_done) LOGE("libanogs.so never loaded — GOT not patched!");
-    if (!anort_done) LOGE("libanort.so never loaded — GOT not patched!");
+    LOGI("AnoBypass: watcher done — anogs=%s anort=%s",
+         (anogs_prev == kAnogsExp ? "OK" : (anogs_prev > 0 ? "partial" : "FAILED")),
+         (anort_prev == kAnortExp ? "OK" : (anort_prev > 0 ? "partial" : "FAILED")));
     return nullptr;
 }
 
@@ -518,7 +659,7 @@ void AnoBypass::installEarly() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("AnoBypass v2.18: signal handlers installed (no libc Dobby, GOT-only)");
+    LOGI("AnoBypass v2.20: signal handlers installed (no libc Dobby, GOT-only)");
 }
 
 void AnoBypass::startWatcher() {
