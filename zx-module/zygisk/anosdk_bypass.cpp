@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.20 — GOT patching, zero libc inline hooks
+// AnoSDK bypass v2.21 — GOT patching, zero libc inline hooks
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -31,6 +31,7 @@
 #include <link.h>
 #include <pthread.h>
 #include <signal.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -328,14 +329,19 @@ struct PatchEntry {
     void       *new_fn;
 };
 
-// Write one 8-byte GOT slot via /proc/self/mem, bypassing RELRO.
+// Write one 8-byte GOT slot by temporarily making the RELRO page writable.
+// mprotect on the process's own mapped pages is not blocked by SELinux unlike
+// pwrite64 to /proc/self/mem which is denied in the untrusted_app SELinux domain.
+// We never set PROT_EXEC — W^X stays intact, only PROT_WRITE is added then removed.
 static bool patchGotSlot(uintptr_t slot_addr, uintptr_t new_val) {
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem", O_RDWR, 0);
-    if (fd < 0) return false;
-    ssize_t n = (ssize_t)syscall(SYS_pwrite64, fd,
-                                  &new_val, sizeof(new_val), (off_t)slot_addr);
-    syscall(SYS_close, fd);
-    return n == (ssize_t)sizeof(uintptr_t);
+    constexpr size_t kPage = 4096;
+    uintptr_t page = slot_addr & ~(kPage - 1u);
+    if (mprotect(reinterpret_cast<void *>(page), kPage, PROT_READ | PROT_WRITE) != 0)
+        return false;
+    *reinterpret_cast<volatile uintptr_t *>(slot_addr) = new_val;
+    __sync_synchronize();
+    mprotect(reinterpret_cast<void *>(page), kPage, PROT_READ);
+    return true;
 }
 
 // Return the load base of a named library by scanning /proc/self/maps.
@@ -477,20 +483,18 @@ static void diagLibGot(const char *lib_name, uintptr_t base) {
         return;
     }
 
-    // Test whether pwrite64 to /proc/self/mem works at all
+    // Test whether mprotect+write works on the first GOT slot
     if (plt_rela && plt_sz >= sizeof(Elf64_Rela)) {
         uintptr_t test_slot = base + plt_rela[0].r_offset;
         uintptr_t cur_val;
         __builtin_memcpy(&cur_val, reinterpret_cast<void *>(test_slot), sizeof(cur_val));
-        int mem_fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/mem", O_RDWR, 0);
-        if (mem_fd < 0) {
-            LOGE("[DIAG] %s: OPEN /proc/self/mem FAILED errno=%d — pwrite path dead", lib_name, errno);
+        int r = mprotect(reinterpret_cast<void *>(test_slot & ~4095u), 4096, PROT_READ | PROT_WRITE);
+        if (r == 0) {
+            *reinterpret_cast<volatile uintptr_t *>(test_slot) = cur_val; // no-op write
+            mprotect(reinterpret_cast<void *>(test_slot & ~4095u), 4096, PROT_READ);
+            LOGI("[DIAG] %s: mprotect test slot=0x%lx OK — write path should work", lib_name, test_slot);
         } else {
-            ssize_t r = (ssize_t)syscall(SYS_pwrite64, mem_fd, &cur_val, sizeof(cur_val), (off_t)test_slot);
-            int saved = errno;
-            syscall(SYS_close, mem_fd);
-            LOGI("[DIAG] %s: pwrite64 test slot=0x%lx result=%zd errno=%d (%s)",
-                 lib_name, test_slot, r, (r < 0 ? saved : 0), (r == 8 ? "OK" : "FAILED"));
+            LOGE("[DIAG] %s: mprotect test FAILED errno=%d — cannot write GOT", lib_name, errno);
         }
     }
 
@@ -659,23 +663,24 @@ void AnoBypass::installEarly() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("AnoBypass v2.20: signal handlers installed (no libc Dobby, GOT-only)");
+    LOGI("AnoBypass v2.21: signal handlers installed (mprotect GOT write, no /proc/self/mem)");
 }
 
 void AnoBypass::startWatcher() {
-    static bool s_started = false;
-    if (s_started) return;
-    s_started = true;
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    int r = pthread_create(&tid, &attr, gotWatcherThread, nullptr);
-    pthread_attr_destroy(&attr);
-    if (r != 0)
-        LOGE("AnoBypass: failed to create GOT watcher thread (errno=%d)", r);
-    else
-        LOGI("AnoBypass: GOT watcher thread launched");
+    // pthread_once guarantees exactly one watcher thread even if startWatcher()
+    // is called concurrently from multiple async worker threads.
+    static pthread_once_t s_once = PTHREAD_ONCE_INIT;
+    static auto launch = []() {
+        pthread_t tid;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int r = pthread_create(&tid, &attr, gotWatcherThread, nullptr);
+        pthread_attr_destroy(&attr);
+        if (r != 0) LOGE("AnoBypass: watcher thread create failed errno=%d", r);
+        else         LOGI("AnoBypass: GOT watcher thread launched");
+    };
+    pthread_once(&s_once, []{ launch(); });
 }
 
 bool AnoBypass::install() {
