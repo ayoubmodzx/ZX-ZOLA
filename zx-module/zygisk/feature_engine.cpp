@@ -1798,11 +1798,9 @@ void FeatureEngine::applyAntiDamage(bool enable) {
 static void hook_outline_judge(void *self, void *method) {
     using Fn = void (*)(void *, void *);
     reinterpret_cast<Fn>(s_orig_outline_judge)(self, method);
-    // After judge ran, if ESP on and this is not our local player → force enemy outline visible
-    if (s_esp && s_local_player && self != s_local_player && s_orig_set_outline_vis) {
-        using ShowFn = void (*)(void *, uint8_t, int, void *);
-        reinterpret_cast<ShowFn>(s_orig_set_outline_vis)(self, 16, 0, nullptr);
-    }
+    // Do NOT call s_orig_set_outline_vis here with nullptr MethodInfo* — that crashes.
+    // hook_set_outline_vis intercepts every game SetOutlineVisible call and forces visible=16.
+    // SetRenderQ in hook_player_update (every 30 frames) also keeps through-wall rendering.
 }
 
 // AvatarOutline.EnableOutline — outline renderer on the avatar component (not on Player itself).
