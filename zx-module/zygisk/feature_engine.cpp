@@ -778,23 +778,9 @@ static void hook_player_update(void *self, void *method) {
     // which is wrong for SetOutlineVisible. nullptr is safe; game ignores it.
     if (s_esp) {
         ++s_global_outline_tick;
-        uint32_t slot = ((uintptr_t)self >> 12) & 0x1F;
-        if ((s_global_outline_tick % 30) == (slot % 30)) {
-            // SetRenderQ(5000) renders this player above walls (Unity Overlay queue).
-            // Direct call with nullptr method is safe — SetRenderQ is a simple renderer
-            // property setter that does not use MethodInfo*.
-            // SetOutlineVisible is NOT called here: proactive calls with nullptr method crash
-            // when the function reads MethodInfo* (null deref). hook_set_outline_vis intercepts
-            // the game's own SetOutlineVisible calls and forces visible=16 safely.
-            if (s_orig_set_render_q) {
-                using SetRQFn = void (*)(void *, int, void *);
-                reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
-            }
-            static uint32_t s_rq_tick_cnt = 0;
-            if ((++s_rq_tick_cnt) <= 5)
-                LOGI("[ESP-DBG] proactive RQ(5000) fire#%u self=%p slot=%u tick=%u",
-                    s_rq_tick_cnt, self, slot, s_global_outline_tick);
-        }
+        // SetRenderQ removed: calling RQ(5000) on enemy objects every frame is a
+        // detectable wallhack signature (AnoSDK monitors render-queue changes).
+        // Outline visibility is handled by hook_set_outline_vis + hook_outline_judge.
     }
     // ── Player classification + GameSettingData permission gate ──────────────
     if (s_is_local_player_fn) {
@@ -1075,21 +1061,9 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         return {orig.x + 9000.f, orig.y + 9000.f, orig.z + 9000.f};
     }
 
-    // ESP: set enemy render queue to Transparent layer (renders above walls).
-    // Per-enemy InitOutline + SetOutlineVisible(1) is injected every ~90 calls via the
-    // hooked InitOutline address — this goes through hook_init_outline which runs
-    // original + SetOutlineVisible(1), covering enemies present before ESP was toggled.
-    // ESP: set render queue above Overlay (5000) so enemy renders through walls.
-    // Only SetRenderQ here — InitOutline fires naturally from game; MatchGame calls
-    // were crashing because both called with nullptr MethodInfo* on first enemy tick.
-    if (s_esp && s_orig_set_render_q) {
-        static uint32_t s_rq_cnt = 0;
-        bool rq_log = ((++s_rq_cnt) % 120) == 1;
-        if (rq_log) LOGI("[ESP-DBG] SetRenderQ(5000) call#%u self=%p fn=%p", s_rq_cnt, self, s_orig_set_render_q);
-        using SetRQFn = void (*)(void *, int, void *);
-        reinterpret_cast<SetRQFn>(s_orig_set_render_q)(self, 5000, nullptr);
-        if (rq_log) LOGI("[ESP-DBG] SetRenderQ returned OK call#%u", s_rq_cnt);
-    }
+    // SetRenderQ(5000) removed: per-frame render queue changes are a detectable
+    // wallhack signature monitored by AnoSDK. Outline visibility is maintained
+    // entirely by hook_set_outline_vis + hook_outline_judge.
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
         static uint32_t s_aim_cnt = 0;
         ++s_aim_cnt;
@@ -1164,7 +1138,7 @@ static uint32_t s_aim_core_norot  = 0;  // times SetAimRotation ptr missing
 static uint32_t s_aim_core_ok     = 0;  // times SetAimRotation fired
 
 static inline void run_aimbot_core(void *self) {
-    if (!s_full_aimbot) return;  // AutoHeadshot uses separate non-aim-lock path
+    if (!s_full_aimbot && !s_auto_headshot) return;
     // Require local player to be known; bail for any non-local instance
     if (!s_local_player || self != s_local_player) {
         static uint32_t s_wrong_self = 0;
@@ -1377,6 +1351,22 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             s_orig_set_aim_rot = m_mth.setAimRotation->methodPointer;
         if (!s_is_local_player_fn && m_mth.isLocalPlayer)
             s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
+        if (!s_orig_has_heuristic && m_mth.hasHeuristicTarget)
+            s_orig_has_heuristic = m_mth.hasHeuristicTarget->methodPointer;
+        if (!s_orig_get_heuristic && m_mth.getHeuristicTarget)
+            s_orig_get_heuristic = m_mth.getHeuristicTarget->methodPointer;
+        // Player.Update: populate s_local_player + enemy list for run_aimbot_core
+        if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer && !s_orig_update) {
+            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+                reinterpret_cast<void *>(hook_player_update), &s_orig_update, "PlayerUpdate-AHS");
+            LOGI("[HS] Player.Update hooked for local+enemy tracking: trampoline=%p", s_orig_update);
+        }
+        // UpdateAiming: per-frame aim-snap to head via run_aimbot_core
+        if (m_mth.updateAiming && m_mth.updateAiming->methodPointer && !s_orig_update_aiming) {
+            HookEngine::get().hookAddr(m_mth.updateAiming->methodPointer,
+                reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "AHS-UpdateAiming");
+            LOGI("[HS] UpdateAiming hooked for aim-snap: trampoline=%p", s_orig_update_aiming);
+        }
     }
 
     // Hook GetAttackableCenterWS → head position
@@ -1450,6 +1440,19 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         }
     } else {
         LOGE("[HS-GATE] TakeDamage(4) NOT resolved — damage pipeline invisible to us");
+    }
+
+    if (!enable && !s_full_aimbot) {
+        if (s_orig_update_aiming && m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
+            HookEngine::get().unhook(m_mth.updateAiming->methodPointer);
+            s_orig_update_aiming = nullptr;
+            LOGI("[HS] UpdateAiming unhooked (auto-headshot off)");
+        }
+        if (s_orig_update && !s_esp && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
+            HookEngine::get().unhook(m_mth.playerUpdate->methodPointer);
+            s_orig_update = nullptr;
+            LOGI("[HS] Player.Update unhooked (auto-headshot off)");
+        }
     }
 
     LOGI("AutoHeadshot: %s  center=%p bone=%p headTF=%p hithead=%p aimRot=%p updAim=%p updADS=%p local_fn=%p",
