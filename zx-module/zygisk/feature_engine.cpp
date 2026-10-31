@@ -1296,6 +1296,12 @@ static void hook_update_aiming(void *self, void *method) {
     if ((++s_ua_cnt) <= 3)
         LOGI("[AIM-DIAG] UpdateAiming fired#%u self=%p local=%p fa=%d ah=%d",
              s_ua_cnt, self, s_local_player, (int)s_full_aimbot, (int)s_auto_headshot);
+    // UpdateAiming only fires for the local player — use self directly.
+    // Works even when ESP (hook_player_update) is not active.
+    if (s_full_aimbot && s_local_player != self) {
+        LOGI("[AIM-DIAG] LocalPlayer from UpdateAiming: self=%p (was %p)", self, s_local_player);
+        s_local_player = self;
+    }
     if (s_orig_update_aiming) {
         using Fn = void (*)(void *, void *);
         reinterpret_cast<Fn>(s_orig_update_aiming)(self, method);
@@ -1558,6 +1564,20 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         }
     } else {
         LOGE("[AIM] FullAimbot: UpdateAiming ptr null");
+    }
+
+    // Install Player.Update hook for enemy list population when ESP is not active.
+    // hook_player_update gates its ESP logic on s_esp flag — safe to share with ESP.
+    if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
+        if (enable && !s_orig_update) {
+            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+                reinterpret_cast<void *>(hook_player_update), &s_orig_update, "PlayerUpdate-Aimbot");
+            LOGI("[AIM] Player.Update hooked for enemy tracking: trampoline=%p", s_orig_update);
+        } else if (!enable && s_orig_update && !s_esp) {
+            HookEngine::get().unhook(m_mth.playerUpdate->methodPointer);
+            s_orig_update = nullptr;
+            LOGI("[AIM] Player.Update unhooked (aimbot off, esp off)");
+        }
     }
 
     // ODKFDOFOHLN — ADS/scope aim update (same aimbot core, different entry point)
