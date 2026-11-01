@@ -40,6 +40,11 @@ static void     *s_match_show_team_outline_fn = nullptr;  // MatchGame.ShowTeamO
 static void     *s_match_try_init_fn          = nullptr;  // MatchGame.TryInitPlayerOutlineRes
 static void     *s_match_get_inst_fn          = nullptr;  // MatchGame.GetMatch (static)
 static void     *s_gs_enable_outline_fn       = nullptr;  // GameSettingData.EnableShowPlayerOutline
+// MethodInfo* mirrors — passed as last arg to IL2CPP calls (null method ptr = SIGSEGV if fn reads it)
+static MethodInfo *s_match_show_outline_mth   = nullptr;
+static MethodInfo *s_match_show_team_mth      = nullptr;
+static MethodInfo *s_match_try_init_mth       = nullptr;
+static MethodInfo *s_match_get_inst_mth       = nullptr;
 static FieldInfo *s_enable_outline_field = nullptr;
 // Through-wall render queue trampolines (filled by applyESP hook setup)
 static void *s_orig_set_render_q    = nullptr;
@@ -428,16 +433,24 @@ void FeatureEngine::resolveClasses() {
              m_mth.enableOutlineMth ? m_mth.enableOutlineMth->methodPointer : nullptr);
 
         // Store all MatchGame outline functions — called from game-thread hooks
-        if (m_mth.showPlayerOutline && m_mth.showPlayerOutline->methodPointer)
-            s_match_show_outline_fn = m_mth.showPlayerOutline->methodPointer;
-        if (m_mth.tryInitOutlineRes && m_mth.tryInitOutlineRes->methodPointer)
-            s_match_try_init_fn = m_mth.tryInitOutlineRes->methodPointer;
-        if (m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer)
-            s_match_get_inst_fn = m_mth.resIdGetInstance->methodPointer;
+        if (m_mth.showPlayerOutline && m_mth.showPlayerOutline->methodPointer) {
+            s_match_show_outline_fn  = m_mth.showPlayerOutline->methodPointer;
+            s_match_show_outline_mth = m_mth.showPlayerOutline;
+        }
+        if (m_mth.tryInitOutlineRes && m_mth.tryInitOutlineRes->methodPointer) {
+            s_match_try_init_fn  = m_mth.tryInitOutlineRes->methodPointer;
+            s_match_try_init_mth = m_mth.tryInitOutlineRes;
+        }
+        if (m_mth.resIdGetInstance && m_mth.resIdGetInstance->methodPointer) {
+            s_match_get_inst_fn  = m_mth.resIdGetInstance->methodPointer;
+            s_match_get_inst_mth = m_mth.resIdGetInstance;
+        }
         // ShowTeamOutline — also activate for full visibility
         MethodInfo *showTeamMth = Il2CppApi::getMethod(matchGameCls, "ShowTeamOutline", -1);
-        if (showTeamMth && showTeamMth->methodPointer)
+        if (showTeamMth && showTeamMth->methodPointer) {
             s_match_show_team_outline_fn = showTeamMth->methodPointer;
+            s_match_show_team_mth        = showTeamMth;
+        }
         LOGI("[ESP] MatchGame fns: GetMatch=%p TryInit=%p ShowPlayer=%p ShowTeam=%p",
              s_match_get_inst_fn, s_match_try_init_fn,
              s_match_show_outline_fn, s_match_show_team_outline_fn);
@@ -591,6 +604,7 @@ static void *s_orig_get_head_collider   = nullptr;  // Player.get_HeadCollider()
 static void *s_orig_get_head_tf         = nullptr;  // Player.GetHeadTF() — alternative head transform
 static void *s_orig_collider_get_bounds = nullptr;  // Collider.get_bounds() → Bounds{center,extents}
 static void *s_orig_set_aim_rot         = nullptr;  // Player.SetAimRotation
+static MethodInfo *s_set_aim_rot_mth    = nullptr;  // MethodInfo* for SetAimRotation (passed as last arg)
 static void *s_orig_update_aiming       = nullptr;  // Player.UpdateAiming
 static void *s_orig_update_aiming_ads   = nullptr;  // Player.ODKFDOFOHLN (ADS/scope)
 static void *s_orig_has_heuristic       = nullptr;  // Player.HasHeuristicTarget
@@ -832,14 +846,14 @@ static void hook_player_update(void *self, void *method) {
             // MatchGame.ShowPlayerOutline(true) — must be called from game main thread
             if (s_esp && !s_matchgame_outline_done && s_match_get_inst_fn && s_match_show_outline_fn) {
                 using GetMatchFn = void *(*)(void *);
-                void *match = reinterpret_cast<GetMatchFn>(s_match_get_inst_fn)(nullptr);
+                void *match = reinterpret_cast<GetMatchFn>(s_match_get_inst_fn)(s_match_get_inst_mth);
                 if (match) {
                     using ShowFn = void (*)(void *, uint8_t, void *);
-                    reinterpret_cast<ShowFn>(s_match_show_outline_fn)(match, 1, nullptr);
+                    reinterpret_cast<ShowFn>(s_match_show_outline_fn)(match, 1, s_match_show_outline_mth);
                     if (s_match_show_team_outline_fn)
-                        reinterpret_cast<ShowFn>(s_match_show_team_outline_fn)(match, 1, nullptr);
+                        reinterpret_cast<ShowFn>(s_match_show_team_outline_fn)(match, 1, s_match_show_team_mth);
                     if (s_match_try_init_fn)
-                        reinterpret_cast<ShowFn>(s_match_try_init_fn)(match, 1, nullptr);
+                        reinterpret_cast<ShowFn>(s_match_try_init_fn)(match, 1, s_match_try_init_mth);
                     s_matchgame_outline_done = true;
                     LOGI("[ESP] MatchGame.ShowPlayerOutline(true) called match=%p", match);
                 }
@@ -1258,7 +1272,7 @@ static inline void run_aimbot_core(void *self) {
     }
     Vec3 aimRot = {pitch, yaw, 0.0f};
     using SetAimFn = void (*)(void *, Vec3, void *);
-    reinterpret_cast<SetAimFn>(s_orig_set_aim_rot)(self, aimRot, nullptr);
+    reinterpret_cast<SetAimFn>(s_orig_set_aim_rot)(self, aimRot, s_set_aim_rot_mth);
     ++s_aim_core_ok;
     if (do_log) LOGI("[AIM-DIAG] core#%u: SET yaw=%.1f pitch=%.1f target=%p head=(%.2f,%.2f,%.2f) ok=%u",
         s_aim_core_fire, yaw, pitch, bestEnemy, bestHead.x, bestHead.y, bestHead.z, s_aim_core_ok);
@@ -1347,8 +1361,10 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         if (!s_res_id_get_inst && m_mth.resIdGetInstance)
             s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
         // SetAimRotation + IsLocalPlayer needed for run_aimbot_core (force-aim path)
-        if (!s_orig_set_aim_rot && m_mth.setAimRotation)
+        if (!s_orig_set_aim_rot && m_mth.setAimRotation) {
             s_orig_set_aim_rot = m_mth.setAimRotation->methodPointer;
+            s_set_aim_rot_mth  = m_mth.setAimRotation;
+        }
         if (!s_is_local_player_fn && m_mth.isLocalPlayer)
             s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
         if (!s_orig_has_heuristic && m_mth.hasHeuristicTarget)
@@ -1534,8 +1550,10 @@ void FeatureEngine::applyFullAimbot(bool enable) {
             s_orig_getpos = m_mth.getPosition->methodPointer;
         if (!s_orig_gettrans && m_mth.getTransform)
             s_orig_gettrans = m_mth.getTransform->methodPointer;
-        if (!s_orig_set_aim_rot && m_mth.setAimRotation)
+        if (!s_orig_set_aim_rot && m_mth.setAimRotation) {
             s_orig_set_aim_rot = m_mth.setAimRotation->methodPointer;
+            s_set_aim_rot_mth  = m_mth.setAimRotation;
+        }
         if (!s_orig_has_heuristic && m_mth.hasHeuristicTarget)
             s_orig_has_heuristic = m_mth.hasHeuristicTarget->methodPointer;
         if (!s_orig_get_heuristic && m_mth.getHeuristicTarget)
