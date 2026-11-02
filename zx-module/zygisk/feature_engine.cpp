@@ -52,8 +52,13 @@ static void *s_orig_revert_render_q = nullptr;
 // GameSettingData game-thread permission gate
 static void  *s_gs_get_instance_fn  = nullptr;  // GameSettingData.get_Instance()
 static void  *s_gs_enable_team_fn   = nullptr;  // GameSettingData.EnableShowTeamOutline()
+// MethodInfo* mirrors for GSD methods — static methods take MethodInfo* as first arg
+static MethodInfo *s_gs_get_inst_mth          = nullptr;
+static MethodInfo *s_gs_enable_outline_mth    = nullptr;
+static MethodInfo *s_gs_enable_team_mth       = nullptr;
 // Local-player detection + enemy tracking for aimbot
 static void  *s_is_local_player_fn  = nullptr;  // Player.IsLocalPlayer()
+static MethodInfo *s_is_local_player_mth      = nullptr;
 
 void FeatureEngine::resolveClasses() {
     Il2CppImage *img = Il2CppApi::getImage("Assembly-CSharp");
@@ -461,15 +466,21 @@ void FeatureEngine::resolveClasses() {
         Il2CppClass *gsCls2 = Il2CppApi::getClass(img, "COW", "GameSettingData");
         if (gsCls2) {
             MethodInfo *enMth = Il2CppApi::getMethod(gsCls2, "EnableShowPlayerOutline", -1);
-            if (enMth && enMth->methodPointer)
-                s_gs_enable_outline_fn = enMth->methodPointer;
+            if (enMth && enMth->methodPointer) {
+                s_gs_enable_outline_fn  = enMth->methodPointer;
+                s_gs_enable_outline_mth = enMth;
+            }
             m_mth.gsGetInstance    = Il2CppApi::getMethod(gsCls2, "get_Instance",            0);
             m_mth.gsEnablePlayerOL = enMth;
             m_mth.gsEnableTeamOL   = Il2CppApi::getMethod(gsCls2, "EnableShowTeamOutline",   1);
-            if (m_mth.gsGetInstance && m_mth.gsGetInstance->methodPointer)
+            if (m_mth.gsGetInstance && m_mth.gsGetInstance->methodPointer) {
                 s_gs_get_instance_fn = m_mth.gsGetInstance->methodPointer;
-            if (m_mth.gsEnableTeamOL && m_mth.gsEnableTeamOL->methodPointer)
-                s_gs_enable_team_fn = m_mth.gsEnableTeamOL->methodPointer;
+                s_gs_get_inst_mth    = m_mth.gsGetInstance;
+            }
+            if (m_mth.gsEnableTeamOL && m_mth.gsEnableTeamOL->methodPointer) {
+                s_gs_enable_team_fn  = m_mth.gsEnableTeamOL->methodPointer;
+                s_gs_enable_team_mth = m_mth.gsEnableTeamOL;
+            }
             LOGI("[ESP] GSD: EnablePlayer=%p get_Instance=%p EnableTeam=%p",
                  s_gs_enable_outline_fn, s_gs_get_instance_fn, s_gs_enable_team_fn);
         }
@@ -602,13 +613,17 @@ static void *s_orig_attackable_ctr      = nullptr;  // Player.GetAttackableCente
 static void *s_orig_get_head_bone       = nullptr;  // Player.get_HeadBoneTransform
 static void *s_orig_get_head_collider   = nullptr;  // Player.get_HeadCollider() — real physics hitbox
 static void *s_orig_get_head_tf         = nullptr;  // Player.GetHeadTF() — alternative head transform
+static MethodInfo *s_get_head_tf_mth    = nullptr;
+static MethodInfo *s_get_head_bone_mth  = nullptr;
 static void *s_orig_collider_get_bounds = nullptr;  // Collider.get_bounds() → Bounds{center,extents}
 static void *s_orig_set_aim_rot         = nullptr;  // Player.SetAimRotation
 static MethodInfo *s_set_aim_rot_mth    = nullptr;  // MethodInfo* for SetAimRotation (passed as last arg)
 static void *s_orig_update_aiming       = nullptr;  // Player.UpdateAiming
 static void *s_orig_update_aiming_ads   = nullptr;  // Player.ODKFDOFOHLN (ADS/scope)
 static void *s_orig_has_heuristic       = nullptr;  // Player.HasHeuristicTarget
+static MethodInfo *s_has_heuristic_mth  = nullptr;
 static void *s_orig_get_heuristic       = nullptr;  // Player.GetHeuristicTarget
+static MethodInfo *s_get_heuristic_mth  = nullptr;
 static void *s_orig_check_dmg_hithead   = nullptr;  // Player.CheckDamageHitHead
 static void *s_orig_no_headshot_state   = nullptr;  // Player.IsInNoHeadShotState
 static void *s_orig_take_damage_4       = nullptr;  // Player.TakeDamage(4) — enemy client-side prediction
@@ -625,8 +640,11 @@ static void *s_orig_avatar_outline = nullptr;  // AvatarOutline.EnableOutline
 static bool  s_max_health                  = false;
 static void *s_orig_invincible             = nullptr;  // PlayerAttributes.SetIsInvincibleByImmortalitySkill
 static void *s_set_is_pending_revive_fn    = nullptr;  // Player.SetIsPendingRevive (cached for Update hook)
+static MethodInfo *s_set_is_pending_revive_mth = nullptr;
 static void *s_set_max_hp_fn               = nullptr;  // Player.set_MaxHP
+static MethodInfo *s_set_max_hp_mth        = nullptr;
 static void *s_set_cur_hp_fn               = nullptr;  // Player.set_CurHP
+static MethodInfo *s_set_cur_hp_mth        = nullptr;
 // ResourceIDDef — cached for in-game lazy init (singleton not available at lobby time)
 static void        *s_res_id_get_inst      = nullptr;  // ResourceIDDef.GetInstance()
 static void        *s_res_id_try_init      = nullptr;  // ResourceIDDef.TryInitPlayerOutlineRes()
@@ -799,7 +817,7 @@ static void hook_player_update(void *self, void *method) {
     // ── Player classification + GameSettingData permission gate ──────────────
     if (s_is_local_player_fn) {
         using IsLocalFn = uint8_t (*)(void *, void *);
-        uint8_t isLocal = reinterpret_cast<IsLocalFn>(s_is_local_player_fn)(self, nullptr);
+        uint8_t isLocal = reinterpret_cast<IsLocalFn>(s_is_local_player_fn)(self, s_is_local_player_mth);
         if (isLocal) {
             if (s_local_player != self) {
                 LOGI("[PLAYER-DIAG] LocalPlayer SET self=%p (was %p) — clearing enemy list", self, s_local_player);
@@ -814,11 +832,11 @@ static void hook_player_update(void *self, void *method) {
                 if ((s_max_health_tick % 30) == 0) {
                     if (s_set_max_hp_fn) {
                         using SetHPFn = void (*)(void *, float, void *);
-                        reinterpret_cast<SetHPFn>(s_set_max_hp_fn)(self, 999.f, nullptr);
+                        reinterpret_cast<SetHPFn>(s_set_max_hp_fn)(self, 999.f, s_set_max_hp_mth);
                     }
                     if (s_set_cur_hp_fn) {
                         using SetHPFn = void (*)(void *, float, void *);
-                        reinterpret_cast<SetHPFn>(s_set_cur_hp_fn)(self, 999.f, nullptr);
+                        reinterpret_cast<SetHPFn>(s_set_cur_hp_fn)(self, 999.f, s_set_cur_hp_mth);
                     }
                 }
             }
@@ -827,18 +845,18 @@ static void hook_player_update(void *self, void *method) {
                 ++s_auto_revive_tick;
                 if ((s_auto_revive_tick % 60) == 0) {
                     using SetRevFn = void (*)(void *, uint8_t, void *);
-                    reinterpret_cast<SetRevFn>(s_set_is_pending_revive_fn)(self, 1, nullptr);
+                    reinterpret_cast<SetRevFn>(s_set_is_pending_revive_fn)(self, 1, s_set_is_pending_revive_mth);
                 }
             }
             // Call GameSettingData.EnableShowPlayerOutline/Team once per session from game thread
             if (s_esp && !s_gs_outline_done && s_gs_get_instance_fn && s_gs_enable_outline_fn) {
                 using GetInstFn = void *(*)(void *);
-                void *gsd = reinterpret_cast<GetInstFn>(s_gs_get_instance_fn)(nullptr);
+                void *gsd = reinterpret_cast<GetInstFn>(s_gs_get_instance_fn)(s_gs_get_inst_mth);
                 if (gsd) {
                     using EnableFn = void (*)(void *, uint8_t, void *);
-                    reinterpret_cast<EnableFn>(s_gs_enable_outline_fn)(gsd, 1, nullptr);
+                    reinterpret_cast<EnableFn>(s_gs_enable_outline_fn)(gsd, 1, s_gs_enable_outline_mth);
                     if (s_gs_enable_team_fn)
-                        reinterpret_cast<EnableFn>(s_gs_enable_team_fn)(gsd, 1, nullptr);
+                        reinterpret_cast<EnableFn>(s_gs_enable_team_fn)(gsd, 1, s_gs_enable_team_mth);
                     s_gs_outline_done = true;
                     LOGI("[ESP] GSD.EnableShowPlayerOutline(true) called gsd=%p", gsd);
                 }
@@ -1093,7 +1111,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         if (s_orig_get_head_tf && s_orig_getpos) {
             if (do_log) LOGI("[HS-CRASH] aim#%u calling GetHeadTF fn=%p self=%p", s_aim_cnt, s_orig_get_head_tf, self);
             using GetTFFn = void *(*)(void *, void *);
-            void *headTF = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(self, nullptr);
+            void *headTF = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(self, s_get_head_tf_mth);
             if (do_log) LOGI("[HS-CRASH] aim#%u GetHeadTF returned tf=%p", s_aim_cnt, headTF);
             if (headTF) {
                 if (do_log) LOGI("[HS-CRASH] aim#%u calling getpos on headTF fn=%p tf=%p", s_aim_cnt, s_orig_getpos, headTF);
@@ -1113,7 +1131,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         if (s_orig_get_head_bone && s_orig_getpos) {
             if (do_log) LOGI("[HS-CRASH] aim#%u calling get_HeadBoneTransform fn=%p self=%p", s_aim_cnt, s_orig_get_head_bone, self);
             using GetBoneFn = void *(*)(void *, void *);
-            void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, nullptr);
+            void *headT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(self, s_get_head_bone_mth);
             if (do_log) LOGI("[HS-CRASH] aim#%u get_HeadBoneTransform returned bone=%p", s_aim_cnt, headT);
             if (headT) {
                 if (do_log) LOGI("[HS-CRASH] aim#%u calling getpos on bone fn=%p bone=%p", s_aim_cnt, s_orig_getpos, headT);
@@ -1187,9 +1205,9 @@ static inline void run_aimbot_core(void *self) {
     // Step 1: HeuristicTarget (aim-assist active path)
     if (s_orig_has_heuristic && s_orig_get_heuristic) {
         using HasFn = uint8_t (*)(void *, void *);
-        if (reinterpret_cast<HasFn>(s_orig_has_heuristic)(self, nullptr)) {
+        if (reinterpret_cast<HasFn>(s_orig_has_heuristic)(self, s_has_heuristic_mth)) {
             using GetFn = void *(*)(void *, void *);
-            void *he = reinterpret_cast<GetFn>(s_orig_get_heuristic)(self, nullptr);
+            void *he = reinterpret_cast<GetFn>(s_orig_get_heuristic)(self, s_get_heuristic_mth);
             if (he) {
                 bestEnemy = he;
                 if (do_log) LOGI("[AIM-DIAG] core#%u: heuristic target=%p", s_aim_core_fire, he);
@@ -1208,11 +1226,11 @@ static inline void run_aimbot_core(void *self) {
             void *hT = nullptr;
             if (s_orig_get_head_tf) {
                 using GetTFFn = void *(*)(void *, void *);
-                hT = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(ep, nullptr);
+                hT = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(ep, s_get_head_tf_mth);
             }
             if (!hT && s_orig_get_head_bone) {
                 using GetBoneFn = void *(*)(void *, void *);
-                hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(ep, nullptr);
+                hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(ep, s_get_head_bone_mth);
             }
             if (!hT) {
                 if (do_log) LOGE("[AIM-DIAG] core#%u: enemy[%d]=%p headTF+bone null — evicting stale ptr", s_aim_core_fire, i, ep);
@@ -1245,11 +1263,11 @@ static inline void run_aimbot_core(void *self) {
         void *hT = nullptr;
         if (s_orig_get_head_tf) {
             using GetTFFn = void *(*)(void *, void *);
-            hT = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(bestEnemy, nullptr);
+            hT = reinterpret_cast<GetTFFn>(s_orig_get_head_tf)(bestEnemy, s_get_head_tf_mth);
         }
         if (!hT && s_orig_get_head_bone) {
             using GetBoneFn = void *(*)(void *, void *);
-            hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(bestEnemy, nullptr);
+            hT = reinterpret_cast<GetBoneFn>(s_orig_get_head_bone)(bestEnemy, s_get_head_bone_mth);
         }
         if (!hT) {
             if (do_log) LOGE("[AIM-DIAG] core#%u: heuristic enemy=%p headTF+bone null", s_aim_core_fire, bestEnemy);
@@ -1340,13 +1358,17 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
 
     // Store head-bone / collider / getpos / gettrans pointers on first enable
     if (enable) {
-        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
+        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform) {
             s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+            s_get_head_bone_mth  = m_mth.getHeadBoneTransform;
+        }
         // Binary-verified: get_HeadCollider = real physics hitbox — use as primary aim point
         if (!s_orig_get_head_collider && m_mth.getHeadCollider)
             s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
-        if (!s_orig_get_head_tf && m_mth.getHeadTF)
-            s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
+        if (!s_orig_get_head_tf && m_mth.getHeadTF) {
+            s_orig_get_head_tf  = m_mth.getHeadTF->methodPointer;
+            s_get_head_tf_mth   = m_mth.getHeadTF;
+        }
         if (!s_orig_collider_get_bounds && m_mth.colliderGetBounds)
             s_orig_collider_get_bounds = m_mth.colliderGetBounds->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
@@ -1365,12 +1387,18 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             s_orig_set_aim_rot = m_mth.setAimRotation->methodPointer;
             s_set_aim_rot_mth  = m_mth.setAimRotation;
         }
-        if (!s_is_local_player_fn && m_mth.isLocalPlayer)
-            s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
-        if (!s_orig_has_heuristic && m_mth.hasHeuristicTarget)
+        if (!s_is_local_player_fn && m_mth.isLocalPlayer) {
+            s_is_local_player_fn  = m_mth.isLocalPlayer->methodPointer;
+            s_is_local_player_mth = m_mth.isLocalPlayer;
+        }
+        if (!s_orig_has_heuristic && m_mth.hasHeuristicTarget) {
             s_orig_has_heuristic = m_mth.hasHeuristicTarget->methodPointer;
-        if (!s_orig_get_heuristic && m_mth.getHeuristicTarget)
+            s_has_heuristic_mth  = m_mth.hasHeuristicTarget;
+        }
+        if (!s_orig_get_heuristic && m_mth.getHeuristicTarget) {
             s_orig_get_heuristic = m_mth.getHeuristicTarget->methodPointer;
+            s_get_heuristic_mth  = m_mth.getHeuristicTarget;
+        }
         // Player.Update: populate s_local_player + enemy list for run_aimbot_core
         if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer && !s_orig_update) {
             HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
@@ -1483,12 +1511,16 @@ void FeatureEngine::applySilentAim(bool enable) {
     s_silent_aim = enable;
 
     if (enable) {
-        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
+        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform) {
             s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+            s_get_head_bone_mth  = m_mth.getHeadBoneTransform;
+        }
         if (!s_orig_get_head_collider && m_mth.getHeadCollider)
             s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
-        if (!s_orig_get_head_tf && m_mth.getHeadTF)
-            s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
+        if (!s_orig_get_head_tf && m_mth.getHeadTF) {
+            s_orig_get_head_tf  = m_mth.getHeadTF->methodPointer;
+            s_get_head_tf_mth   = m_mth.getHeadTF;
+        }
         if (!s_orig_collider_get_bounds && m_mth.colliderGetBounds)
             s_orig_collider_get_bounds = m_mth.colliderGetBounds->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
@@ -1538,12 +1570,16 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     s_full_aimbot = enable;
 
     if (enable) {
-        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform)
+        if (!s_orig_get_head_bone && m_mth.getHeadBoneTransform) {
             s_orig_get_head_bone = m_mth.getHeadBoneTransform->methodPointer;
+            s_get_head_bone_mth  = m_mth.getHeadBoneTransform;
+        }
         if (!s_orig_get_head_collider && m_mth.getHeadCollider)
             s_orig_get_head_collider = m_mth.getHeadCollider->methodPointer;
-        if (!s_orig_get_head_tf && m_mth.getHeadTF)
-            s_orig_get_head_tf = m_mth.getHeadTF->methodPointer;
+        if (!s_orig_get_head_tf && m_mth.getHeadTF) {
+            s_orig_get_head_tf  = m_mth.getHeadTF->methodPointer;
+            s_get_head_tf_mth   = m_mth.getHeadTF;
+        }
         if (!s_orig_collider_get_bounds && m_mth.colliderGetBounds)
             s_orig_collider_get_bounds = m_mth.colliderGetBounds->methodPointer;
         if (!s_orig_getpos && m_mth.getPosition)
@@ -1554,17 +1590,23 @@ void FeatureEngine::applyFullAimbot(bool enable) {
             s_orig_set_aim_rot = m_mth.setAimRotation->methodPointer;
             s_set_aim_rot_mth  = m_mth.setAimRotation;
         }
-        if (!s_orig_has_heuristic && m_mth.hasHeuristicTarget)
+        if (!s_orig_has_heuristic && m_mth.hasHeuristicTarget) {
             s_orig_has_heuristic = m_mth.hasHeuristicTarget->methodPointer;
-        if (!s_orig_get_heuristic && m_mth.getHeuristicTarget)
+            s_has_heuristic_mth  = m_mth.hasHeuristicTarget;
+        }
+        if (!s_orig_get_heuristic && m_mth.getHeuristicTarget) {
             s_orig_get_heuristic = m_mth.getHeuristicTarget->methodPointer;
+            s_get_heuristic_mth  = m_mth.getHeuristicTarget;
+        }
         if (!s_res_id_only_headshot && m_mth.setOnlyHeadshot)
             s_res_id_only_headshot = m_mth.setOnlyHeadshot->methodPointer;
         if (!s_res_id_cls)      s_res_id_cls      = m_cls.ResIdDef;
         if (!s_res_id_get_inst && m_mth.resIdGetInstance)
             s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
-        if (!s_is_local_player_fn && m_mth.isLocalPlayer)
-            s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
+        if (!s_is_local_player_fn && m_mth.isLocalPlayer) {
+            s_is_local_player_fn  = m_mth.isLocalPlayer->methodPointer;
+            s_is_local_player_mth = m_mth.isLocalPlayer;
+        }
     }
 
     if (enable) installAimCenterHook(m_mth.calcAimTarget);
@@ -1778,15 +1820,19 @@ void FeatureEngine::applyNoGrass(bool enable) {
 void FeatureEngine::applyMaxHealth(bool enable) {
     s_max_health = enable;
     if (enable) {
-        s_set_max_hp_fn = m_mth.setMaxHP ? m_mth.setMaxHP->methodPointer : nullptr;
-        s_set_cur_hp_fn = m_mth.setCurHP ? m_mth.setCurHP->methodPointer : nullptr;
+        s_set_max_hp_fn  = m_mth.setMaxHP ? m_mth.setMaxHP->methodPointer : nullptr;
+        s_set_max_hp_mth = m_mth.setMaxHP;
+        s_set_cur_hp_fn  = m_mth.setCurHP ? m_mth.setCurHP->methodPointer : nullptr;
+        s_set_cur_hp_mth = m_mth.setCurHP;
         // Ensure Player.Update hook is installed for the per-frame HP restore
         if (!s_orig_update && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
             HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "MaxHPTick");
         }
-        if (!s_is_local_player_fn && m_mth.isLocalPlayer)
-            s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
+        if (!s_is_local_player_fn && m_mth.isLocalPlayer) {
+            s_is_local_player_fn  = m_mth.isLocalPlayer->methodPointer;
+            s_is_local_player_mth = m_mth.isLocalPlayer;
+        }
     }
     LOGI("MaxHealth: %s  set_MaxHP=%p set_CurHP=%p", enable ? "ON" : "OFF",
          s_set_max_hp_fn, s_set_cur_hp_fn);
@@ -1969,8 +2015,10 @@ void FeatureEngine::applyESP(bool enable) {
         s_gs_get_instance_fn = m_mth.gsGetInstance->methodPointer;
     if (enable && !s_gs_enable_team_fn && m_mth.gsEnableTeamOL)
         s_gs_enable_team_fn = m_mth.gsEnableTeamOL->methodPointer;
-    if (enable && !s_is_local_player_fn && m_mth.isLocalPlayer)
-        s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
+    if (enable && !s_is_local_player_fn && m_mth.isLocalPlayer) {
+        s_is_local_player_fn  = m_mth.isLocalPlayer->methodPointer;
+        s_is_local_player_mth = m_mth.isLocalPlayer;
+    }
     LOGI("[ESP-DIAG] MatchGame.ShowPlayerOutline deferred to game thread (flag reset=%d)", !enable);
 
     // Layer 7: GetAttackableCenterWS hook — fires on each enemy the aim system processes.
@@ -2097,16 +2145,20 @@ void FeatureEngine::applyAutoRevive(bool enable) {
     }
     // Active call: SetIsPendingRevive(true) from game Update tick — more reliable than getter hook alone
     if (enable) {
-        s_set_is_pending_revive_fn = m_mth.setIsPendingRevive
+        s_set_is_pending_revive_fn  = m_mth.setIsPendingRevive
             ? m_mth.setIsPendingRevive->methodPointer : nullptr;
+        s_set_is_pending_revive_mth = m_mth.setIsPendingRevive;
         if (!s_orig_update && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
             HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "ReviveTick");
         }
-        if (!s_is_local_player_fn && m_mth.isLocalPlayer)
-            s_is_local_player_fn = m_mth.isLocalPlayer->methodPointer;
+        if (!s_is_local_player_fn && m_mth.isLocalPlayer) {
+            s_is_local_player_fn  = m_mth.isLocalPlayer->methodPointer;
+            s_is_local_player_mth = m_mth.isLocalPlayer;
+        }
     } else {
-        s_set_is_pending_revive_fn = nullptr;
+        s_set_is_pending_revive_fn  = nullptr;
+        s_set_is_pending_revive_mth = nullptr;
     }
     LOGI("AutoRevive: %s  getter=%p active_call=%p", enable ? "ON" : "OFF",
          s_orig_knockdown, s_set_is_pending_revive_fn);
