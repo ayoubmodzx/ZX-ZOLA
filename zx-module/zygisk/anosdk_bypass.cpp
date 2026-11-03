@@ -567,17 +567,22 @@ static const PatchEntry kAnogsEntries[] = {
 };
 
 static const PatchEntry kAnortEntries[] = {
-    { "open",             reinterpret_cast<void *>(hook_open)        },
-    { "__open_2",         reinterpret_cast<void *>(hook_open2)       },
-    { "__openat_2",       reinterpret_cast<void *>(hook_openat2)     },
-    { "fopen",            reinterpret_cast<void *>(hook_fopen)       },
-    { "kill",             reinterpret_cast<void *>(hook_kill)        },
-    { "_exit",            reinterpret_cast<void *>(hook__exit)       },
-    { "ptrace",           reinterpret_cast<void *>(hook_ptrace)      },
-    { "fork",             reinterpret_cast<void *>(hook_fork)        },
-    { "openat",           reinterpret_cast<void *>(hook_openat2)     },
-    { "syscall",          reinterpret_cast<void *>(hook_syscall_got) },
-    { "ioctl",            reinterpret_cast<void *>(hook_ioctl)       },
+    { "open",             reinterpret_cast<void *>(hook_open)            },
+    { "__open_2",         reinterpret_cast<void *>(hook_open2)           },
+    { "__openat_2",       reinterpret_cast<void *>(hook_openat2)         },
+    { "openat",           reinterpret_cast<void *>(hook_openat2)         },
+    { "fopen",            reinterpret_cast<void *>(hook_fopen)           },
+    { "popen",            reinterpret_cast<void *>(hook_popen)           },
+    { "pclose",           reinterpret_cast<void *>(hook_pclose)          },
+    { "kill",             reinterpret_cast<void *>(hook_kill)            },
+    { "exit",             reinterpret_cast<void *>(hook_exit)            },
+    { "_exit",            reinterpret_cast<void *>(hook__exit)           },
+    { "abort",            reinterpret_cast<void *>(hook_abort)           },
+    { "ptrace",           reinterpret_cast<void *>(hook_ptrace)          },
+    { "fork",             reinterpret_cast<void *>(hook_fork)            },
+    { "syscall",          reinterpret_cast<void *>(hook_syscall_got)     },
+    { "ioctl",            reinterpret_cast<void *>(hook_ioctl)           },
+    { "dl_iterate_phdr",  reinterpret_cast<void *>(hook_dl_iterate_phdr) },
 };
 
 // ── Watcher thread ────────────────────────────────────────────────────────────
