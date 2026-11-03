@@ -536,6 +536,14 @@ void FeatureEngine::resolveClasses() {
     }
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
+
+    // One-shot runtime dump — writes /sdcard/zx_dump.cs for method/field verification
+    static bool s_dumped = false;
+    if (!s_dumped) {
+        s_dumped = true;
+        Il2CppApi::dumpRuntime("/sdcard/zx_dump.cs", "Assembly-CSharp");
+    }
+
     LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p cam_fov:%p",
          m_cls.Player, m_cls.Weapon, m_cls.Grass, m_cls.Vehicle,
          m_mth.takeDamage, m_mth.recoilFormula, m_mth.rateOfFire, m_mth.setSpeedScale,

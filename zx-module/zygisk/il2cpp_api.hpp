@@ -17,4 +17,7 @@ namespace Il2CppApi {
     MethodInfo  *scanMethods(Il2CppClass *klass, const char *filter);
     // Iterates every method on klass; calls cb(name, info) for each — returns false from cb to stop.
     void         forEachMethod(Il2CppClass *klass, void (*cb)(const char *name, MethodInfo *info, void *ctx), void *ctx);
+    // Dumps all IL2CPP classes/methods/fields from memory to output_path (dump.cs format).
+    // Call after Il2CppApi::init(). Writes Assembly-CSharp only if assembly_filter is set.
+    void         dumpRuntime(const char *output_path, const char *assembly_filter = nullptr);
 }
