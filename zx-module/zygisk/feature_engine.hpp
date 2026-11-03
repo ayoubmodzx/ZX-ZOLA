@@ -103,6 +103,7 @@ private:
         Il2CppClass *ResIdDef     = nullptr;  // COW::ResourceIDDef — singleton outline manager
         Il2CppClass *HitDetect    = nullptr;  // COW.GamePlay.HitDetectColliderHelper — real headshot gate
         Il2CppClass *AvatarOutline = nullptr; // COW.GamePlay.AvatarOutline — outline renderer component
+        Il2CppClass *AvatarTrace   = nullptr; // COW.GamePlay.AvatarTrace — through-wall visibility driver
         Il2CppClass *HudNameEnemy  = nullptr; // COW.HUD.UIHudNameEnemyController — enemy nameplate
     } m_cls;
 
@@ -190,6 +191,10 @@ private:
         MethodInfo *outlineJudge         = nullptr; // Player.OutlineVisibleJudgeInUpDate — per-frame reset gate
         MethodInfo *enableAvatarOutline  = nullptr; // AvatarOutline.EnableOutline(bool) — renderer-level bypass
         MethodInfo *enableThroughOutline = nullptr; // MatchGame.EnableThroughTeamOutline(bool)
+        // AvatarTrace — through-wall visibility + outline (COW.GamePlay.AvatarTrace, confirmed in metadata)
+        MethodInfo *setPlayerVisible      = nullptr; // AvatarTrace.SetPlayerVisible(bool) — forces through-wall render
+        MethodInfo *enableUMAOutline      = nullptr; // AvatarTrace.EnableUMAOutline(bool) — UMA outline enable
+        MethodInfo *enableRendererOutline = nullptr; // AvatarTrace.EnableRendererOutline(bool) — renderer outline
         MethodInfo *hudBindPlayer        = nullptr; // UIHudNameEnemyController.BindPlayer
         MethodInfo *hudVisChanged        = nullptr; // UIHudNameEnemyController.OnVisibilityChanged
         // v2.16 bug fixes

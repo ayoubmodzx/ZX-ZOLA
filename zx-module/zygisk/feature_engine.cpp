@@ -499,6 +499,24 @@ void FeatureEngine::resolveClasses() {
         }
     }
 
+    // AvatarTrace — through-wall visibility driver (COW.GamePlay.AvatarTrace, confirmed in metadata).
+    // SetPlayerVisible forces the avatar to render through walls (depth-ignore) when true.
+    // EnableRendererOutline and EnableUMAOutline are the two renderer-level outline paths.
+    {
+        m_cls.AvatarTrace = Il2CppApi::getClass(img, "COW.GamePlay", "AvatarTrace");
+        if (m_cls.AvatarTrace) {
+            m_mth.setPlayerVisible      = Il2CppApi::getMethod(m_cls.AvatarTrace, "SetPlayerVisible",      -1);
+            m_mth.enableUMAOutline      = Il2CppApi::getMethod(m_cls.AvatarTrace, "EnableUMAOutline",      -1);
+            m_mth.enableRendererOutline = Il2CppApi::getMethod(m_cls.AvatarTrace, "EnableRendererOutline", -1);
+            LOGI("[ESP] AvatarTrace: SetPlayerVisible=%p EnableUMAOutline=%p EnableRendererOutline=%p",
+                 m_mth.setPlayerVisible      ? m_mth.setPlayerVisible->methodPointer      : nullptr,
+                 m_mth.enableUMAOutline      ? m_mth.enableUMAOutline->methodPointer      : nullptr,
+                 m_mth.enableRendererOutline ? m_mth.enableRendererOutline->methodPointer : nullptr);
+        } else {
+            LOGE("[ESP] AvatarTrace NOT found — through-wall visibility hook unavailable");
+        }
+    }
+
     // OutlineVisibleJudgeInUpDate — per-frame judge on Player that is the ROOT CAUSE of
     // wallhack not persisting. It resets m_IsShowPlayerOutLine every frame via ticket check.
     // Hooking it lets us win the race: run original (update tickets), then force visible=16.
@@ -642,8 +660,11 @@ static void *s_orig_set_scatter_num     = nullptr;  // PlayerAttributes.set_Scat
 // InitOutline hooked target address — calling this address goes through our hook
 static void *s_initoutline_hooked_addr  = nullptr;
 // v2.15 ESP fix — outline judge + avatar outline renderer
-static void *s_orig_outline_judge  = nullptr;  // Player.OutlineVisibleJudgeInUpDate
-static void *s_orig_avatar_outline = nullptr;  // AvatarOutline.EnableOutline
+static void *s_orig_outline_judge       = nullptr;  // Player.OutlineVisibleJudgeInUpDate
+static void *s_orig_avatar_outline      = nullptr;  // AvatarOutline.EnableOutline
+// v2.31 AvatarTrace — through-wall visibility
+static void *s_orig_set_player_visible      = nullptr;  // AvatarTrace.SetPlayerVisible
+static void *s_orig_enable_renderer_outline = nullptr;  // AvatarTrace.EnableRendererOutline
 // v2.16 feature fixes
 static bool  s_max_health                  = false;
 static void *s_orig_invincible             = nullptr;  // PlayerAttributes.SetIsInvincibleByImmortalitySkill
@@ -1888,6 +1909,22 @@ static void hook_avatar_outline(void *self, uint8_t enable, void *method) {
     reinterpret_cast<Fn>(s_orig_avatar_outline)(self, forced, method);
 }
 
+// AvatarTrace.SetPlayerVisible — force true when ESP active (through-wall render)
+// ARM64: x0=this, w1=visible(bool), x2=MethodInfo*
+static void hook_set_player_visible(void *self, uint8_t visible, void *method) {
+    uint8_t forced = s_esp ? 1 : visible;
+    using Fn = void (*)(void *, uint8_t, void *);
+    reinterpret_cast<Fn>(s_orig_set_player_visible)(self, forced, method);
+}
+
+// AvatarTrace.EnableRendererOutline — force true when ESP active
+// ARM64: x0=this, w1=enable(bool), x2=MethodInfo*
+static void hook_enable_renderer_outline(void *self, uint8_t enable_flag, void *method) {
+    uint8_t forced = s_esp ? 1 : enable_flag;
+    using Fn = void (*)(void *, uint8_t, void *);
+    reinterpret_cast<Fn>(s_orig_enable_renderer_outline)(self, forced, method);
+}
+
 void FeatureEngine::applyESP(bool enable) {
     s_esp     = enable;
     s_esp_hud = enable;
@@ -2084,9 +2121,47 @@ void FeatureEngine::applyESP(bool enable) {
             s_match_show_team_outline_fn = m_mth.enableThroughOutline->methodPointer;
     }
 
-    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p judge=%p avatar_outline=%p renderQ=%p",
+    // Layer 10: AvatarTrace.SetPlayerVisible — forces through-wall rendering on every avatar.
+    // This is the deepest through-wall hook: works even when outline ticket system is blocked.
+    if (m_mth.setPlayerVisible && m_mth.setPlayerVisible->methodPointer) {
+        if (enable && !s_orig_set_player_visible) {
+            HookEngine::get().hookAddr(m_mth.setPlayerVisible->methodPointer,
+                reinterpret_cast<void *>(hook_set_player_visible),
+                &s_orig_set_player_visible, "ESP-SetPlayerVisible");
+            LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible HOOKED trampoline=%p",
+                 s_orig_set_player_visible);
+        } else if (!enable && s_orig_set_player_visible) {
+            HookEngine::get().unhook(m_mth.setPlayerVisible->methodPointer);
+            s_orig_set_player_visible = nullptr;
+            LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible unhooked");
+        }
+    } else {
+        LOGE("[ESP-DIAG] Layer10 SKIP — AvatarTrace.SetPlayerVisible not resolved");
+    }
+
+    // Layer 11: AvatarTrace.EnableRendererOutline — forces renderer-level outline on.
+    // Complements AvatarOutline.EnableOutline (Layer 9) from the AvatarTrace component side.
+    if (m_mth.enableRendererOutline && m_mth.enableRendererOutline->methodPointer) {
+        if (enable && !s_orig_enable_renderer_outline) {
+            HookEngine::get().hookAddr(m_mth.enableRendererOutline->methodPointer,
+                reinterpret_cast<void *>(hook_enable_renderer_outline),
+                &s_orig_enable_renderer_outline, "ESP-EnableRendererOutline");
+            LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline HOOKED trampoline=%p",
+                 s_orig_enable_renderer_outline);
+        } else if (!enable && s_orig_enable_renderer_outline) {
+            HookEngine::get().unhook(m_mth.enableRendererOutline->methodPointer);
+            s_orig_enable_renderer_outline = nullptr;
+            LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline unhooked");
+        }
+    } else {
+        LOGE("[ESP-DIAG] Layer11 SKIP — AvatarTrace.EnableRendererOutline not resolved");
+    }
+
+    LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p judge=%p avatar_outline=%p"
+         " setPlayerVis=%p rendererOutline=%p renderQ=%p",
          (int)enable, s_orig_hud_show, s_orig_set_outline_vis,
-         s_orig_outline_judge, s_orig_avatar_outline, s_orig_set_render_q);
+         s_orig_outline_judge, s_orig_avatar_outline,
+         s_orig_set_player_visible, s_orig_enable_renderer_outline, s_orig_set_render_q);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {
