@@ -5,7 +5,6 @@
 #include "feature_engine.hpp"
 #include "anosdk_bypass.hpp"
 #include "memory_guard.hpp"
-#include "device_spoof.hpp"
 #include <android/log.h>
 #include <cstring>
 #include <fcntl.h>
@@ -53,10 +52,6 @@ public:
         if (!m_is_ff) return;
 
         LOGI("Free Fire — postAppSpecialize, installing hooks");
-
-        // Phase 0: Device fingerprint spoof — before AnoSDK even loads.
-        // Spoofs android_id, ro.serialno, MAC — stable across restarts on same ROM.
-        DeviceSpoof::install(m_env);
 
         // Phase 1: Hook libc.so kill/exit/abort IMMEDIATELY on the main thread.
         // libc.so is always loaded at this point — hooks succeed before any game
