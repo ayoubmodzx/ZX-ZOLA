@@ -9,7 +9,7 @@ include(FetchContent)
 FetchContent_Declare(
     Dobby
     GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-    GIT_TAG        master
+    GIT_TAG        9a6e5801a44b5b6f6a0fe0d7823b85756b81cdf5
     GIT_SHALLOW    TRUE
     GIT_PROGRESS   FALSE
 )
@@ -17,6 +17,7 @@ set(DOBBY_DEBUG                            OFF CACHE BOOL "" FORCE)
 set(Plugin.SymbolResolver                  OFF CACHE BOOL "" FORCE)
 set(Plugin.Darwin.HideLibrary              OFF CACHE BOOL "" FORCE)
 set(Plugin.Android.BionicLinkerRestriction OFF CACHE BOOL "" FORCE)
+set(DOBBY_GENERATE_SHARED                  OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Dobby)
 
 # The NDK's c++_static imported target carries libc++_shared in INTERFACE_LINK_LIBRARIES.
@@ -72,10 +73,16 @@ target_compile_options(zx_zola PRIVATE
     -fvisibility-inlines-hidden
 )
 
+if(TARGET dobby_static)
+    set(_dobby_link_target dobby_static)
+else()
+    set(_dobby_link_target dobby)
+endif()
+
 target_link_libraries(zx_zola PRIVATE
     log
     dl
-    dobby_static
+    ${_dobby_link_target}
 )
 
 # Static C++ runtime absorption — runs AFTER objects so lld sees references first.
