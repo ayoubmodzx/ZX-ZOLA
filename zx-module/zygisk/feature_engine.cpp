@@ -69,6 +69,11 @@ static MethodInfo *s_gs_enable_team_mth       = nullptr;
 // Local-player detection + enemy tracking for aimbot
 static void  *s_is_local_player_fn  = nullptr;  // Player.IsLocalPlayer()
 static MethodInfo *s_is_local_player_mth      = nullptr;
+// Field-based fallback for IsLocalPlayer (bool field at known offset)
+static int   s_local_field_offset = -1;  // offset of m_bIsLocalPlayer or similar field
+// First-player heuristic: promote first player after N frames with no local
+static uint32_t s_first_player_frames = 0;
+static void    *s_first_player_ptr    = nullptr;
 
 void FeatureEngine::resolveClasses() {
     Il2CppImage *img = Il2CppApi::getImage("Assembly-CSharp");
@@ -123,13 +128,69 @@ void FeatureEngine::resolveClasses() {
              m_mth.updateAiming       ? m_mth.updateAiming->methodPointer       : nullptr,
              m_mth.hasHeuristicTarget ? m_mth.hasHeuristicTarget->methodPointer : nullptr,
              m_mth.getHeuristicTarget ? m_mth.getHeuristicTarget->methodPointer : nullptr);
-        // IsLocalPlayer: use param_count=-1 (wildcard) — internal IL2CPP counts differ by build.
-        // Falls back to IsLocalPlayerInMatch if primary name absent.
-        m_mth.isLocalPlayer = Il2CppApi::getMethod(m_cls.Player, "IsLocalPlayer", -1);
-        if (!m_mth.isLocalPlayer || !m_mth.isLocalPlayer->methodPointer)
-            m_mth.isLocalPlayer = Il2CppApi::getMethod(m_cls.Player, "IsLocalPlayerInMatch", -1);
-        LOGI("[AIM] IsLocalPlayer=%p",
-             m_mth.isLocalPlayer ? m_mth.isLocalPlayer->methodPointer : nullptr);
+        // IsLocalPlayer: search many name variants — obfuscated builds rename freely.
+        // Property getter (get_IsLocalPlayer) is tried FIRST since C# bool properties
+        // compile to a getter method in IL2CPP; the raw name "IsLocalPlayer" might
+        // match a method with unexpected parameters or a stub.
+        {
+            static const char *kLocalNames[] = {
+                "get_IsLocalPlayer", "IsLocalPlayer", "IsLocalPlayerInMatch",
+                "get_IsLocal", "IsLocal", "IsSelf", "get_IsSelf",
+                "IsMe", "get_IsMe", "IsOwner", "get_IsOwner",
+                "IsMainPlayer", "get_IsMainPlayer",
+                "get_isLocalPlayer", "get_bIsLocal",
+                nullptr
+            };
+            m_mth.isLocalPlayer = nullptr;
+            for (int i = 0; kLocalNames[i]; ++i) {
+                MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kLocalNames[i], -1);
+                if (m && m->methodPointer) {
+                    m_mth.isLocalPlayer = m;
+                    LOGI("[LOCAL] resolved '%s' pc=%d ptr=%p",
+                         kLocalNames[i], (int)m->parameters_count, m->methodPointer);
+                    break;
+                }
+            }
+            // Prefer zero-param variant: if we got one with params, try explicit 0-param
+            if (m_mth.isLocalPlayer && m_mth.isLocalPlayer->parameters_count > 0) {
+                MethodInfo *m0 = Il2CppApi::getMethod(m_cls.Player, m_mth.isLocalPlayer->name, 0);
+                if (m0 && m0->methodPointer) {
+                    LOGI("[LOCAL] prefer 0-param overload '%s' (was pc=%d)",
+                         m0->name, (int)m_mth.isLocalPlayer->parameters_count);
+                    m_mth.isLocalPlayer = m0;
+                }
+            }
+        }
+        // Diagnostic: scan ALL methods with "Local" or "Self" to find alternatives
+        LOGI("[LOCAL-DIAG] === Scanning Player for 'Local' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "Local");
+        LOGI("[LOCAL-DIAG] === Scanning Player for 'Self' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "Self");
+        LOGI("[LOCAL-DIAG] === Scanning Player for 'IsLocal' ===");
+        Il2CppApi::scanMethods(m_cls.Player, "IsLocal");
+        LOGI("[AIM] IsLocalPlayer=%p pc=%d",
+             m_mth.isLocalPlayer ? m_mth.isLocalPlayer->methodPointer : nullptr,
+             m_mth.isLocalPlayer ? (int)m_mth.isLocalPlayer->parameters_count : -1);
+        // Field-based fallback: scan Player for bool fields related to "local"
+        {
+            static const char *kLocalFields[] = {
+                "m_bIsLocalPlayer", "m_IsLocalPlayer", "m_isLocal",
+                "_isLocalPlayer", "isLocal", "bIsLocal",
+                "m_bIsLocal", "_bIsLocal", "isLocalPlayer",
+                "m_bIsLocalPlayerInMatch", "_isLocal",
+                nullptr
+            };
+            for (int i = 0; kLocalFields[i]; ++i) {
+                FieldInfo *f = Il2CppApi::getField(m_cls.Player, kLocalFields[i]);
+                if (f) {
+                    s_local_field_offset = (int)Il2CppApi::fieldOffset(f);
+                    LOGI("[LOCAL] Field fallback: '%s' at offset %d", kLocalFields[i], s_local_field_offset);
+                    break;
+                }
+            }
+            if (s_local_field_offset < 0)
+                LOGE("[LOCAL] No local-player field found — first-player heuristic will be used");
+        }
         LOGI("[AIM] get_HeadCollider=%p GetHeadTF=%p",
              m_mth.getHeadCollider ? m_mth.getHeadCollider->methodPointer : nullptr,
              m_mth.getHeadTF       ? m_mth.getHeadTF->methodPointer       : nullptr);
@@ -980,9 +1041,32 @@ static void hook_player_update(void *self, void *method) {
         // Outline visibility is handled by hook_set_outline_vis + hook_outline_judge.
     }
     // ── Player classification + GameSettingData permission gate ──────────────
-    if (s_is_local_player_fn) {
-        using IsLocalFn = uint8_t (*)(void *, void *);
-        uint8_t isLocal = reinterpret_cast<IsLocalFn>(s_is_local_player_fn)(self, s_is_local_player_mth);
+    {
+        uint8_t isLocal = 0;
+        // Layer 1: method call (preferred)
+        if (s_is_local_player_fn && s_is_local_player_mth) {
+            if (s_is_local_player_mth->parameters_count == 0) {
+                using IsLocalFn = uint8_t (*)(void *, void *);
+                isLocal = reinterpret_cast<IsLocalFn>(s_is_local_player_fn)(self, s_is_local_player_mth);
+            } else {
+                using IsLocalFn3 = uint8_t (*)(void *, uintptr_t, void *);
+                isLocal = reinterpret_cast<IsLocalFn3>(s_is_local_player_fn)(self, 0, s_is_local_player_mth);
+            }
+        }
+        // Layer 2: field-based fallback (reads bool field directly from object memory)
+        if (!isLocal && s_local_field_offset >= 0 && (uintptr_t)self > 0x10000) {
+            isLocal = *reinterpret_cast<uint8_t *>((uintptr_t)self + s_local_field_offset);
+        }
+        // Layer 3: first-player heuristic — after 500 frames with no local, promote first
+        if (!isLocal && !s_local_player) {
+            if (!s_first_player_ptr) s_first_player_ptr = self;
+            ++s_first_player_frames;
+            if (s_first_player_frames > 500 && self == s_first_player_ptr) {
+                isLocal = 1;
+                LOGI("[LOCAL] First-player heuristic activated at frame %u — promoting %p",
+                     s_first_player_frames, self);
+            }
+        }
         if (isLocal) {
             ++s_diag_local_ticks;
             if (s_local_player != self) {
@@ -1128,10 +1212,10 @@ void FeatureEngine::applyAntiRecoil(bool enable) {
     s_anti_recoil = enable;
     if (!m_mth.recoilFormula || !m_mth.recoilFormula->methodPointer) return;
     if (enable && !s_orig_recoil) {
-        HookEngine::get().hookAddr(m_mth.recoilFormula->methodPointer,
+        HookEngine::get().hookMethod(m_mth.recoilFormula,
             reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "AntiRecoil");
     } else if (!enable && !s_no_spread && s_orig_recoil) {
-        HookEngine::get().unhook(m_mth.recoilFormula->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.recoilFormula);
         s_orig_recoil = nullptr;
     }
     LOGI("AntiRecoil: %s", enable ? "ON" : "OFF");
@@ -1144,11 +1228,11 @@ void FeatureEngine::applyNoSpread(bool enable) {
     // GetScatterRate is on PlayerAttributes (type 0x86e8, verified in global-metadata.dat).
     if (m_mth.getScatterRate && m_mth.getScatterRate->methodPointer) {
         if (enable && !s_orig_scatter_rate) {
-            HookEngine::get().hookAddr(m_mth.getScatterRate->methodPointer,
+            HookEngine::get().hookMethod(m_mth.getScatterRate,
                 reinterpret_cast<void *>(hook_get_scatter_rate), &s_orig_scatter_rate, "NoSpread-ScatterRate");
             LOGI("[SCATTER] GetScatterRate hooked: trampoline=%p", s_orig_scatter_rate);
         } else if (!enable && !s_anti_recoil && s_orig_scatter_rate) {
-            HookEngine::get().unhook(m_mth.getScatterRate->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.getScatterRate);
             s_orig_scatter_rate = nullptr;
         }
     } else {
@@ -1158,19 +1242,19 @@ void FeatureEngine::applyNoSpread(bool enable) {
     // Belt-and-suspenders: zero ScatterMax + ScatterNum at weapon-equip time.
     if (m_mth.setScatterMax && m_mth.setScatterMax->methodPointer) {
         if (enable && !s_orig_set_scatter_max) {
-            HookEngine::get().hookAddr(m_mth.setScatterMax->methodPointer,
+            HookEngine::get().hookMethod(m_mth.setScatterMax,
                 reinterpret_cast<void *>(hook_set_scatter_max), &s_orig_set_scatter_max, "NoSpread-Max");
         } else if (!enable && !s_anti_recoil && s_orig_set_scatter_max) {
-            HookEngine::get().unhook(m_mth.setScatterMax->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.setScatterMax);
             s_orig_set_scatter_max = nullptr;
         }
     }
     if (m_mth.setScatterNum && m_mth.setScatterNum->methodPointer) {
         if (enable && !s_orig_set_scatter_num) {
-            HookEngine::get().hookAddr(m_mth.setScatterNum->methodPointer,
+            HookEngine::get().hookMethod(m_mth.setScatterNum,
                 reinterpret_cast<void *>(hook_set_scatter_num), &s_orig_set_scatter_num, "NoSpread-Num");
         } else if (!enable && !s_anti_recoil && s_orig_set_scatter_num) {
-            HookEngine::get().unhook(m_mth.setScatterNum->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.setScatterNum);
             s_orig_set_scatter_num = nullptr;
         }
     }
@@ -1178,10 +1262,10 @@ void FeatureEngine::applyNoSpread(bool enable) {
     // Legacy: also try recoilFormula if resolved (older builds / other formula variants)
     if (m_mth.recoilFormula && m_mth.recoilFormula->methodPointer) {
         if (enable && !s_orig_recoil) {
-            HookEngine::get().hookAddr(m_mth.recoilFormula->methodPointer,
+            HookEngine::get().hookMethod(m_mth.recoilFormula,
                 reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "NoSpread-Legacy");
         } else if (!enable && !s_anti_recoil && s_orig_recoil) {
-            HookEngine::get().unhook(m_mth.recoilFormula->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.recoilFormula);
             s_orig_recoil = nullptr;
         }
     }
@@ -1195,10 +1279,10 @@ void FeatureEngine::applyRapidFire(bool enable) {
     s_rapid_fire = enable;
     if (!m_mth.rateOfFire || !m_mth.rateOfFire->methodPointer) return;
     if (enable && !s_orig_rof) {
-        HookEngine::get().hookAddr(m_mth.rateOfFire->methodPointer,
+        HookEngine::get().hookMethod(m_mth.rateOfFire,
             reinterpret_cast<void *>(hook_rof), &s_orig_rof, "RapidFire");
     } else if (!enable && s_orig_rof) {
-        HookEngine::get().unhook(m_mth.rateOfFire->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.rateOfFire);
         s_orig_rof = nullptr;
     }
     LOGI("RapidFire: %s", enable ? "ON" : "OFF");
@@ -1506,7 +1590,7 @@ static void hook_update_aiming_ads(void *self, void *method) {
 // ── Shared helper: install / remove GetAttackableCenterWS hook ────────────────
 static void installAimCenterHook(MethodInfo *mth) {
     if (!mth || !mth->methodPointer || s_orig_attackable_ctr) return;
-    HookEngine::get().hookAddr(mth->methodPointer,
+    HookEngine::get().hookMethod(mth,
         reinterpret_cast<void *>(hook_get_attackable_center),
         &s_orig_attackable_ctr, "AimCenter");
     LOGI("[AIM] GetAttackableCenterWS hooked: trampoline=%p", s_orig_attackable_ctr);
@@ -1514,7 +1598,7 @@ static void installAimCenterHook(MethodInfo *mth) {
 static void removeAimCenterHook(MethodInfo *mth) {
     if (!mth || !mth->methodPointer || !s_orig_attackable_ctr) return;
     if (s_auto_headshot || s_silent_aim || s_full_aimbot || s_esp || s_anti_aim) return; // another feature still needs it
-    HookEngine::get().unhook(mth->methodPointer);
+    HookEngine::get().unhookMethod(mth);
     s_orig_attackable_ctr = nullptr;
     LOGI("[AIM] GetAttackableCenterWS unhooked");
 }
@@ -1573,13 +1657,13 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         }
         // Player.Update: populate s_local_player + enemy list for run_aimbot_core
         if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer && !s_orig_update) {
-            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+            HookEngine::get().hookMethod(m_mth.playerUpdate,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "PlayerUpdate-AHS");
             LOGI("[HS] Player.Update hooked for local+enemy tracking: trampoline=%p", s_orig_update);
         }
         // UpdateAiming: per-frame aim-snap to head via run_aimbot_core
         if (m_mth.updateAiming && m_mth.updateAiming->methodPointer && !s_orig_update_aiming) {
-            HookEngine::get().hookAddr(m_mth.updateAiming->methodPointer,
+            HookEngine::get().hookMethod(m_mth.updateAiming,
                 reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "AHS-UpdateAiming");
             LOGI("[HS] UpdateAiming hooked for aim-snap: trampoline=%p", s_orig_update_aiming);
         }
@@ -1615,11 +1699,11 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
     // CheckDamageHitHead does NOT exist in this FF build — this is the correct replacement.
     if (m_mth.isPlayerHead && m_mth.isPlayerHead->methodPointer) {
         if (enable && !s_orig_is_player_head) {
-            HookEngine::get().hookAddr(m_mth.isPlayerHead->methodPointer,
+            HookEngine::get().hookMethod(m_mth.isPlayerHead,
                 reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
             LOGI("[HS-GATE] IsPlayerHead hooked: trampoline=%p", s_orig_is_player_head);
         } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_is_player_head) {
-            HookEngine::get().unhook(m_mth.isPlayerHead->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.isPlayerHead);
             s_orig_is_player_head = nullptr;
         }
     } else {
@@ -1634,11 +1718,11 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
             LOGI("[HS-CRASH] BEFORE hookAddr CheckDamageHitHead ptr=%p hook_fn=%p",
                 m_mth.checkDamageHitHead->methodPointer,
                 reinterpret_cast<void *>(hook_check_dmg_hithead));
-            HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,
+            HookEngine::get().hookMethod(m_mth.checkDamageHitHead,
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
             LOGI("[HS-CRASH] AFTER hookAddr CheckDamageHitHead trampoline=%p", s_orig_check_dmg_hithead);
         } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_check_dmg_hithead) {
-            HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.checkDamageHitHead);
             s_orig_check_dmg_hithead = nullptr;
         }
     } else { LOGI("[HS-GATE] CheckDamageHitHead absent in this build (expected) — IsPlayerHead hook covers it"); }
@@ -1647,11 +1731,11 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
     // pipeline calls CheckDamageHitHead or bypasses it entirely
     if (m_mth.takeDamage4 && m_mth.takeDamage4->methodPointer) {
         if (enable && !s_orig_take_damage_4_hook) {
-            HookEngine::get().hookAddr(m_mth.takeDamage4->methodPointer,
+            HookEngine::get().hookMethod(m_mth.takeDamage4,
                 reinterpret_cast<void *>(hook_take_damage_4), &s_orig_take_damage_4_hook, "TD4Diag");
             LOGI("[HS-GATE] TakeDamage(4) diagnostic hooked: trampoline=%p", s_orig_take_damage_4_hook);
         } else if (!enable && s_orig_take_damage_4_hook) {
-            HookEngine::get().unhook(m_mth.takeDamage4->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.takeDamage4);
             s_orig_take_damage_4_hook = nullptr;
         }
     } else {
@@ -1660,12 +1744,12 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
 
     if (!enable && !s_full_aimbot) {
         if (s_orig_update_aiming && m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
-            HookEngine::get().unhook(m_mth.updateAiming->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.updateAiming);
             s_orig_update_aiming = nullptr;
             LOGI("[HS] UpdateAiming unhooked (auto-headshot off)");
         }
         if (s_orig_update && !s_esp && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
-            HookEngine::get().unhook(m_mth.playerUpdate->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.playerUpdate);
             s_orig_update = nullptr;
             LOGI("[HS] Player.Update unhooked (auto-headshot off)");
         }
@@ -1706,7 +1790,7 @@ void FeatureEngine::applySilentAim(bool enable) {
             s_res_id_get_inst = m_mth.resIdGetInstance->methodPointer;
         // IsPlayerHead — REAL headshot gate (shared with AutoHeadshot)
         if (m_mth.isPlayerHead && m_mth.isPlayerHead->methodPointer && !s_orig_is_player_head) {
-            HookEngine::get().hookAddr(m_mth.isPlayerHead->methodPointer,
+            HookEngine::get().hookMethod(m_mth.isPlayerHead,
                 reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
             LOGI("[HS-GATE] IsPlayerHead hooked (SilentAim): trampoline=%p", s_orig_is_player_head);
         }
@@ -1715,18 +1799,18 @@ void FeatureEngine::applySilentAim(bool enable) {
                 && !s_orig_check_dmg_hithead) {
             LOGI("[HS-CRASH] BEFORE hookAddr CheckDamageHitHead (SilentAim) ptr=%p",
                 m_mth.checkDamageHitHead->methodPointer);
-            HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,
+            HookEngine::get().hookMethod(m_mth.checkDamageHitHead,
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
             LOGI("[HS-CRASH] AFTER hookAddr CheckDamageHitHead (SilentAim) trampoline=%p", s_orig_check_dmg_hithead);
         }
     } else {
         if (!s_auto_headshot && !s_full_aimbot) {
             if (s_orig_is_player_head && m_mth.isPlayerHead) {
-                HookEngine::get().unhook(m_mth.isPlayerHead->methodPointer);
+                HookEngine::get().unhookMethod(m_mth.isPlayerHead);
                 s_orig_is_player_head = nullptr;
             }
             if (s_orig_check_dmg_hithead && m_mth.checkDamageHitHead) {
-                HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
+                HookEngine::get().unhookMethod(m_mth.checkDamageHitHead);
                 s_orig_check_dmg_hithead = nullptr;
             }
         }
@@ -1787,11 +1871,11 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     // Hook UpdateAiming for per-frame aim snap (hip-fire / normal mode)
     if (m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
         if (enable && !s_orig_update_aiming) {
-            HookEngine::get().hookAddr(m_mth.updateAiming->methodPointer,
+            HookEngine::get().hookMethod(m_mth.updateAiming,
                 reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "FullAimbot");
             LOGI("[AIM] UpdateAiming hooked: trampoline=%p", s_orig_update_aiming);
         } else if (!enable && s_orig_update_aiming) {
-            HookEngine::get().unhook(m_mth.updateAiming->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.updateAiming);
             s_orig_update_aiming = nullptr;
             s_enemy_count = 0;
             s_local_player = nullptr;
@@ -1805,11 +1889,11 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     // hook_player_update gates its ESP logic on s_esp flag — safe to share with ESP.
     if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
         if (enable && !s_orig_update) {
-            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+            HookEngine::get().hookMethod(m_mth.playerUpdate,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "PlayerUpdate-Aimbot");
             LOGI("[AIM] Player.Update hooked for enemy tracking: trampoline=%p", s_orig_update);
         } else if (!enable && s_orig_update && !s_esp) {
-            HookEngine::get().unhook(m_mth.playerUpdate->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.playerUpdate);
             s_orig_update = nullptr;
             LOGI("[AIM] Player.Update unhooked (aimbot off, esp off)");
         }
@@ -1818,11 +1902,11 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     // ODKFDOFOHLN — ADS/scope aim update (same aimbot core, different entry point)
     if (m_mth.updateAimingADS && m_mth.updateAimingADS->methodPointer) {
         if (enable && !s_orig_update_aiming_ads) {
-            HookEngine::get().hookAddr(m_mth.updateAimingADS->methodPointer,
+            HookEngine::get().hookMethod(m_mth.updateAimingADS,
                 reinterpret_cast<void *>(hook_update_aiming_ads), &s_orig_update_aiming_ads, "AimbotADS");
             LOGI("[AIM] ODKFDOFOHLN hooked: trampoline=%p", s_orig_update_aiming_ads);
         } else if (!enable && s_orig_update_aiming_ads) {
-            HookEngine::get().unhook(m_mth.updateAimingADS->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.updateAimingADS);
             s_orig_update_aiming_ads = nullptr;
         }
     } else {
@@ -1832,22 +1916,22 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     // IsPlayerHead — ensures stationary enemy headshots register (REAL gate in this build)
     if (m_mth.isPlayerHead && m_mth.isPlayerHead->methodPointer) {
         if (enable && !s_orig_is_player_head) {
-            HookEngine::get().hookAddr(m_mth.isPlayerHead->methodPointer,
+            HookEngine::get().hookMethod(m_mth.isPlayerHead,
                 reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
             LOGI("[AIM] IsPlayerHead hooked (FullAimbot): trampoline=%p", s_orig_is_player_head);
         } else if (!enable && !s_auto_headshot && !s_silent_aim && s_orig_is_player_head) {
-            HookEngine::get().unhook(m_mth.isPlayerHead->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.isPlayerHead);
             s_orig_is_player_head = nullptr;
         }
     }
     // CheckDamageHitHead fallback (does not exist in this build — forward compat only)
     if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer) {
         if (enable && !s_orig_check_dmg_hithead) {
-            HookEngine::get().hookAddr(m_mth.checkDamageHitHead->methodPointer,
+            HookEngine::get().hookMethod(m_mth.checkDamageHitHead,
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
             LOGI("[AIM] CheckDamageHitHead hooked (FullAimbot): trampoline=%p", s_orig_check_dmg_hithead);
         } else if (!enable && !s_auto_headshot && !s_silent_aim && s_orig_check_dmg_hithead) {
-            HookEngine::get().unhook(m_mth.checkDamageHitHead->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.checkDamageHitHead);
             s_orig_check_dmg_hithead = nullptr;
         }
     }
@@ -1874,10 +1958,10 @@ void FeatureEngine::applySpeedHack(bool enable, float multiplier) {
     s_speed_mul = multiplier;
     if (!m_mth.setSpeedScale || !m_mth.setSpeedScale->methodPointer) return;
     if (enable && !s_orig_speed) {
-        HookEngine::get().hookAddr(m_mth.setSpeedScale->methodPointer,
+        HookEngine::get().hookMethod(m_mth.setSpeedScale,
             reinterpret_cast<void *>(hook_speed), &s_orig_speed, "SpeedHack");
     } else if (!enable && s_orig_speed) {
-        HookEngine::get().unhook(m_mth.setSpeedScale->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.setSpeedScale);
         s_orig_speed = nullptr;
     }
     LOGI("SpeedHack: %s (x%.2f)", enable ? "ON" : "OFF", multiplier);
@@ -1900,7 +1984,7 @@ void FeatureEngine::applyHighJump(bool enable) {
             MethodInfo *m = Il2CppApi::getMethod(m_cls.Character, kJumpNames[i], -1);
             if (m && m->methodPointer) {
                 m_mth.jumpMethod = m;
-                HookEngine::get().hookAddr(m->methodPointer,
+                HookEngine::get().hookMethod(m,
                     reinterpret_cast<void *>(hook_jump), &s_orig_jump, "HighJump");
                 LOGI("HighJump: hooked via %s", kJumpNames[i]);
                 break;
@@ -1913,7 +1997,7 @@ void FeatureEngine::applyHighJump(bool enable) {
                     MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kJumpNames[i], -1);
                     if (m && m->methodPointer) {
                         m_mth.jumpMethod = m;
-                        HookEngine::get().hookAddr(m->methodPointer,
+                        HookEngine::get().hookMethod(m,
                             reinterpret_cast<void *>(hook_jump), &s_orig_jump, "HighJump");
                         LOGI("HighJump: hooked via Player::%s", kJumpNames[i]);
                         break;
@@ -1923,7 +2007,7 @@ void FeatureEngine::applyHighJump(bool enable) {
         }
         if (!s_orig_jump) LOGE("HighJump: no suitable method found in class tree");
     } else if (!enable && s_orig_jump && m_mth.jumpMethod) {
-        HookEngine::get().unhook(m_mth.jumpMethod->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.jumpMethod);
         s_orig_jump = nullptr;
     }
     LOGI("HighJump: %s (mul=%.2f)", enable ? "ON" : "OFF", s_jump_mul);
@@ -1945,7 +2029,7 @@ void FeatureEngine::applyVehicleSpeed(bool enable, float multiplier) {
             MethodInfo *m = Il2CppApi::getMethod(m_cls.Vehicle, kVehicleNames[i], -1);
             if (m && m->methodPointer) {
                 m_mth.vehicleAccel = m;
-                HookEngine::get().hookAddr(m->methodPointer,
+                HookEngine::get().hookMethod(m,
                     reinterpret_cast<void *>(hook_vehicle), &s_orig_vehicle, "VehicleSpeed");
                 LOGI("VehicleSpeed: hooked via %s", kVehicleNames[i]);
                 break;
@@ -1953,7 +2037,7 @@ void FeatureEngine::applyVehicleSpeed(bool enable, float multiplier) {
         }
         if (!s_orig_vehicle) LOGE("VehicleSpeed: no suitable method found in Vehicle class");
     } else if (!enable && s_orig_vehicle && m_mth.vehicleAccel) {
-        HookEngine::get().unhook(m_mth.vehicleAccel->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.vehicleAccel);
         s_orig_vehicle = nullptr;
     }
     LOGI("VehicleSpeed: %s (x%.2f)", enable ? "ON" : "OFF", multiplier);
@@ -1967,10 +2051,10 @@ void FeatureEngine::applyWidePOV(float fov) {
         return;
     }
     if (s_wide_pov && !s_orig_fov) {
-        HookEngine::get().hookAddr(m_mth.setCameraFov->methodPointer,
+        HookEngine::get().hookMethod(m_mth.setCameraFov,
             reinterpret_cast<void *>(hook_set_fov), &s_orig_fov, "WidePOV");
     } else if (!s_wide_pov && s_orig_fov) {
-        HookEngine::get().unhook(m_mth.setCameraFov->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.setCameraFov);
         s_orig_fov = nullptr;
     }
     LOGI("WidePOV: %.1f", fov);
@@ -1980,10 +2064,10 @@ void FeatureEngine::applyNoGrass(bool enable) {
     s_no_grass = enable;
     if (!m_mth.getGrassInst || !m_mth.getGrassInst->methodPointer) return;
     if (enable && !s_orig_grass) {
-        HookEngine::get().hookAddr(m_mth.getGrassInst->methodPointer,
+        HookEngine::get().hookMethod(m_mth.getGrassInst,
             reinterpret_cast<void *>(hook_grass), &s_orig_grass, "NoGrass");
     } else if (!enable && s_orig_grass) {
-        HookEngine::get().unhook(m_mth.getGrassInst->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.getGrassInst);
         s_orig_grass = nullptr;
     }
     LOGI("NoGrass: %s", enable ? "ON" : "OFF");
@@ -1998,7 +2082,7 @@ void FeatureEngine::applyMaxHealth(bool enable) {
         s_set_cur_hp_mth = m_mth.setCurHP;
         // Ensure Player.Update hook is installed for the per-frame HP restore
         if (!s_orig_update && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
-            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+            HookEngine::get().hookMethod(m_mth.playerUpdate,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "MaxHPTick");
         }
         if (!s_is_local_player_fn && m_mth.isLocalPlayer) {
@@ -2015,10 +2099,10 @@ void FeatureEngine::applyAntiDamage(bool enable) {
     // TakeDamage no-op
     if (m_mth.takeDamage && m_mth.takeDamage->methodPointer) {
         if (enable && !s_orig_dmg)
-            HookEngine::get().hookAddr(m_mth.takeDamage->methodPointer,
+            HookEngine::get().hookMethod(m_mth.takeDamage,
                 reinterpret_cast<void *>(hook_dmg), &s_orig_dmg, "AntiDamage");
         else if (!enable && s_orig_dmg) {
-            HookEngine::get().unhook(m_mth.takeDamage->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.takeDamage);
             s_orig_dmg = nullptr;
         }
     }
@@ -2102,10 +2186,10 @@ void FeatureEngine::applyESP(bool enable) {
     // Layer 2: HUD SetVisible — forces enemy health bars / name plates to render
     if (m_mth.hudSetVisible && m_mth.hudSetVisible->methodPointer) {
         if (enable && !s_orig_hud_show)
-            HookEngine::get().hookAddr(m_mth.hudSetVisible->methodPointer,
+            HookEngine::get().hookMethod(m_mth.hudSetVisible,
                 reinterpret_cast<void *>(hook_hud_set_visible), &s_orig_hud_show, "ESP-hud");
         else if (!enable && s_orig_hud_show) {
-            HookEngine::get().unhook(m_mth.hudSetVisible->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.hudSetVisible);
             s_orig_hud_show = nullptr;
         }
     } else {
@@ -2116,11 +2200,11 @@ void FeatureEngine::applyESP(bool enable) {
     // Hooks every game call so visible=0 is forced to 1; trampoline fills s_orig_set_outline_vis.
     if (m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
         if (enable && !s_orig_set_outline_vis) {
-            HookEngine::get().hookAddr(m_mth.setOutlineVisible->methodPointer,
+            HookEngine::get().hookMethod(m_mth.setOutlineVisible,
                 reinterpret_cast<void *>(hook_set_outline_vis), &s_orig_set_outline_vis, "ESP-SetOutlineVis");
             LOGI("[ESP-DIAG] Layer3 SetOutlineVisible HOOKED trampoline=%p", s_orig_set_outline_vis);
         } else if (!enable && s_orig_set_outline_vis) {
-            HookEngine::get().unhook(m_mth.setOutlineVisible->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.setOutlineVisible);
             s_orig_set_outline_vis = nullptr;
             LOGI("[ESP-DIAG] Layer3 SetOutlineVisible unhooked");
         } else {
@@ -2136,13 +2220,13 @@ void FeatureEngine::applyESP(bool enable) {
     // s_orig_init_outline = trampoline to original (filled by Dobby).
     if (m_mth.initOutline && m_mth.initOutline->methodPointer) {
         if (enable && !s_orig_init_outline) {
-            HookEngine::get().hookAddr(m_mth.initOutline->methodPointer,
+            HookEngine::get().hookMethod(m_mth.initOutline,
                 reinterpret_cast<void *>(hook_init_outline), &s_orig_init_outline, "ESP-InitOutline");
             s_initoutline_hooked_addr = m_mth.initOutline->methodPointer;
             LOGI("[ESP-DIAG] Layer4 InitOutline hooked, trampoline=%p hooked_addr=%p",
                  s_orig_init_outline, s_initoutline_hooked_addr);
         } else if (!enable && s_orig_init_outline) {
-            HookEngine::get().unhook(m_mth.initOutline->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.initOutline);
             s_orig_init_outline = nullptr;
             s_initoutline_hooked_addr = nullptr;
             LOGI("[ESP-DIAG] Layer4 InitOutline unhooked");
@@ -2158,12 +2242,12 @@ void FeatureEngine::applyESP(bool enable) {
                           (m_mth.setRenderQ       && m_mth.setRenderQ->methodPointer);
     if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer && hasOutlinePath) {
         if (enable && !s_orig_update) {
-            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+            HookEngine::get().hookMethod(m_mth.playerUpdate,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "ESP-UpdateTick");
             LOGI("[ESP-DIAG] Layer5 Player.Update hooked for proactive outline+renderQ");
         } else if (!enable && s_orig_update) {
             if (!s_tp_has_save && !s_tp_pending) {
-                HookEngine::get().unhook(m_mth.playerUpdate->methodPointer);
+                HookEngine::get().unhookMethod(m_mth.playerUpdate);
                 s_orig_update = nullptr;
                 LOGI("[ESP-DIAG] Layer5 Player.Update unhooked");
             }
@@ -2227,11 +2311,11 @@ void FeatureEngine::applyESP(bool enable) {
     // visible=16 for enemy players right after. This is the v2.15 root-cause fix.
     if (m_mth.outlineJudge && m_mth.outlineJudge->methodPointer) {
         if (enable && !s_orig_outline_judge) {
-            HookEngine::get().hookAddr(m_mth.outlineJudge->methodPointer,
+            HookEngine::get().hookMethod(m_mth.outlineJudge,
                 reinterpret_cast<void *>(hook_outline_judge), &s_orig_outline_judge, "ESP-OutlineJudge");
             LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate HOOKED trampoline=%p", s_orig_outline_judge);
         } else if (!enable && s_orig_outline_judge) {
-            HookEngine::get().unhook(m_mth.outlineJudge->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.outlineJudge);
             s_orig_outline_judge = nullptr;
             LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate unhooked");
         }
@@ -2243,11 +2327,11 @@ void FeatureEngine::applyESP(bool enable) {
     // Bypasses the ticket system at renderer level regardless of the judge's output.
     if (m_mth.enableAvatarOutline && m_mth.enableAvatarOutline->methodPointer) {
         if (enable && !s_orig_avatar_outline) {
-            HookEngine::get().hookAddr(m_mth.enableAvatarOutline->methodPointer,
+            HookEngine::get().hookMethod(m_mth.enableAvatarOutline,
                 reinterpret_cast<void *>(hook_avatar_outline), &s_orig_avatar_outline, "ESP-AvatarOutline");
             LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline HOOKED trampoline=%p", s_orig_avatar_outline);
         } else if (!enable && s_orig_avatar_outline) {
-            HookEngine::get().unhook(m_mth.enableAvatarOutline->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.enableAvatarOutline);
             s_orig_avatar_outline = nullptr;
             LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline unhooked");
         }
@@ -2269,13 +2353,13 @@ void FeatureEngine::applyESP(bool enable) {
     // This is the deepest through-wall hook: works even when outline ticket system is blocked.
     if (m_mth.setPlayerVisible && m_mth.setPlayerVisible->methodPointer) {
         if (enable && !s_orig_set_player_visible) {
-            HookEngine::get().hookAddr(m_mth.setPlayerVisible->methodPointer,
+            HookEngine::get().hookMethod(m_mth.setPlayerVisible,
                 reinterpret_cast<void *>(hook_set_player_visible),
                 &s_orig_set_player_visible, "ESP-SetPlayerVisible");
             LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible HOOKED trampoline=%p",
                  s_orig_set_player_visible);
         } else if (!enable && s_orig_set_player_visible) {
-            HookEngine::get().unhook(m_mth.setPlayerVisible->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.setPlayerVisible);
             s_orig_set_player_visible = nullptr;
             LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible unhooked");
         }
@@ -2287,13 +2371,13 @@ void FeatureEngine::applyESP(bool enable) {
     // Complements AvatarOutline.EnableOutline (Layer 9) from the AvatarTrace component side.
     if (m_mth.enableRendererOutline && m_mth.enableRendererOutline->methodPointer) {
         if (enable && !s_orig_enable_renderer_outline) {
-            HookEngine::get().hookAddr(m_mth.enableRendererOutline->methodPointer,
+            HookEngine::get().hookMethod(m_mth.enableRendererOutline,
                 reinterpret_cast<void *>(hook_enable_renderer_outline),
                 &s_orig_enable_renderer_outline, "ESP-EnableRendererOutline");
             LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline HOOKED trampoline=%p",
                  s_orig_enable_renderer_outline);
         } else if (!enable && s_orig_enable_renderer_outline) {
-            HookEngine::get().unhook(m_mth.enableRendererOutline->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.enableRendererOutline);
             s_orig_enable_renderer_outline = nullptr;
             LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline unhooked");
         }
@@ -2315,10 +2399,10 @@ void FeatureEngine::applyInfiniteAmmo(bool enable) {
         return;
     }
     if (enable && !s_orig_ammo) {
-        HookEngine::get().hookAddr(m_mth.getCurrentAmmo->methodPointer,
+        HookEngine::get().hookMethod(m_mth.getCurrentAmmo,
             reinterpret_cast<void *>(hook_get_ammo), &s_orig_ammo, "InfAmmo");
     } else if (!enable && s_orig_ammo) {
-        HookEngine::get().unhook(m_mth.getCurrentAmmo->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.getCurrentAmmo);
         s_orig_ammo = nullptr;
     }
     LOGI("InfiniteAmmo: %s", enable ? "ON" : "OFF");
@@ -2331,10 +2415,10 @@ void FeatureEngine::applyNoReload(bool enable) {
         return;
     }
     if (enable && !s_orig_reload) {
-        HookEngine::get().hookAddr(m_mth.isNeedReload->methodPointer,
+        HookEngine::get().hookMethod(m_mth.isNeedReload,
             reinterpret_cast<void *>(hook_is_reload), &s_orig_reload, "NoReload");
     } else if (!enable && s_orig_reload) {
-        HookEngine::get().unhook(m_mth.isNeedReload->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.isNeedReload);
         s_orig_reload = nullptr;
     }
     LOGI("NoReload: %s", enable ? "ON" : "OFF");
@@ -2347,10 +2431,10 @@ void FeatureEngine::applyWallShoot(bool enable) {
         return;
     }
     if (enable && !s_orig_wallhit) {
-        HookEngine::get().hookAddr(m_mth.checkWallHit->methodPointer,
+        HookEngine::get().hookMethod(m_mth.checkWallHit,
             reinterpret_cast<void *>(hook_wall_hit), &s_orig_wallhit, "WallShoot");
     } else if (!enable && s_orig_wallhit) {
-        HookEngine::get().unhook(m_mth.checkWallHit->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.checkWallHit);
         s_orig_wallhit = nullptr;
     }
     LOGI("WallShoot: %s", enable ? "ON" : "OFF");
@@ -2361,10 +2445,10 @@ void FeatureEngine::applyAutoRevive(bool enable) {
     // Getter hook: get_IsPendingRevive → always 1 (primary path)
     if (m_mth.isKnockDown && m_mth.isKnockDown->methodPointer) {
         if (enable && !s_orig_knockdown)
-            HookEngine::get().hookAddr(m_mth.isKnockDown->methodPointer,
+            HookEngine::get().hookMethod(m_mth.isKnockDown,
                 reinterpret_cast<void *>(hook_is_knockdown), &s_orig_knockdown, "AutoRevive");
         else if (!enable && s_orig_knockdown) {
-            HookEngine::get().unhook(m_mth.isKnockDown->methodPointer);
+            HookEngine::get().unhookMethod(m_mth.isKnockDown);
             s_orig_knockdown = nullptr;
         }
     } else {
@@ -2376,7 +2460,7 @@ void FeatureEngine::applyAutoRevive(bool enable) {
             ? m_mth.setIsPendingRevive->methodPointer : nullptr;
         s_set_is_pending_revive_mth = m_mth.setIsPendingRevive;
         if (!s_orig_update && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
-            HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+            HookEngine::get().hookMethod(m_mth.playerUpdate,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "ReviveTick");
         }
         if (!s_is_local_player_fn && m_mth.isLocalPlayer) {
@@ -2398,10 +2482,10 @@ void FeatureEngine::applyNoClip(bool enable) {
         return;
     }
     if (enable && !s_orig_collider) {
-        HookEngine::get().hookAddr(m_mth.colliderHit->methodPointer,
+        HookEngine::get().hookMethod(m_mth.colliderHit,
             reinterpret_cast<void *>(hook_collider_hit), &s_orig_collider, "NoClip");
     } else if (!enable && s_orig_collider) {
-        HookEngine::get().unhook(m_mth.colliderHit->methodPointer);
+        HookEngine::get().unhookMethod(m_mth.colliderHit);
         s_orig_collider = nullptr;
     }
     LOGI("NoClip: %s", enable ? "ON" : "OFF");
@@ -2421,7 +2505,7 @@ void FeatureEngine::applyTeleportSave() {
     s_tp_save_requested = true;
     // Install tick hook if not already there
     if (!s_orig_update) {
-        HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+        HookEngine::get().hookMethod(m_mth.playerUpdate,
             reinterpret_cast<void *>(hook_player_update), &s_orig_update, "TpTick");
     }
     LOGI("TeleportSave: capturing position on next Update");
@@ -2442,7 +2526,7 @@ void FeatureEngine::applyTeleport() {
     if (m_mth.getTransform) s_orig_gettrans = m_mth.getTransform->methodPointer;
     s_tp_pending = true;
     if (!s_orig_update) {
-        HookEngine::get().hookAddr(m_mth.playerUpdate->methodPointer,
+        HookEngine::get().hookMethod(m_mth.playerUpdate,
             reinterpret_cast<void *>(hook_player_update), &s_orig_update, "TpTick");
     }
     LOGI("Teleport: will move to (%.2f,%.2f,%.2f) on next Update",

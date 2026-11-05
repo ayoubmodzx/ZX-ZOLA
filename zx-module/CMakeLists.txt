@@ -9,8 +9,8 @@ include(FetchContent)
 FetchContent_Declare(
     Dobby
     GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
+    GIT_TAG        687ff82
+    GIT_SHALLOW    FALSE
     GIT_PROGRESS   FALSE
 )
 set(DOBBY_DEBUG                            OFF CACHE BOOL "" FORCE)
@@ -42,10 +42,10 @@ if(_dobby_asm_files)
     string(REPLACE "\n" ";" _dobby_asm_files "${_dobby_asm_files}")
     foreach(_f IN LISTS _dobby_asm_files)
         execute_process(COMMAND sed -i
-            "s/\\([A-Za-z_][A-Za-z0-9_]*\\)@PAGEOFF/:lo12:\\1/g"
+            "s/\\(cdecl([^)]*))\\)@PAGEOFF/:lo12:\\1/g;s/\\([A-Za-z_][A-Za-z0-9_]*\\)@PAGEOFF/:lo12:\\1/g"
             "${_f}")
         execute_process(COMMAND sed -i
-            "s/\\([A-Za-z_][A-Za-z0-9_]*\\)@PAGE/\\1/g"
+            "s/\\(cdecl([^)]*))\\)@PAGE/\\1/g;s/\\([A-Za-z_][A-Za-z0-9_]*\\)@PAGE/\\1/g"
             "${_f}")
         message(STATUS "Dobby @PAGE patch: ${_f}")
     endforeach()
