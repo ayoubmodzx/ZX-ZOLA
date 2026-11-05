@@ -254,6 +254,74 @@ static pid_t hook_fork() {
     return (pid_t)-1;
 }
 
+// Protection 10: inotify filesystem watcher — AnoSDK uses inotify to watch
+// /proc/self/maps for changes when modules load.  Block the watcher entirely.
+#include <sys/inotify.h>
+uint32_t g_ano_inotify_blocked = 0;
+static int hook_inotify_init() {
+    ++g_ano_inotify_blocked;
+    errno = EMFILE;
+    return -1;
+}
+static int hook_inotify_init1(int flags) {
+    (void)flags;
+    ++g_ano_inotify_blocked;
+    errno = EMFILE;
+    return -1;
+}
+static int hook_inotify_add_watch(int fd, const char *path, uint32_t mask) {
+    (void)fd; (void)path; (void)mask;
+    ++g_ano_inotify_blocked;
+    errno = EBADF;
+    return -1;
+}
+
+// Protection 11: mincore — AnoSDK uses this to check if injected code pages
+// are resident in memory.  Return success with all pages marked NOT present.
+uint32_t g_ano_mincore_spoofed = 0;
+static int hook_mincore(void *addr, size_t length, unsigned char *vec) {
+    (void)addr;
+    if (vec && length > 0) {
+        size_t pages = (length + 4095) / 4096;
+        __builtin_memset(vec, 0, pages);
+    }
+    ++g_ano_mincore_spoofed;
+    return 0;
+}
+
+// Protection 12: tp_syscall_imp — libanort.so exports a raw SVC #0 wrapper that
+// bypasses ALL GOT hooks.  If libanogs.so imports it via GOT, this intercepts it.
+// Same filtering logic as hook_syscall_got.
+static long hook_tp_syscall(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
+    if (nr == __NR_openat && a1 != 0) {
+        const char *path = (const char *)a1;
+        if (is_self_maps(path))   return (long)make_filtered_maps();
+        if (is_self_status(path)) return (long)make_filtered_status(path);
+    }
+    if (nr == __NR_ioctl) {
+        unsigned long req  = (unsigned long)a1;
+        unsigned long type = (req >> 8) & 0xFF;
+        unsigned long num  = req & 0xFF;
+        bool is_system = type == 0x54 || type == 0x66 || type == 0x53 || type == 0x89 || type == 0x00;
+        if (!is_system && a2 != 0 && num >= 0x10)
+            __builtin_memset((void *)a2, 0, 64);
+    }
+    return syscall(nr, a0, a1, a2, a3, a4, a5);
+}
+
+// Protection 13: unwind_xx_ioctl — libanort.so secondary ioctl interface that
+// may bypass our primary ioctl GOT hook.  Same zero-payload logic.
+static int hook_unwind_ioctl(int fd, unsigned long req, void *arg) {
+    unsigned long type = (req >> 8) & 0xFF;
+    unsigned long num  = req & 0xFF;
+    bool is_system = type == 0x54 || type == 0x66 || type == 0x53 || type == 0x89 || type == 0x00;
+    if (!is_system && arg && num >= 0x10) {
+        ++g_ano_ioctl_zeroed;
+        __builtin_memset(arg, 0, 64);
+    }
+    return ::ioctl(fd, req, arg);
+}
+
 // Protection 7: raw syscall bypass — intercept SYS_openat targeting /proc/self/maps
 // AArch64 ABI: syscall(nr, a0, a1, a2, ...) → x0=nr, x1=a0, x2=a1=path, x3=a2=flags
 static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
@@ -584,6 +652,14 @@ static const PatchEntry kAnogsEntries[] = {
     { "dl_iterate_phdr",  reinterpret_cast<void *>(hook_dl_iterate_phdr) },
     // Protection 9: ioctl detection-report interception
     { "ioctl",            reinterpret_cast<void *>(hook_ioctl)           },
+    // Protection 10: inotify filesystem watcher
+    { "inotify_init",     reinterpret_cast<void *>(hook_inotify_init)    },
+    { "inotify_init1",    reinterpret_cast<void *>(hook_inotify_init1)   },
+    { "inotify_add_watch",reinterpret_cast<void *>(hook_inotify_add_watch)},
+    // Protection 11: mincore memory page detection
+    { "mincore",          reinterpret_cast<void *>(hook_mincore)         },
+    // Protection 12: tp_syscall_imp raw syscall (if imported via GOT)
+    { "tp_syscall_imp",   reinterpret_cast<void *>(hook_tp_syscall)      },
 };
 
 static const PatchEntry kAnortEntries[] = {
@@ -603,6 +679,14 @@ static const PatchEntry kAnortEntries[] = {
     { "syscall",          reinterpret_cast<void *>(hook_syscall_got)     },
     { "ioctl",            reinterpret_cast<void *>(hook_ioctl)           },
     { "dl_iterate_phdr",  reinterpret_cast<void *>(hook_dl_iterate_phdr) },
+    // Protection 10-13: inotify, mincore, tp_syscall, secondary ioctl
+    { "inotify_init",     reinterpret_cast<void *>(hook_inotify_init)    },
+    { "inotify_init1",    reinterpret_cast<void *>(hook_inotify_init1)   },
+    { "inotify_add_watch",reinterpret_cast<void *>(hook_inotify_add_watch)},
+    { "mincore",          reinterpret_cast<void *>(hook_mincore)         },
+    { "tp_syscall_imp",   reinterpret_cast<void *>(hook_tp_syscall)      },
+    { "unwind_xx_ioctl",  reinterpret_cast<void *>(hook_unwind_ioctl)    },
+    { "unwind_xx_info_query", reinterpret_cast<void *>(hook_unwind_ioctl)},
 };
 
 // ── Watcher thread ────────────────────────────────────────────────────────────

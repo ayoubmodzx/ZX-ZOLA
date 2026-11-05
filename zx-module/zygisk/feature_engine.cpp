@@ -101,10 +101,22 @@ void FeatureEngine::resolveClasses() {
     // Headshot / Aimbot methods — all on Player
     if (m_cls.Player) {
         m_mth.getHeadBoneTransform = Il2CppApi::getMethod(m_cls.Player, "get_HeadBoneTransform", 0);
-        // Binary-verified: get_HeadCollider returns the PHYSICS Collider (= real server-side hitbox)
-        // GetHeadTF returns a Transform at the head (may differ from bone crown)
         m_mth.getHeadCollider      = Il2CppApi::getMethod(m_cls.Player, "get_HeadCollider",      0);
-        m_mth.getHeadTF            = Il2CppApi::getMethod(m_cls.Player, "GetHeadTF",             0);
+        // GetHeadTF: try multiple names from metadata
+        {
+            static const char *kHeadTFNames[] = {
+                "GetHeadTF", "get_HeadTF", "get_CurHeadPos",
+                "GetHeadPosition", "get_HeadSpot", nullptr
+            };
+            for (int i = 0; kHeadTFNames[i]; ++i) {
+                MethodInfo *m = Il2CppApi::getMethod(m_cls.Player, kHeadTFNames[i], 0);
+                if (m && m->methodPointer) {
+                    m_mth.getHeadTF = m;
+                    LOGI("[HEAD] resolved '%s' ptr=%p", kHeadTFNames[i], m->methodPointer);
+                    break;
+                }
+            }
+        }
         // SetAimRotation: try multiple names — method may be renamed per build
         {
             static const char *kAimRotNames[] = {
@@ -134,11 +146,13 @@ void FeatureEngine::resolveClasses() {
         // match a method with unexpected parameters or a stub.
         {
             static const char *kLocalNames[] = {
-                "get_IsLocalPlayer", "IsLocalPlayer", "IsLocalPlayerInMatch",
+                "get_IsLocalPlayer", "IsLocalPlayer", "isLocalPlayer",
+                "get_IsLocalPlayerEnter", "IsLocalPlayerInMatch",
                 "get_IsLocal", "IsLocal", "IsSelf", "get_IsSelf",
                 "IsMe", "get_IsMe", "IsOwner", "get_IsOwner",
                 "IsMainPlayer", "get_IsMainPlayer",
                 "get_isLocalPlayer", "get_bIsLocal",
+                "get_IsLocalAvatar", "get_IsLocalPlayerUma",
                 nullptr
             };
             m_mth.isLocalPlayer = nullptr;
@@ -174,10 +188,12 @@ void FeatureEngine::resolveClasses() {
         // Field-based fallback: scan Player for bool fields related to "local"
         {
             static const char *kLocalFields[] = {
-                "m_bIsLocalPlayer", "m_IsLocalPlayer", "m_isLocal",
+                "m_bIsLocalPlayer", "m_IsLocalPlayer", "m_IsLocalPLayer",
+                "m_OwnerIsLocalPlayer", "m_isLocal",
                 "_isLocalPlayer", "isLocal", "bIsLocal",
                 "m_bIsLocal", "_bIsLocal", "isLocalPlayer",
                 "m_bIsLocalPlayerInMatch", "_isLocal",
+                "m_IsLocalAvatar", "m_IsLocalPlayerEnter",
                 nullptr
             };
             for (int i = 0; kLocalFields[i]; ++i) {
@@ -204,6 +220,18 @@ void FeatureEngine::resolveClasses() {
              m_mth.checkDamageHitHead  ? m_mth.checkDamageHitHead->methodPointer  : nullptr,
              m_mth.isInNoHeadShotState ? m_mth.isInNoHeadShotState->methodPointer : nullptr,
              m_mth.takeDamage4         ? m_mth.takeDamage4->methodPointer         : nullptr);
+        // IsMoving — used for headshot standing-target fix
+        m_mth.isMoving = Il2CppApi::getMethod(m_cls.Player, "IsMoving", 0);
+        if (!m_mth.isMoving) m_mth.isMoving = Il2CppApi::getMethod(m_cls.Player, "get_IsMoving", 0);
+        // get_CurHeadPos — direct head position (metadata-verified, more reliable than bone)
+        m_mth.getCurHeadPos = Il2CppApi::getMethod(m_cls.Player, "get_CurHeadPos", 0);
+        if (!m_mth.getCurHeadPos) m_mth.getCurHeadPos = Il2CppApi::getMethod(m_cls.Player, "GetHeadPosition", 0);
+        LOGI("[AIM] IsMoving=%p getCurHeadPos=%p",
+             m_mth.isMoving     ? m_mth.isMoving->methodPointer     : nullptr,
+             m_mth.getCurHeadPos ? m_mth.getCurHeadPos->methodPointer : nullptr);
+        // IsHeadShotCollider — secondary headshot gate
+        if (m_cls.HudNameEnemy)
+            m_mth.isHeadShotCollider = Il2CppApi::getMethod(m_cls.HudNameEnemy, "IsHeadShotCollider", -1);
     }
 
     // SpeedHack — search multiple names across PlayerAttributes then Player
@@ -728,6 +756,10 @@ static void *s_orig_is_player_head      = nullptr;  // HitDetectColliderHelper.I
 static void *s_orig_scatter_rate        = nullptr;  // PlayerAttributes.GetScatterRate — scatter cone
 static void *s_orig_set_scatter_max     = nullptr;  // PlayerAttributes.set_ScatterMax
 static void *s_orig_set_scatter_num     = nullptr;  // PlayerAttributes.set_ScatterNum
+static void *s_orig_get_cur_head_pos    = nullptr;  // Player.get_CurHeadPos — direct head position
+static MethodInfo *s_get_cur_head_pos_mth = nullptr;
+static void *s_orig_is_moving           = nullptr;  // Player.IsMoving
+static MethodInfo *s_is_moving_mth      = nullptr;
 // InitOutline hooked target address — calling this address goes through our hook
 static void *s_initoutline_hooked_addr  = nullptr;
 // v2.15 ESP fix — outline judge + avatar outline renderer
@@ -1357,9 +1389,18 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         if (do_log) LOGI("[HS-CRASH] aim#%u ENTER self=%p headtf_fn=%p bone_fn=%p getpos_fn=%p",
             s_aim_cnt, self, s_orig_get_head_tf, s_orig_get_head_bone, s_orig_getpos);
 
-        // Priority 1 (Collider.get_bounds) REMOVED — Collider.bounds queries PhysX
-        // which is NOT thread-safe from a hook thread → guaranteed crash.
-        // Priority 2: GetHeadTF (alternate head transform)
+        // Priority 0: get_CurHeadPos — game's own head position that matches server-side
+        // collider.  Critical for standing enemies: bone transform differs from collider
+        // during idle animation, causing server to reject headshot.
+        if (s_orig_get_cur_head_pos) {
+            using GetHeadPosFn = Vec3 (*)(void *, void *);
+            Vec3 hp = reinterpret_cast<GetHeadPosFn>(s_orig_get_cur_head_pos)(self, s_get_cur_head_pos_mth);
+            if (do_log) LOGI("[HS-AIM] aim#%u CurHeadPos=(%.3f,%.3f,%.3f)", s_aim_cnt, hp.x, hp.y, hp.z);
+            if (hp.x != 0.0f || hp.y != 0.0f || hp.z != 0.0f)
+                return hp;
+        }
+
+        // Priority 1: GetHeadTF (alternate head transform)
         if (s_orig_get_head_tf && s_orig_getpos) {
             if (do_log) LOGI("[HS-CRASH] aim#%u calling GetHeadTF fn=%p self=%p", s_aim_cnt, s_orig_get_head_tf, self);
             using GetTFFn = void *(*)(void *, void *);
@@ -1469,13 +1510,24 @@ static inline void run_aimbot_core(void *self) {
     }
 
     // Step 2: enemy list scan — covers stationary enemies + fast movers
-    if (!bestEnemy && (s_orig_get_head_tf || s_orig_get_head_bone)) {
+    if (!bestEnemy && (s_orig_get_cur_head_pos || s_orig_get_head_tf || s_orig_get_head_bone)) {
         if (s_enemy_count == 0 && do_log)
-            LOGE("[AIM-DIAG] core#%u: enemy list EMPTY — no targets (headTF=%p bone=%p)",
-                 s_aim_core_fire, s_orig_get_head_tf, s_orig_get_head_bone);
+            LOGE("[AIM-DIAG] core#%u: enemy list EMPTY — no targets",
+                 s_aim_core_fire);
         for (int i = 0; i < s_enemy_count; ++i) {
             void *ep = s_enemy_list[i];
             if (!ep || ep == self) continue;
+            // Priority: get_CurHeadPos (matches server collider) > GetHeadTF > bone
+            if (s_orig_get_cur_head_pos) {
+                using GetHeadPosFn = Vec3 (*)(void *, void *);
+                Vec3 hp = reinterpret_cast<GetHeadPosFn>(s_orig_get_cur_head_pos)(ep, s_get_cur_head_pos_mth);
+                if (hp.x != 0.f || hp.y != 0.f || hp.z != 0.f) {
+                    float dx2 = hp.x - myPos.x, dy2 = hp.y - myPos.y, dz2 = hp.z - myPos.z;
+                    float d2 = dx2*dx2 + dy2*dy2 + dz2*dz2;
+                    if (d2 < bestDist2) { bestDist2 = d2; bestEnemy = ep; bestHead = hp; }
+                    continue;
+                }
+            }
             void *hT = nullptr;
             if (s_orig_get_head_tf) {
                 using GetTFFn = void *(*)(void *, void *);
@@ -1512,8 +1564,17 @@ static inline void run_aimbot_core(void *self) {
         return;
     }
 
-    // Resolve head position for HeuristicTarget path (prefer stable GetHeadTF)
+    // Resolve head position for HeuristicTarget path
     if (bestDist2 >= 1e20f) {
+        // get_CurHeadPos first — matches server-side collider position
+        if (s_orig_get_cur_head_pos) {
+            using GetHeadPosFn = Vec3 (*)(void *, void *);
+            bestHead = reinterpret_cast<GetHeadPosFn>(s_orig_get_cur_head_pos)(bestEnemy, s_get_cur_head_pos_mth);
+            if (bestHead.x != 0.f || bestHead.y != 0.f || bestHead.z != 0.f) {
+                bestDist2 = 0.f;
+            }
+        }
+        if (bestDist2 >= 1e20f) {
         void *hT = nullptr;
         if (s_orig_get_head_tf) {
             using GetTFFn = void *(*)(void *, void *);
@@ -1528,6 +1589,7 @@ static inline void run_aimbot_core(void *self) {
             return;
         }
         bestHead = reinterpret_cast<GetPosFn>(s_orig_getpos)(hT, nullptr);
+        } // end inner if (bestDist2 >= 1e20f)
     }
 
     float dx    = bestHead.x - myPos.x;
@@ -1627,6 +1689,14 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         }
         if (!s_orig_collider_get_bounds && m_mth.colliderGetBounds)
             s_orig_collider_get_bounds = m_mth.colliderGetBounds->methodPointer;
+        if (!s_orig_get_cur_head_pos && m_mth.getCurHeadPos) {
+            s_orig_get_cur_head_pos = m_mth.getCurHeadPos->methodPointer;
+            s_get_cur_head_pos_mth  = m_mth.getCurHeadPos;
+        }
+        if (!s_orig_is_moving && m_mth.isMoving) {
+            s_orig_is_moving = m_mth.isMoving->methodPointer;
+            s_is_moving_mth  = m_mth.isMoving;
+        }
         if (!s_orig_getpos && m_mth.getPosition)
             s_orig_getpos = m_mth.getPosition->methodPointer;
         if (!s_orig_gettrans && m_mth.getTransform)

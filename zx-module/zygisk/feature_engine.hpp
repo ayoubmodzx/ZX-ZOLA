@@ -180,6 +180,9 @@ private:
         MethodInfo *takeDamage4          = nullptr; // Player.TakeDamage(4 params) [210713] — client prediction
         // HitDetectColliderHelper — REAL client-side headshot gate (binary verified)
         MethodInfo *isPlayerHead         = nullptr; // HitDetectColliderHelper.IsPlayerHead(Collider) → bool
+        MethodInfo *isHeadShotCollider  = nullptr; // UIHudNameEnemyController.IsHeadShotCollider → bool
+        MethodInfo *isMoving            = nullptr; // Player.IsMoving() → bool
+        MethodInfo *getCurHeadPos       = nullptr; // Player.get_CurHeadPos() → Vec3
         // PlayerAttributes scatter system — verified from global-metadata.dat (type 0x86e8)
         MethodInfo *getScatterRate       = nullptr; // PlayerAttributes.GetScatterRate() → float (computed cone)
         MethodInfo *setScatterMax        = nullptr; // PlayerAttributes.set_ScatterMax(float)
