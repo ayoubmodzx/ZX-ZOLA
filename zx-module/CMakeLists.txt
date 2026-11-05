@@ -9,7 +9,7 @@ include(FetchContent)
 FetchContent_Declare(
     Dobby
     GIT_REPOSITORY https://github.com/jmpews/Dobby.git
-    GIT_TAG        9a6e5801a44b5b6f6a0fe0d7823b85756b81cdf5
+    GIT_TAG        master
     GIT_SHALLOW    TRUE
     GIT_PROGRESS   FALSE
 )

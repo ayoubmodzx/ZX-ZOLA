@@ -13,13 +13,8 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-// XOR-obfuscated socket name. Key=0x37. Decoded: "com.dts.ff.gfx"
-// Appears in /proc/net/unix as @com.dts.ff.gfx — blends with game-internal sockets.
-// anosdk_bypass.cpp filters this same string from /proc/net/unix reads.
-static constexpr uint8_t kSockEnc[] = {
-    0x54,0x58,0x5A,0x19,0x53,0x43,0x44,0x19,0x51,0x51,0x19,0x50,0x51,0x4F
-};
-static constexpr uint8_t kSockKey = 0x37;
+// Abstract socket name (leading \0 = abstract, no filesystem entry)
+static constexpr char kSockName[] = "zx_zola";
 
 FeatureEngine &FeatureEngine::get() {
     static FeatureEngine instance;
@@ -670,9 +665,6 @@ static void *s_orig_avatar_outline      = nullptr;  // AvatarOutline.EnableOutli
 // v2.31 AvatarTrace — through-wall visibility
 static void *s_orig_set_player_visible      = nullptr;  // AvatarTrace.SetPlayerVisible
 static void *s_orig_enable_renderer_outline = nullptr;  // AvatarTrace.EnableRendererOutline
-// v2.32 Layer 12: AvatarTrace.EnableUMAOutline + active per-frame SetOutlineVisible push
-static void *s_orig_enable_uma_outline      = nullptr;  // AvatarTrace.EnableUMAOutline
-static MethodInfo *s_set_outline_vis_mth    = nullptr;  // cached MethodInfo* for SetOutlineVisible
 // v2.16 feature fixes
 static bool  s_max_health                  = false;
 static void *s_orig_invincible             = nullptr;  // PlayerAttributes.SetIsInvincibleByImmortalitySkill
@@ -921,12 +913,6 @@ static void hook_player_update(void *self, void *method) {
             if (!found && s_enemy_count < 32) {
                 LOGI("[PLAYER-DIAG] Enemy ADDED[%d] self=%p total=%d", s_enemy_count, self, s_enemy_count + 1);
                 s_enemy_list[s_enemy_count++] = self;
-            }
-            // Active ESP push — every 15 ticks force SetOutlineVisible(16) on each enemy.
-            // Guarantees outline stays on even when AvatarTrace hooks haven't fired yet.
-            if (s_esp && s_orig_set_outline_vis && (s_global_outline_tick % 15) == 0) {
-                using SetVisFn = void (*)(void *, uint8_t, void *, void *);
-                reinterpret_cast<SetVisFn>(s_orig_set_outline_vis)(self, 16, nullptr, s_set_outline_vis_mth);
             }
         }
     }
@@ -1939,14 +1925,6 @@ static void hook_enable_renderer_outline(void *self, uint8_t enable_flag, void *
     reinterpret_cast<Fn>(s_orig_enable_renderer_outline)(self, forced, method);
 }
 
-// AvatarTrace.EnableUMAOutline — third AvatarTrace rendering path; forces UMA skeleton outlines.
-// ARM64: x0=this, w1=enable(bool), x2=MethodInfo*
-static void hook_enable_uma_outline(void *self, uint8_t enable_flag, void *method) {
-    uint8_t forced = s_esp ? 1 : enable_flag;
-    using Fn = void (*)(void *, uint8_t, void *);
-    reinterpret_cast<Fn>(s_orig_enable_uma_outline)(self, forced, method);
-}
-
 void FeatureEngine::applyESP(bool enable) {
     s_esp     = enable;
     s_esp_hud = enable;
@@ -2179,33 +2157,11 @@ void FeatureEngine::applyESP(bool enable) {
         LOGE("[ESP-DIAG] Layer11 SKIP — AvatarTrace.EnableRendererOutline not resolved");
     }
 
-    // Layer 12: AvatarTrace.EnableUMAOutline — UMA skeleton outline path; third AvatarTrace hook.
-    if (m_mth.enableUMAOutline && m_mth.enableUMAOutline->methodPointer) {
-        if (enable && !s_orig_enable_uma_outline) {
-            HookEngine::get().hookAddr(m_mth.enableUMAOutline->methodPointer,
-                reinterpret_cast<void *>(hook_enable_uma_outline),
-                &s_orig_enable_uma_outline, "ESP-EnableUMAOutline");
-            LOGI("[ESP-DIAG] Layer12 AvatarTrace.EnableUMAOutline HOOKED trampoline=%p",
-                 s_orig_enable_uma_outline);
-        } else if (!enable && s_orig_enable_uma_outline) {
-            HookEngine::get().unhook(m_mth.enableUMAOutline->methodPointer);
-            s_orig_enable_uma_outline = nullptr;
-            LOGI("[ESP-DIAG] Layer12 AvatarTrace.EnableUMAOutline unhooked");
-        }
-    } else {
-        LOGE("[ESP-DIAG] Layer12 SKIP — AvatarTrace.EnableUMAOutline not resolved");
-    }
-
-    // Cache SetOutlineVisible MethodInfo* for the active per-frame ESP push in hook_player_update.
-    if (enable && !s_set_outline_vis_mth && m_mth.setOutlineVisible)
-        s_set_outline_vis_mth = m_mth.setOutlineVisible;
-
     LOGI("[ESP-DIAG] applyESP done: enable=%d hud=%p outline=%p judge=%p avatar_outline=%p"
-         " setPlayerVis=%p rendererOutline=%p umaOutline=%p renderQ=%p",
+         " setPlayerVis=%p rendererOutline=%p renderQ=%p",
          (int)enable, s_orig_hud_show, s_orig_set_outline_vis,
          s_orig_outline_judge, s_orig_avatar_outline,
-         s_orig_set_player_visible, s_orig_enable_renderer_outline,
-         s_orig_enable_uma_outline, s_orig_set_render_q);
+         s_orig_set_player_visible, s_orig_enable_renderer_outline, s_orig_set_render_q);
 }
 
 void FeatureEngine::applyInfiniteAmmo(bool enable) {
@@ -2410,7 +2366,6 @@ void FeatureEngine::startServer() {
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_create(&tid, &attr, serverThread, this);
-    pthread_setname_np(tid, "migration/0");
     pthread_attr_destroy(&attr);
     LOGI("Socket server thread started");
 }
@@ -2419,26 +2374,21 @@ void FeatureEngine::runServer() {
     int srv = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (srv < 0) { LOGE("socket(): %s", strerror(errno)); return; }
 
-    // Decode XOR-obfuscated socket name at runtime — not visible as a plain string in the binary
-    char sockName[32] = {};
-    for (size_t i = 0; i < sizeof(kSockEnc); ++i)
-        sockName[i] = (char)(kSockEnc[i] ^ kSockKey);
-    size_t name_len = sizeof(kSockEnc);
-
     // Abstract socket — sun_path[0]='\0' + name, no filesystem entry needed
     struct sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     memset(addr.sun_path, 0, sizeof(addr.sun_path));
-    memcpy(addr.sun_path + 1, sockName, name_len);
+    size_t name_len = strlen(kSockName);
+    memcpy(addr.sun_path + 1, kSockName, name_len);
     socklen_t addr_len = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + 1 + name_len);
 
     if (bind(srv, reinterpret_cast<struct sockaddr *>(&addr), addr_len) < 0) {
-        LOGE("bind(\\0%s): %s", sockName, strerror(errno));
+        LOGE("bind(\\0%s): %s", kSockName, strerror(errno));
         ::close(srv); return;
     }
 
     listen(srv, 8);
-    LOGI("Socket server listening on \\0%s", sockName);
+    LOGI("Socket server listening on \\0%s", kSockName);
 
     while (true) {
         int cli = accept(srv, nullptr, nullptr);

@@ -72,8 +72,7 @@ static int make_filtered_maps() {
                 bool hide = strstr(line, "arm64-v8a.so") ||
                             strstr(line, "zx_zola")      ||
                             strstr(line, "zx-zola")      ||
-                            strstr(line, "com.zx.zola")  ||
-                            strstr(line, "zx_zola_v2");
+                            strstr(line, "com.zx.zola");
                 if (!hide) syscall(SYS_write, mem_fd, line, (size_t)llen);
                 llen = 0;
             }
@@ -145,51 +144,6 @@ static bool is_self_status(const char *path) {
     return strcmp(path, buf) == 0;
 }
 
-static bool is_net_unix(const char *path) {
-    if (!path) return false;
-    if (strcmp(path, "/proc/self/net/unix") == 0) return true;
-    if (strcmp(path, "/proc/net/unix")       == 0) return true;
-    char buf[64];
-    int pid = (int)getpid();
-    snprintf(buf, sizeof(buf), "/proc/%d/net/unix", pid);
-    return strcmp(path, buf) == 0;
-}
-
-// Decoded socket name (matches feature_engine.cpp XOR decode) — hidden from /proc/net/unix.
-// Abstract sockets appear as "@com.dts.ff.gfx" which blends with game-internal sockets.
-static constexpr char kNetSockFilter[] = "com.dts.ff.gfx";
-
-static int make_filtered_net_unix(const char *real_path) {
-    int real_fd = (int)syscall(SYS_openat, AT_FDCWD, real_path, O_RDONLY, 0);
-    if (real_fd < 0) return -1;
-    int mem_fd = (int)syscall(SYS_memfd_create, "netunix", 0U);
-    if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
-    char buf[4096], line[1024];
-    int llen = 0;
-    for (;;) {
-        ssize_t n = (ssize_t)syscall(SYS_read, real_fd, buf, sizeof(buf));
-        if (n <= 0) break;
-        for (ssize_t i = 0; i < n; i++) {
-            char c = buf[i];
-            if (llen < (int)sizeof(line) - 1) line[llen++] = c;
-            if (c == '\n' || llen >= (int)sizeof(line) - 1) {
-                line[llen] = '\0';
-                if (!strstr(line, kNetSockFilter))
-                    syscall(SYS_write, mem_fd, line, (size_t)llen);
-                llen = 0;
-            }
-        }
-    }
-    if (llen > 0) {
-        line[llen] = '\0';
-        if (!strstr(line, kNetSockFilter))
-            syscall(SYS_write, mem_fd, line, (size_t)llen);
-    }
-    syscall(SYS_close, real_fd);
-    syscall(SYS_lseek, mem_fd, 0, SEEK_SET);
-    return mem_fd;
-}
-
 // ── GOT hook functions ────────────────────────────────────────────────────────
 // These replace GOT entries in libanogs.so and libanort.so.
 // Every forwarding call goes through libzx_zola.so's own unpatched PLT/GOT,
@@ -197,23 +151,20 @@ static int make_filtered_net_unix(const char *real_path) {
 
 // Protection 2: maps + status file access — open() family
 static int hook_open(const char *path, int flags, mode_t mode) {
-    if (is_self_maps(path))   { int fd = make_filtered_maps();             if (fd >= 0) return fd; }
-    if (is_self_status(path)) { int fd = make_filtered_status(path);       if (fd >= 0) return fd; }
-    if (is_net_unix(path))    { int fd = make_filtered_net_unix(path);     if (fd >= 0) return fd; }
+    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     return ::open(path, flags, mode);
 }
 
 static int hook_open2(const char *path, int flags) {
-    if (is_self_maps(path))   { int fd = make_filtered_maps();             if (fd >= 0) return fd; }
-    if (is_self_status(path)) { int fd = make_filtered_status(path);       if (fd >= 0) return fd; }
-    if (is_net_unix(path))    { int fd = make_filtered_net_unix(path);     if (fd >= 0) return fd; }
+    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     return ::open(path, flags);
 }
 
 static int hook_openat2(int dirfd, const char *path, int flags) {
-    if (is_self_maps(path))   { int fd = make_filtered_maps();             if (fd >= 0) return fd; }
-    if (is_self_status(path)) { int fd = make_filtered_status(path);       if (fd >= 0) return fd; }
-    if (is_net_unix(path))    { int fd = make_filtered_net_unix(path);     if (fd >= 0) return fd; }
+    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     return ::openat(dirfd, path, flags);
 }
 
@@ -224,10 +175,6 @@ static FILE *hook_fopen(const char *path, const char *mode) {
     }
     if (is_self_status(path)) {
         int fd = make_filtered_status(path);
-        if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
-    }
-    if (is_net_unix(path)) {
-        int fd = make_filtered_net_unix(path);
         if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
     }
     return ::fopen(path, mode);
@@ -298,7 +245,6 @@ static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a
         const char *path = (const char *)a1;
         if (is_self_maps(path))   return (long)make_filtered_maps();
         if (is_self_status(path)) return (long)make_filtered_status(path);
-        if (is_net_unix(path))    return (long)make_filtered_net_unix(path);
     }
     // Direct SYS_ioctl — same filtering as hook_ioctl (a0=fd, a1=req, a2=arg)
     if (nr == __NR_ioctl) {
@@ -642,8 +588,6 @@ static const PatchEntry kAnortEntries[] = {
 // ── Watcher thread ────────────────────────────────────────────────────────────
 
 static void *gotWatcherThread(void *) {
-    pthread_setname_np(pthread_self(), "kworker/0:0");
-
     // Phase 1 (attempts 0–49):  10ms sleep → library usually loads within ~200ms
     // Phase 2 (attempts 50–199): 100ms sleep → covers slow JIT/dex load paths
     // Give-up: if library IS found but 0 slots patch for 50 consecutive attempts
