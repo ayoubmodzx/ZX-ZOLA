@@ -16,6 +16,16 @@
 // Abstract socket name (leading \0 = abstract, no filesystem entry)
 static constexpr char kSockName[] = "zx_zola";
 
+// AnoSDK bypass diagnostic counters (defined in anosdk_bypass.cpp)
+extern uint32_t g_ano_kill_blocked;
+extern uint32_t g_ano_exit_blocked;
+extern uint32_t g_ano_abort_blocked;
+extern uint32_t g_ano_maps_filtered;
+extern uint32_t g_ano_ioctl_zeroed;
+extern uint32_t g_ano_ptrace_blocked;
+extern uint32_t g_ano_fork_blocked;
+extern uint32_t g_ano_dl_hidden;
+
 FeatureEngine &FeatureEngine::get() {
     static FeatureEngine instance;
     return instance;
@@ -749,11 +759,32 @@ static float hook_vehicle(void *self, void *method) {
     return s_vehicle_on ? v * s_vehicle_mul : v;
 }
 
+// ── Diagnostic counters (reset every 5s by diag thread) ─────────────────────
+static uint32_t s_diag_update_calls     = 0;
+static uint32_t s_diag_local_ticks      = 0;
+static uint32_t s_diag_enemy_ticks      = 0;
+static uint32_t s_diag_outline_vis      = 0;
+static uint32_t s_diag_outline_forced   = 0;
+static uint32_t s_diag_init_outline     = 0;
+static uint32_t s_diag_is_visible       = 0;
+static uint32_t s_diag_is_visible_force = 0;
+static uint32_t s_diag_hs_gate          = 0;
+static uint32_t s_diag_hs_forced        = 0;
+static uint32_t s_diag_aim_core_runs    = 0;
+static uint32_t s_diag_aim_snapped      = 0;
+static uint32_t s_diag_aim_notarget     = 0;
+static uint32_t s_diag_aim_norot        = 0;
+static uint32_t s_diag_outline_judge    = 0;
+static uint32_t s_diag_avatar_outline   = 0;
+static uint32_t s_diag_avatar_trace_vis = 0;
+static uint32_t s_diag_avatar_trace_ren = 0;
+
 // ── New hooks ────────────────────────────────────────────────────────────────
 
 // ESP: IsVisible gate — always true (culling bypass)
 static uint8_t hook_is_visible(void *self, void *method) {
-    if (s_esp) return 1;
+    ++s_diag_is_visible;
+    if (s_esp) { ++s_diag_is_visible_force; return 1; }
     using Fn = uint8_t (*)(void *, void *);
     return reinterpret_cast<Fn>(s_orig_visible)(self, method);
 }
@@ -774,7 +805,9 @@ static void hook_hud_set_visible(void *self, uint8_t visible, void *method) {
 // Passing args through unchanged (except visible) preserves the correct MethodInfo*
 // in whichever register position the function actually reads it from — no null deref.
 static void hook_set_outline_vis(void *self, uint8_t visible, void *arg2, void *method) {
+    ++s_diag_outline_vis;
     uint8_t forced = (s_esp && visible < 16) ? 16 : visible;
+    if (forced != visible) ++s_diag_outline_forced;
     using Fn = void (*)(void *, uint8_t, void *, void *);
     reinterpret_cast<Fn>(s_orig_set_outline_vis)(self, forced, arg2, method);
 }
@@ -782,10 +815,7 @@ static void hook_set_outline_vis(void *self, uint8_t visible, void *arg2, void *
 // ESP: InitOutline() — binary-verified: pc=1 (one explicit param before MethodInfo*).
 // Inject SetOutlineVisible(self, 1, 0) right after each player's outline init.
 static void hook_init_outline(void *self, void *param0, void *method) {
-    // Run original InitOutline — the game will call SetOutlineVisible as part of init,
-    // which our hook_set_outline_vis will intercept and force to visible=16.
-    // Do NOT proactively call SetOutlineVisible here with nullptr method — that crashes
-    // if the function reads the MethodInfo* argument (null deref / wrong signature).
+    ++s_diag_init_outline;
     using Fn = void (*)(void *, void *, void *);
     reinterpret_cast<Fn>(s_orig_init_outline)(self, param0, method);
 }
@@ -829,7 +859,113 @@ static void hook_collider_hit(void *self, void *hit, void *method) {
 // All players share this counter on the Unity main thread so thread_local is wrong.
 static uint32_t s_global_outline_tick = 0;
 
+static void *diagThread(void *) {
+    pthread_setname_np(pthread_self(), "zx_diag");
+    for (;;) {
+        usleep(5000000u); // 5 seconds
+
+        LOGI("╔══════════════════════════════════════════════════════╗");
+        LOGI("║          ZX-ZOLA DIAGNOSTIC REPORT (5s)             ║");
+        LOGI("╠══════════════════════════════════════════════════════╣");
+
+        // Feature flags
+        LOGI("║ [FLAGS] esp=%d headshot=%d aimbot=%d silentaim=%d",
+             (int)s_esp, (int)s_auto_headshot, (int)s_full_aimbot, (int)s_silent_aim);
+        LOGI("║ [FLAGS] recoil=%d spread=%d rapid=%d dmg=%d grass=%d speed=%d",
+             (int)s_anti_recoil, (int)s_no_spread, (int)s_rapid_fire,
+             (int)s_anti_damage, (int)s_no_grass, (int)s_speed_on);
+        LOGI("║ [FLAGS] ammo=%d reload=%d wallshoot=%d revive=%d noclip=%d maxhp=%d",
+             (int)s_inf_ammo, (int)s_no_reload, (int)s_wall_shoot,
+             (int)s_auto_revive, (int)s_noclip, (int)s_max_health);
+
+        // Player tracking
+        LOGI("║ [PLAYER] local=%p enemies=%d", s_local_player, s_enemy_count);
+        for (int i = 0; i < s_enemy_count && i < 8; ++i)
+            LOGI("║   enemy[%d]=%p", i, s_enemy_list[i]);
+
+        // Hook trampoline state
+        LOGI("║ [HOOKS] update=%p visible=%p outlineVis=%p initOutline=%p",
+             s_orig_update, s_orig_visible, s_orig_set_outline_vis, s_orig_init_outline);
+        LOGI("║ [HOOKS] headTF=%p headBone=%p getpos=%p gettrans=%p setaimrot=%p",
+             s_orig_get_head_tf, s_orig_get_head_bone, s_orig_getpos, s_orig_gettrans, s_orig_set_aim_rot);
+        LOGI("║ [HOOKS] isPlayerHead=%p scatterRate=%p outlineJudge=%p avatarOutline=%p",
+             s_orig_is_player_head, s_orig_scatter_rate, s_orig_outline_judge, s_orig_avatar_outline);
+        LOGI("║ [HOOKS] avatarTraceVis=%p avatarTraceRen=%p updateAiming=%p updateADS=%p",
+             s_orig_set_player_visible, s_orig_enable_renderer_outline,
+             s_orig_update_aiming, s_orig_update_aiming_ads);
+
+        // Activity counters (5s window)
+        LOGI("║ [ESP] outlineVis=%u(forced=%u) initOutline=%u isVisible=%u(forced=%u)",
+             s_diag_outline_vis, s_diag_outline_forced, s_diag_init_outline,
+             s_diag_is_visible, s_diag_is_visible_force);
+        LOGI("║ [ESP] outlineJudge=%u avatarOutline=%u traceVis=%u traceRen=%u",
+             s_diag_outline_judge, s_diag_avatar_outline,
+             s_diag_avatar_trace_vis, s_diag_avatar_trace_ren);
+        LOGI("║ [ESP] matchOutlineDone=%d gsOutlineDone=%d globalTick=%u",
+             (int)s_matchgame_outline_done, (int)s_gs_outline_done, s_global_outline_tick);
+
+        LOGI("║ [AIM] core_runs=%u snapped=%u notarget=%u norot=%u",
+             s_diag_aim_core_runs, s_diag_aim_snapped, s_diag_aim_notarget, s_diag_aim_norot);
+        LOGI("║ [HS]  isPlayerHead=%u(forced=%u)", s_diag_hs_gate, s_diag_hs_forced);
+
+        LOGI("║ [UPDATE] total=%u local=%u enemy=%u",
+             s_diag_update_calls, s_diag_local_ticks, s_diag_enemy_ticks);
+
+        LOGI("║ [ANOSDK] kill=%u exit=%u abort=%u maps=%u ioctl=%u ptrace=%u fork=%u dl=%u",
+             g_ano_kill_blocked, g_ano_exit_blocked, g_ano_abort_blocked,
+             g_ano_maps_filtered, g_ano_ioctl_zeroed, g_ano_ptrace_blocked,
+             g_ano_fork_blocked, g_ano_dl_hidden);
+
+        // Problems detection
+        if (s_esp && s_diag_outline_vis == 0)
+            LOGE("║ ⚠ ESP ON but SetOutlineVisible NEVER fired — method ptr may be wrong");
+        if (s_esp && s_diag_outline_forced == 0 && s_diag_outline_vis > 0)
+            LOGE("║ ⚠ ESP ON, SetOutlineVisible fires but NEVER forced — flag check bug");
+        if (s_esp && !s_orig_set_outline_vis)
+            LOGE("║ ⚠ ESP ON but SetOutlineVisible NOT hooked — method not resolved");
+        if (s_esp && !s_orig_outline_judge)
+            LOGE("║ ⚠ ESP ON but OutlineJudge NOT hooked — outline resets every frame");
+        if (s_esp && s_diag_update_calls == 0)
+            LOGE("║ ⚠ ESP ON but Player.Update NEVER fired — hook not installed");
+        if (s_esp && s_enemy_count == 0 && s_diag_update_calls > 10)
+            LOGE("║ ⚠ ESP ON, Update fires but 0 enemies — IsLocalPlayer may fail on all");
+        if (s_auto_headshot && s_diag_hs_gate == 0 && s_diag_update_calls > 10)
+            LOGE("║ ⚠ HEADSHOT ON but IsPlayerHead NEVER fired — not in damage pipeline");
+        if (s_auto_headshot && !s_orig_is_player_head)
+            LOGE("║ ⚠ HEADSHOT ON but IsPlayerHead NOT hooked — method not resolved");
+        if ((s_auto_headshot || s_full_aimbot) && s_diag_aim_core_runs == 0 && s_diag_update_calls > 10)
+            LOGE("║ ⚠ AIM ON but run_aimbot_core NEVER ran — UpdateAiming not hooked or not firing");
+        if ((s_auto_headshot || s_full_aimbot) && s_diag_aim_notarget > 0 && s_diag_aim_snapped == 0)
+            LOGE("║ ⚠ AIM ON but NEVER snapped — always no target (enemy list empty or all null)");
+        if ((s_auto_headshot || s_full_aimbot) && !s_orig_set_aim_rot)
+            LOGE("║ ⚠ AIM ON but SetAimRotation ptr NULL — cannot snap aim");
+        if ((s_auto_headshot || s_full_aimbot) && !s_orig_update_aiming)
+            LOGE("║ ⚠ AIM ON but UpdateAiming NOT hooked — aimbot core never triggers");
+        if (s_local_player == nullptr && s_diag_update_calls > 10)
+            LOGE("║ ⚠ Player.Update fires but LocalPlayer STILL null — IsLocalPlayer always=0");
+        if (g_ano_kill_blocked > 0 || g_ano_exit_blocked > 0 || g_ano_abort_blocked > 0)
+            LOGE("║ ⚠ ANOSDK tried to kill process %u times (kill=%u exit=%u abort=%u)",
+                 g_ano_kill_blocked + g_ano_exit_blocked + g_ano_abort_blocked,
+                 g_ano_kill_blocked, g_ano_exit_blocked, g_ano_abort_blocked);
+        if (g_ano_ioctl_zeroed > 50)
+            LOGE("║ ⚠ ANOSDK ioctl spam: %u detection reports zeroed — may trigger server flag", g_ano_ioctl_zeroed);
+
+        LOGI("╚══════════════════════════════════════════════════════╝");
+
+        // Reset counters
+        s_diag_update_calls = s_diag_local_ticks = s_diag_enemy_ticks = 0;
+        s_diag_outline_vis = s_diag_outline_forced = s_diag_init_outline = 0;
+        s_diag_is_visible = s_diag_is_visible_force = 0;
+        s_diag_hs_gate = s_diag_hs_forced = 0;
+        s_diag_aim_core_runs = s_diag_aim_snapped = s_diag_aim_notarget = s_diag_aim_norot = 0;
+        s_diag_outline_judge = s_diag_avatar_outline = 0;
+        s_diag_avatar_trace_vis = s_diag_avatar_trace_ren = 0;
+    }
+    return nullptr;
+}
+
 static void hook_player_update(void *self, void *method) {
+    ++s_diag_update_calls;
     // ── ESP proactive outline ─────────────────────────────────────────────────
     // thread_local was wrong: all Unity Update() callbacks run on the same main
     // thread, so thread_local is SHARED across all players. With 4 players only
@@ -848,6 +984,7 @@ static void hook_player_update(void *self, void *method) {
         using IsLocalFn = uint8_t (*)(void *, void *);
         uint8_t isLocal = reinterpret_cast<IsLocalFn>(s_is_local_player_fn)(self, s_is_local_player_mth);
         if (isLocal) {
+            ++s_diag_local_ticks;
             if (s_local_player != self) {
                 LOGI("[PLAYER-DIAG] LocalPlayer SET self=%p (was %p) — clearing enemy list", self, s_local_player);
                 s_local_player = self;
@@ -906,7 +1043,7 @@ static void hook_player_update(void *self, void *method) {
                 }
             }
         } else {
-            // Track enemy instances for aimbot targeting
+            ++s_diag_enemy_ticks;
             bool found = false;
             for (int i = 0; i < s_enemy_count; ++i)
                 if (s_enemy_list[i] == self) { found = true; break; }
@@ -951,7 +1088,9 @@ static void hook_player_update(void *self, void *method) {
 static uint8_t hook_is_player_head(void *self, void *collider, void *method) {
     static uint32_t s_iph_cnt = 0;
     ++s_iph_cnt;
+    ++s_diag_hs_gate;
     if (s_auto_headshot || s_silent_aim || s_full_aimbot) {
+        ++s_diag_hs_forced;
         if (s_iph_cnt <= 5 || (s_iph_cnt % 300) == 1)
             LOGI("[HS-GATE] IsPlayerHead#%u FORCED=1 self=%p col=%p", s_iph_cnt, self, collider);
         return 1;
@@ -1214,6 +1353,7 @@ static inline void run_aimbot_core(void *self) {
     }
 
     ++s_aim_core_fire;
+    ++s_diag_aim_core_runs;
     bool do_log = (s_aim_core_fire <= 5) || (s_aim_core_fire % 120) == 1;
 
     using GetTransFn = void *(*)(void *, void *);
@@ -1282,6 +1422,7 @@ static inline void run_aimbot_core(void *self) {
 
     if (!bestEnemy) {
         ++s_aim_core_nolist;
+        ++s_diag_aim_notarget;
         if (do_log) LOGE("[AIM-DIAG] core#%u: NO target found enemies=%d headTF=%p bone=%p nolist_total=%u",
              s_aim_core_fire, s_enemy_count, s_orig_get_head_tf, s_orig_get_head_bone, s_aim_core_nolist);
         return;
@@ -1314,6 +1455,7 @@ static inline void run_aimbot_core(void *self) {
 
     if (!s_orig_set_aim_rot) {
         ++s_aim_core_norot;
+        ++s_diag_aim_norot;
         if (do_log) LOGE("[AIM-DIAG] core#%u: SetAimRotation ptr NULL — aim cannot be set norot=%u", s_aim_core_fire, s_aim_core_norot);
         return;
     }
@@ -1321,6 +1463,7 @@ static inline void run_aimbot_core(void *self) {
     using SetAimFn = void (*)(void *, Vec3, void *);
     reinterpret_cast<SetAimFn>(s_orig_set_aim_rot)(self, aimRot, s_set_aim_rot_mth);
     ++s_aim_core_ok;
+    ++s_diag_aim_snapped;
     if (do_log) LOGI("[AIM-DIAG] core#%u: SET yaw=%.1f pitch=%.1f target=%p head=(%.2f,%.2f,%.2f) ok=%u",
         s_aim_core_fire, yaw, pitch, bestEnemy, bestHead.x, bestHead.y, bestHead.z, s_aim_core_ok);
 }
@@ -1892,11 +2035,9 @@ void FeatureEngine::applyAntiDamage(bool enable) {
 // force SetOutlineVisible(self, 16, 0) for every non-local player so we ALWAYS win the race.
 // ARM64: x0=this(Player*), x1=MethodInfo* → void
 static void hook_outline_judge(void *self, void *method) {
+    ++s_diag_outline_judge;
     using Fn = void (*)(void *, void *);
     reinterpret_cast<Fn>(s_orig_outline_judge)(self, method);
-    // Do NOT call s_orig_set_outline_vis here with nullptr MethodInfo* — that crashes.
-    // hook_set_outline_vis intercepts every game SetOutlineVisible call and forces visible=16.
-    // SetRenderQ in hook_player_update (every 30 frames) also keeps through-wall rendering.
 }
 
 // AvatarOutline.EnableOutline — outline renderer on the avatar component (not on Player itself).
@@ -1904,6 +2045,7 @@ static void hook_outline_judge(void *self, void *method) {
 // forcing EnableOutline(true) keeps the shader mesh enabled.
 // ARM64: x0=this(AvatarOutline*), w1=enable(bool), x2=MethodInfo* → void
 static void hook_avatar_outline(void *self, uint8_t enable, void *method) {
+    ++s_diag_avatar_outline;
     uint8_t forced = s_esp ? 1 : enable;
     using Fn = void (*)(void *, uint8_t, void *);
     reinterpret_cast<Fn>(s_orig_avatar_outline)(self, forced, method);
@@ -1912,6 +2054,7 @@ static void hook_avatar_outline(void *self, uint8_t enable, void *method) {
 // AvatarTrace.SetPlayerVisible — force true when ESP active (through-wall render)
 // ARM64: x0=this, w1=visible(bool), x2=MethodInfo*
 static void hook_set_player_visible(void *self, uint8_t visible, void *method) {
+    ++s_diag_avatar_trace_vis;
     uint8_t forced = s_esp ? 1 : visible;
     using Fn = void (*)(void *, uint8_t, void *);
     reinterpret_cast<Fn>(s_orig_set_player_visible)(self, forced, method);
@@ -1920,6 +2063,7 @@ static void hook_set_player_visible(void *self, uint8_t visible, void *method) {
 // AvatarTrace.EnableRendererOutline — force true when ESP active
 // ARM64: x0=this, w1=enable(bool), x2=MethodInfo*
 static void hook_enable_renderer_outline(void *self, uint8_t enable_flag, void *method) {
+    ++s_diag_avatar_trace_ren;
     uint8_t forced = s_esp ? 1 : enable_flag;
     using Fn = void (*)(void *, uint8_t, void *);
     reinterpret_cast<Fn>(s_orig_enable_renderer_outline)(self, forced, method);
@@ -2368,6 +2512,14 @@ void FeatureEngine::startServer() {
     pthread_create(&tid, &attr, serverThread, this);
     pthread_attr_destroy(&attr);
     LOGI("Socket server thread started");
+
+    pthread_t diag_tid;
+    pthread_attr_t diag_attr;
+    pthread_attr_init(&diag_attr);
+    pthread_attr_setdetachstate(&diag_attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&diag_tid, &diag_attr, diagThread, nullptr);
+    pthread_attr_destroy(&diag_attr);
+    LOGI("Diagnostic thread started (5s interval)");
 }
 
 void FeatureEngine::runServer() {

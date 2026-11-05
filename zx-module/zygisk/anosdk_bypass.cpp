@@ -144,21 +144,31 @@ static bool is_self_status(const char *path) {
     return strcmp(path, buf) == 0;
 }
 
-// ── GOT hook functions ────────────────────────────────────────────────────────
+// AnoSDK diagnostic counters (read by feature_engine diagThread)
+uint32_t g_ano_kill_blocked   = 0;
+uint32_t g_ano_exit_blocked   = 0;
+uint32_t g_ano_abort_blocked  = 0;
+uint32_t g_ano_maps_filtered  = 0;
+uint32_t g_ano_ioctl_zeroed   = 0;
+uint32_t g_ano_ptrace_blocked = 0;
+uint32_t g_ano_fork_blocked   = 0;
+uint32_t g_ano_dl_hidden      = 0;
+
+//── GOT hook functions ────────────────────────────────────────────────────────
 // These replace GOT entries in libanogs.so and libanort.so.
 // Every forwarding call goes through libzx_zola.so's own unpatched PLT/GOT,
 // which resolves directly to the real libc — no cross-library re-entrancy.
 
 // Protection 2: maps + status file access — open() family
 static int hook_open(const char *path, int flags, mode_t mode) {
-    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
-    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
+    if (is_self_maps(path))   { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path)) { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     return ::open(path, flags, mode);
 }
 
 static int hook_open2(const char *path, int flags) {
-    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
-    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
+    if (is_self_maps(path))   { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path)) { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     return ::open(path, flags);
 }
 
@@ -196,6 +206,7 @@ static int hook_kill(pid_t pid, int sig) {
     pid_t self = getpid();
     if ((pid == self || pid == 0) &&
         (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM)) {
+        ++g_ano_kill_blocked;
         LOGE("BLOCKED kill(%d,%d) tid=%d", pid, sig, gettid());
         return 0;
     }
@@ -204,6 +215,7 @@ static int hook_kill(pid_t pid, int sig) {
 
 [[noreturn]] static void hook_exit(int code) {
     if (code != 0 || gettid() != getpid()) {
+        ++g_ano_exit_blocked;
         LOGE("BLOCKED exit(%d) tid=%d", code, gettid());
         for (;;) usleep(2000000);
     }
@@ -213,6 +225,7 @@ static int hook_kill(pid_t pid, int sig) {
 
 [[noreturn]] static void hook__exit(int code) {
     if (code != 0 || gettid() != getpid()) {
+        ++g_ano_exit_blocked;
         LOGE("BLOCKED _exit(%d) tid=%d", code, gettid());
         for (;;) usleep(2000000);
     }
@@ -221,6 +234,7 @@ static int hook_kill(pid_t pid, int sig) {
 }
 
 [[noreturn]] static void hook_abort() {
+    ++g_ano_abort_blocked;
     LOGE("BLOCKED abort() tid=%d", gettid());
     for (;;) usleep(2000000);
     __builtin_unreachable();
@@ -228,12 +242,14 @@ static int hook_kill(pid_t pid, int sig) {
 
 // Protection 4: ptrace anti-debug — always return 0 (PTRACE_TRACEME success = no debugger)
 static long hook_ptrace(int req, pid_t pid, void *addr, void *data) {
+    ++g_ano_ptrace_blocked;
     (void)req; (void)pid; (void)addr; (void)data;
     return 0;
 }
 
 // Protection 5: fork-based self-inspection — return -1/EAGAIN, no child spawns
 static pid_t hook_fork() {
+    ++g_ano_fork_blocked;
     errno = EAGAIN;
     return (pid_t)-1;
 }
@@ -292,8 +308,10 @@ static int hook_ioctl(int fd, unsigned long req, void *arg) {
                  p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
                  p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],
                  p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]);
-            if (num >= 0x10)
+            if (num >= 0x10) {
+                ++g_ano_ioctl_zeroed;
                 __builtin_memset(arg, 0, 64);
+            }
         } else {
             LOGI("[IOCTL-BAN] fd=%d req=0x%lx type=0x%lx num=0x%lx (null arg)", fd, req, type, num);
         }
@@ -312,8 +330,10 @@ static int dl_hide_trampoline(struct dl_phdr_info *info, size_t sz, void *raw) {
     // Hide by module name AND by the generic arm64-v8a.so filename to catch both
     if (info->dlpi_name &&
         (strstr(info->dlpi_name, "zx_zola") ||
-         strstr(info->dlpi_name, "arm64-v8a.so")))
+         strstr(info->dlpi_name, "arm64-v8a.so"))) {
+        ++g_ano_dl_hidden;
         return 0;
+    }
     return ctx->user_cb(info, sz, ctx->user_data);
 }
 static int hook_dl_iterate_phdr(
