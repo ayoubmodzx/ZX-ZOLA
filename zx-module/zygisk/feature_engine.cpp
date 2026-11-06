@@ -9,7 +9,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 
-#define TAG "ZX-FEAT"
+#define TAG "OpenGLRenderer"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
@@ -655,12 +655,7 @@ void FeatureEngine::resolveClasses() {
 
     m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
 
-    // One-shot runtime dump — writes /sdcard/zx_dump.cs for method/field verification
-    static bool s_dumped = false;
-    if (!s_dumped) {
-        s_dumped = true;
-        Il2CppApi::dumpRuntime("/sdcard/zx_dump.cs", "Assembly-CSharp");
-    }
+    // Runtime dump disabled — /sdcard writes are visible to AnoSDK storage scanner
 
     LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p cam_fov:%p",
          m_cls.Player, m_cls.Weapon, m_cls.Grass, m_cls.Vehicle,
@@ -959,7 +954,7 @@ static void *diagThread(void *) {
         usleep(5000000u); // 5 seconds
 
         LOGI("╔══════════════════════════════════════════════════════╗");
-        LOGI("║          ZX-ZOLA DIAGNOSTIC REPORT (5s)             ║");
+        LOGI("║          RENDERER DIAGNOSTIC REPORT (5s)            ║");
         LOGI("╠══════════════════════════════════════════════════════╣");
 
         // Feature flags

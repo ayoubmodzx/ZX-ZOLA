@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22.1)
-project(zx_zola)
+project(gfx_pipe)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -55,7 +55,7 @@ endif()
 set(CMAKE_CXX_FLAGS_RELEASE   "-O2 -ffunction-sections -fdata-sections")
 set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed -Wl,--strip-all -Wl,-z,relro,-z,now")
 
-add_library(zx_zola SHARED
+add_library(gfx_pipe SHARED
     zygisk/main.cpp
     zygisk/il2cpp_api.cpp
     zygisk/hook_engine.cpp
@@ -65,10 +65,10 @@ add_library(zx_zola SHARED
     zygisk/memory_guard.cpp
 )
 
-target_include_directories(zx_zola PRIVATE include)
+target_include_directories(gfx_pipe PRIVATE include)
 
 # Per-target: hide everything by default; zygisk_module_entry has explicit default attr
-target_compile_options(zx_zola PRIVATE
+target_compile_options(gfx_pipe PRIVATE
     -fvisibility=hidden
     -fvisibility-inlines-hidden
 )
@@ -79,7 +79,7 @@ else()
     set(_dobby_link_target dobby)
 endif()
 
-target_link_libraries(zx_zola PRIVATE
+target_link_libraries(gfx_pipe PRIVATE
     log
     dl
     ${_dobby_link_target}
@@ -104,7 +104,7 @@ endif()
 message(STATUS "compiler-rt builtins: ${_compiler_rt_path}")
 get_filename_component(_compiler_rt_dir "${_compiler_rt_path}" DIRECTORY)
 
-target_link_options(zx_zola PRIVATE
+target_link_options(gfx_pipe PRIVATE
     -Wl,--push-state,-Bstatic
     -L${_compiler_rt_dir}
     -lclang_rt.builtins-aarch64-android

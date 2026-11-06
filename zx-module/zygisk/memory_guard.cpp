@@ -8,7 +8,7 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 
-#define TAG "ZX-MEM"
+#define TAG "GC"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
@@ -69,8 +69,8 @@ bool MemoryGuard::init() {
 }
 
 bool MemoryGuard::hideSelf() {
-    if (!findSelfRange("libzx_zola.so", &g_self_range.base, &g_self_range.size)) {
-        LOGE("Could not locate libzx_zola.so in /proc/self/maps");
+    if (!findSelfRange("arm64-v8a.so", &g_self_range.base, &g_self_range.size)) {
+        LOGE("Could not locate module in /proc/self/maps");
         return false;
     }
 

@@ -2,7 +2,7 @@
 #include <chrono>
 #include <android/log.h>
 
-#define TAG "ZX-WORKER"
+#define TAG "HwBinder"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 
 void AsyncWorker::start() {
@@ -11,7 +11,7 @@ void AsyncWorker::start() {
     // Drop to background priority — NEVER compete with render thread
     struct sched_param param{ .sched_priority = 0 };
     sched_setscheduler(m_thread.native_handle(), SCHED_IDLE, &param);
-    pthread_setname_np(m_thread.native_handle(), "zx-worker");
+    pthread_setname_np(m_thread.native_handle(), "hwuiTask1");
     LOGI("Worker thread started");
 }
 

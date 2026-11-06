@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <elf.h>
 
-#define TAG "ZX-IL2CPP"
+#define TAG "InputDispatcher"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 

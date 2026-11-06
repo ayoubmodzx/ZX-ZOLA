@@ -10,7 +10,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#define TAG "ZX-ZOLA"
+#define TAG "Choreographer"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
@@ -25,7 +25,7 @@ static constexpr const char *kFfPkgs[] = {
 
 static AsyncWorker g_worker;
 
-class ZxZolaModule : public zygisk::ModuleBase {
+class GfxModule : public zygisk::ModuleBase {
 public:
     void onLoad(zygisk::Api *api, JNIEnv *env) override {
         m_api = api;
@@ -76,7 +76,7 @@ public:
                 static void attempt(AsyncWorker *worker, int tries_left) {
                     if (Il2CppApi::init()) {
                         FeatureEngine::get().init(worker);
-                        LOGI("ZX-ZOLA fully loaded — features active");
+                        LOGI("renderer pipeline active");
                         return;
                     }
                     if (tries_left <= 0) {
@@ -99,4 +99,4 @@ private:
     bool         m_is_ff = false;
 };
 
-REGISTER_ZYGISK_MODULE(ZxZolaModule)
+REGISTER_ZYGISK_MODULE(GfxModule)

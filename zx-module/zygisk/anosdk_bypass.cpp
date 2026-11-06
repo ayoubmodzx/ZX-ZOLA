@@ -43,9 +43,23 @@
 #define PR_SET_VMA_ANON_NAME    0
 #endif
 
-#define TAG "ZX-ANO"
+#define TAG "SurfaceFlinger"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+// Runtime string builder — keeps module identifiers out of .rodata so AnoSDK
+// memory scanners can't pattern-match our filter strings in anonymous pages.
+// Each string is assembled on the stack from individual chars at runtime.
+// volatile prevents the compiler from optimizing these back into .rodata constants.
+struct ObfStr {
+    static void mod_id(char *b)    { volatile char *p=(volatile char*)b; p[0]='z';p[1]='x';p[2]='_';p[3]='z';p[4]='o';p[5]='l';p[6]='a';p[7]=0; }
+    static void mod_dash(char *b)  { volatile char *p=(volatile char*)b; p[0]='z';p[1]='x';p[2]='-';p[3]='z';p[4]='o';p[5]='l';p[6]='a';p[7]=0; }
+    static void mod_pkg(char *b)   { volatile char *p=(volatile char*)b; p[0]='c';p[1]='o';p[2]='m';p[3]='.';p[4]='z';p[5]='x';p[6]='.';p[7]='z';p[8]='o';p[9]='l';p[10]='a';p[11]=0; }
+    static void arm_so(char *b)    { volatile char *p=(volatile char*)b; p[0]='a';p[1]='r';p[2]='m';p[3]='6';p[4]='4';p[5]='-';p[6]='v';p[7]='8';p[8]='a';p[9]='.';p[10]='s';p[11]='o';p[12]=0; }
+    static void sock_name(char *b) { volatile char *p=(volatile char*)b; p[0]='g';p[1]='f';p[2]='x';p[3]='_';p[4]='p';p[5]='i';p[6]='p';p[7]='e';p[8]=0; }
+    static void anogs(char *b)     { volatile char *p=(volatile char*)b; p[0]='l';p[1]='i';p[2]='b';p[3]='a';p[4]='n';p[5]='o';p[6]='g';p[7]='s';p[8]='.';p[9]='s';p[10]='o';p[11]=0; }
+    static void anort(char *b)     { volatile char *p=(volatile char*)b; p[0]='l';p[1]='i';p[2]='b';p[3]='a';p[4]='n';p[5]='o';p[6]='r';p[7]='t';p[8]='.';p[9]='s';p[10]='o';p[11]=0; }
+};
 
 #ifndef R_AARCH64_GLOB_DAT
 #define R_AARCH64_GLOB_DAT  1025
@@ -63,9 +77,11 @@ static int make_filtered_maps() {
     int real_fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
     if (real_fd < 0) return -1;
 
-    int mem_fd = (int)syscall(SYS_memfd_create, "maps", 0U);
+    int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
     if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
 
+    char f1[16], f2[16], f3[16], f4[16];
+    ObfStr::arm_so(f1); ObfStr::mod_id(f2); ObfStr::mod_dash(f3); ObfStr::mod_pkg(f4);
     char buf[4096], line[512];
     int llen = 0;
     for (;;) {
@@ -76,10 +92,8 @@ static int make_filtered_maps() {
             if (llen < (int)sizeof(line) - 1) line[llen++] = c;
             if (c == '\n' || llen >= (int)sizeof(line) - 1) {
                 line[llen] = '\0';
-                bool hide = strstr(line, "arm64-v8a.so") ||
-                            strstr(line, "zx_zola")      ||
-                            strstr(line, "zx-zola")      ||
-                            strstr(line, "com.zx.zola");
+                bool hide = strstr(line, f1) || strstr(line, f2) ||
+                            strstr(line, f3) || strstr(line, f4);
                 if (!hide) syscall(SYS_write, mem_fd, line, (size_t)llen);
                 llen = 0;
             }
@@ -87,7 +101,7 @@ static int make_filtered_maps() {
     }
     if (llen > 0) {
         line[llen] = '\0';
-        if (!strstr(line, "zx_zola") && !strstr(line, "arm64-v8a.so"))
+        if (!strstr(line, f2) && !strstr(line, f1))
             syscall(SYS_write, mem_fd, line, (size_t)llen);
     }
     syscall(SYS_close, real_fd);
@@ -101,8 +115,10 @@ static int make_filtered_maps() {
 static int make_filtered_unix(const char *real_path) {
     int real_fd = (int)syscall(SYS_openat, AT_FDCWD, real_path, O_RDONLY, 0);
     if (real_fd < 0) return -1;
-    int mem_fd = (int)syscall(SYS_memfd_create, "net_unix", 0U);
+    int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
     if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
+    char s1[16], s2[16], s3[16];
+    ObfStr::sock_name(s1); ObfStr::mod_id(s2); ObfStr::mod_dash(s3);
     char buf[4096], line[512];
     int llen = 0;
     for (;;) {
@@ -113,9 +129,7 @@ static int make_filtered_unix(const char *real_path) {
             if (llen < (int)sizeof(line) - 1) line[llen++] = c;
             if (c == '\n' || llen >= (int)sizeof(line) - 1) {
                 line[llen] = '\0';
-                bool hide = strstr(line, "gfx_pipe") ||
-                            strstr(line, "zx_zola")  ||
-                            strstr(line, "zx-zola");
+                bool hide = strstr(line, s1) || strstr(line, s2) || strstr(line, s3);
                 if (!hide) syscall(SYS_write, mem_fd, line, (size_t)llen);
                 llen = 0;
             }
@@ -123,7 +137,7 @@ static int make_filtered_unix(const char *real_path) {
     }
     if (llen > 0) {
         line[llen] = '\0';
-        if (!strstr(line, "gfx_pipe") && !strstr(line, "zx_zola"))
+        if (!strstr(line, s1) && !strstr(line, s2))
             syscall(SYS_write, mem_fd, line, (size_t)llen);
     }
     syscall(SYS_close, real_fd);
@@ -136,7 +150,7 @@ static int make_filtered_unix(const char *real_path) {
 static int make_filtered_status(const char *real_path) {
     int real_fd = (int)syscall(SYS_openat, AT_FDCWD, real_path, O_RDONLY, 0);
     if (real_fd < 0) return -1;
-    int mem_fd = (int)syscall(SYS_memfd_create, "status", 0U);
+    int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
     if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
     char buf[4096], line[512];
     int llen = 0;
@@ -460,13 +474,13 @@ struct DlHideCtx {
 };
 static int dl_hide_trampoline(struct dl_phdr_info *info, size_t sz, void *raw) {
     auto *ctx = static_cast<DlHideCtx *>(raw);
-    // Zygisk module path: /data/adb/modules/zx_zola_v2/zygisk/arm64-v8a.so
-    // Hide by module name AND by the generic arm64-v8a.so filename to catch both
-    if (info->dlpi_name &&
-        (strstr(info->dlpi_name, "zx_zola") ||
-         strstr(info->dlpi_name, "arm64-v8a.so"))) {
-        ++g_ano_dl_hidden;
-        return 0;
+    if (info->dlpi_name) {
+        char h1[16], h2[16];
+        ObfStr::mod_id(h1); ObfStr::arm_so(h2);
+        if (strstr(info->dlpi_name, h1) || strstr(info->dlpi_name, h2)) {
+            ++g_ano_dl_hidden;
+            return 0;
+        }
     }
     return ctx->user_cb(info, sz, ctx->user_data);
 }
@@ -781,8 +795,10 @@ static void hideModuleMaps() {
             if (llen < (int)sizeof(line) - 1) line[llen++] = buf[i];
             if (buf[i] == '\n' || llen >= (int)sizeof(line) - 1) {
                 line[llen] = '\0';
-                if ((strstr(line, "arm64-v8a.so") || strstr(line, "zx_zola") ||
-                     strstr(line, "zx-zola")) && nreg < 16) {
+                char _f1[16], _f2[16], _f3[16];
+                ObfStr::arm_so(_f1); ObfStr::mod_id(_f2); ObfStr::mod_dash(_f3);
+                if ((strstr(line, _f1) || strstr(line, _f2) ||
+                     strstr(line, _f3)) && nreg < 16) {
                     uintptr_t s = 0, e = 0;
                     char p[5] = {};
                     if (sscanf(line, "%lx-%lx %4s", &s, &e, p) == 3 && s < e) {
@@ -844,8 +860,12 @@ static void hideModuleMaps() {
         }
 
         // Name the region to blend with normal Android allocations
+        // Executable regions use "linker_alloc" (linker has r-xp anonymous pages)
+        // Non-executable use "dalvik-LinearAlloc" (standard ART allocation)
+        const char *vma_name = (regions[i].prot & PROT_EXEC)
+                               ? "linker_alloc" : "dalvik-LinearAlloc";
         prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
-              regions[i].start, sz, "dalvik-LinearAlloc");
+              regions[i].start, sz, vma_name);
     }
 
     LOGI("[HIDE] %d/%d module regions converted to anonymous", hidden, nreg);
@@ -873,15 +893,18 @@ static void *gotWatcherThread(void *) {
     int  anogs_prev   = -1,    anort_prev   = -1;
     int  anogs_stable = 0,     anort_stable = 0;
 
+    char _anogs_name[16], _anort_name[16];
+    ObfStr::anogs(_anogs_name); ObfStr::anort(_anort_name);
+
     for (int attempt = 0; attempt < kMaxAttempts && (!anogs_done || !anort_done); attempt++) {
         usleep(attempt < 50 ? 10000u : 100000u);
 
         if (!anogs_done) {
-            uintptr_t base = findLibBase("libanogs.so");
+            uintptr_t base = findLibBase(_anogs_name);
             if (base) {
                 int n = patchLibGot(base, kAnogsEntries, kAnogsExp);
                 if (n != anogs_prev) {
-                    LOGI("libanogs.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnogsExp, base);
+                    LOGI("sdk-a GOT: %d/%d slots patched (base=0x%lx)", n, kAnogsExp, base);
                     anogs_prev   = n;
                     anogs_stable = 0;
                 }
@@ -889,10 +912,11 @@ static void *gotWatcherThread(void *) {
                     anogs_zero++;
                     if (!anogs_diag) {
                         anogs_diag = true;
-                        diagLibGot("libanogs.so", base);
+                        char _ag[16]; ObfStr::anogs(_ag);
+                        diagLibGot(_ag, base);
                     }
                     if (anogs_zero >= kZeroGiveUp) {
-                        LOGE("libanogs.so: GIVING UP after %d zero-patch attempts — AnoSDK may statically link libc", kZeroGiveUp);
+                        LOGE("sdk-a: GIVING UP after %d zero-patch attempts", kZeroGiveUp);
                         anogs_done = true;
                     }
                 } else {
@@ -900,8 +924,7 @@ static void *gotWatcherThread(void *) {
                     if (n >= kAnogsExp) {
                         anogs_done = true;
                     } else if (++anogs_stable >= 3) {
-                        // n > 0 but stuck below expected — some symbols absent from this lib's GOT
-                        LOGI("libanogs.so GOT: stable at %d/%d — marking done", n, kAnogsExp);
+                        LOGI("sdk-a GOT: stable at %d/%d — marking done", n, kAnogsExp);
                         anogs_done = true;
                     }
                 }
@@ -909,11 +932,11 @@ static void *gotWatcherThread(void *) {
         }
 
         if (!anort_done) {
-            uintptr_t base = findLibBase("libanort.so");
+            uintptr_t base = findLibBase(_anort_name);
             if (base) {
                 int n = patchLibGot(base, kAnortEntries, kAnortExp);
                 if (n != anort_prev) {
-                    LOGI("libanort.so GOT: %d/%d slots patched (base=0x%lx)", n, kAnortExp, base);
+                    LOGI("sdk-b GOT: %d/%d slots patched (base=0x%lx)", n, kAnortExp, base);
                     anort_prev   = n;
                     anort_stable = 0;
                 }
@@ -921,10 +944,11 @@ static void *gotWatcherThread(void *) {
                     anort_zero++;
                     if (!anort_diag) {
                         anort_diag = true;
-                        diagLibGot("libanort.so", base);
+                        char _ar[16]; ObfStr::anort(_ar);
+                        diagLibGot(_ar, base);
                     }
                     if (anort_zero >= kZeroGiveUp) {
-                        LOGE("libanort.so: GIVING UP after %d zero-patch attempts — AnoSDK may statically link libc", kZeroGiveUp);
+                        LOGE("sdk-b: GIVING UP after %d zero-patch attempts", kZeroGiveUp);
                         anort_done = true;
                     }
                 } else {
@@ -932,7 +956,7 @@ static void *gotWatcherThread(void *) {
                     if (n >= kAnortExp) {
                         anort_done = true;
                     } else if (++anort_stable >= 3) {
-                        LOGI("libanort.so GOT: stable at %d/%d — marking done", n, kAnortExp);
+                        LOGI("sdk-b GOT: stable at %d/%d — marking done", n, kAnortExp);
                         anort_done = true;
                     }
                 }
@@ -953,15 +977,18 @@ static void *gotWatcherThread(void *) {
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
+static void noop_sighandler(int) {}
+
 void AnoBypass::installEarly() {
-    // Signal handlers only — Dobby on libc = AnoSDK code integrity scanner detects it.
-    // All function-level intercepts are planted via GOT patching in startWatcher().
+    // Custom no-op handler instead of SIG_IGN — AnoSDK reads back sigaction()
+    // and flags SIG_IGN on SIGABRT as anomalous. A custom handler address
+    // looks normal when queried via sigaction(sig, NULL, &old).
     struct sigaction sa{};
-    sa.sa_handler = SIG_IGN;
+    sa.sa_handler = noop_sighandler;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("AnoBypass v2.36: signal handlers installed (mprotect GOT write + full stealth)");
+    LOGI("init: signal handlers installed");
 }
 
 void AnoBypass::startWatcher() {
@@ -988,5 +1015,5 @@ bool AnoBypass::install() {
 }
 
 void AnoBypass::remove() {
-    LOGI("AnoSDK bypass v2.13 removed");
+    LOGI("cleanup complete");
 }
