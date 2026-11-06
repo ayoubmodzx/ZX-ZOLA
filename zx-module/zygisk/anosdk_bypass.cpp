@@ -26,15 +26,22 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <elf.h>
 #include <fcntl.h>
 #include <link.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#ifndef PR_SET_VMA
+#define PR_SET_VMA              0x53564d41
+#define PR_SET_VMA_ANON_NAME    0
+#endif
 
 #define TAG "ZX-ANO"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
@@ -125,10 +132,14 @@ static bool is_self_maps(const char *path) {
     if (!path) return false;
     if (strcmp(path, "/proc/self/maps")  == 0) return true;
     if (strcmp(path, "/proc/self/smaps") == 0) return true;
+    if (strcmp(path, "/proc/self/smaps_rollup") == 0) return true;
+    if (strcmp(path, "/proc/self/mountinfo") == 0) return true;
+    if (strcmp(path, "/proc/self/map_files") == 0) return true;
     char buf[64];
     int pid = (int)getpid();
     snprintf(buf, sizeof(buf), "/proc/%d/maps",  pid); if (strcmp(path, buf) == 0) return true;
     snprintf(buf, sizeof(buf), "/proc/%d/smaps", pid); if (strcmp(path, buf) == 0) return true;
+    snprintf(buf, sizeof(buf), "/proc/%d/mountinfo", pid); if (strcmp(path, buf) == 0) return true;
     // Per-thread maps (AnoSDK may scan each thread's maps separately)
     snprintf(buf, sizeof(buf), "/proc/%d/task/",  pid);
     if (path && strncmp(path, buf, strlen(buf)) == 0 && strstr(path, "/maps")) return true;
@@ -689,9 +700,108 @@ static const PatchEntry kAnortEntries[] = {
     { "unwind_xx_info_query", reinterpret_cast<void *>(hook_unwind_ioctl)},
 };
 
+// ── Module map hiding ─────────────────────────────────────────────────────────
+// libanort.so uses tp_syscall_imp (raw SVC #0) to read /proc/self/maps directly,
+// bypassing ALL GOT hooks.  If our module shows up in maps → server-side ban.
+//
+// Fix: after loading, replace every file-backed mapping of our .so with an
+// anonymous mapping containing the same bytes.  mremap(MREMAP_FIXED) swaps
+// atomically — threads executing from the region keep running with identical
+// content, but /proc/self/maps no longer shows a filename.
+
+static void hideModuleMaps() {
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    if (fd < 0) return;
+
+    struct Region { uintptr_t start, end; int prot; };
+    Region regions[16];
+    int nreg = 0;
+
+    char buf[4096], line[512];
+    int llen = 0;
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            if (llen < (int)sizeof(line) - 1) line[llen++] = buf[i];
+            if (buf[i] == '\n' || llen >= (int)sizeof(line) - 1) {
+                line[llen] = '\0';
+                if ((strstr(line, "arm64-v8a.so") || strstr(line, "zx_zola") ||
+                     strstr(line, "zx-zola")) && nreg < 16) {
+                    uintptr_t s = 0, e = 0;
+                    char p[5] = {};
+                    if (sscanf(line, "%lx-%lx %4s", &s, &e, p) == 3 && s < e) {
+                        int prot = 0;
+                        if (p[0] == 'r') prot |= PROT_READ;
+                        if (p[1] == 'w') prot |= PROT_WRITE;
+                        if (p[2] == 'x') prot |= PROT_EXEC;
+                        regions[nreg++] = {s, e, prot};
+                    }
+                }
+                llen = 0;
+            }
+        }
+    }
+    syscall(SYS_close, fd);
+
+    if (nreg == 0) { LOGI("[HIDE] no module regions found in maps"); return; }
+
+    int hidden = 0;
+    for (int i = 0; i < nreg; i++) {
+        size_t sz = regions[i].end - regions[i].start;
+
+        // Allocate anonymous copy and duplicate content
+        void *copy = mmap(nullptr, sz, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (copy == MAP_FAILED) {
+            LOGE("[HIDE] mmap copy failed for 0x%lx sz=%zu errno=%d",
+                 regions[i].start, sz, errno);
+            continue;
+        }
+        __builtin_memcpy(copy, reinterpret_cast<void *>(regions[i].start), sz);
+
+        // Set correct permissions on the copy BEFORE the atomic swap
+        if (regions[i].prot != (PROT_READ | PROT_WRITE))
+            mprotect(copy, sz, regions[i].prot);
+
+        // Atomic swap: mremap moves our anonymous copy to the original address,
+        // replacing the file-backed mapping.  Content is identical, so any thread
+        // executing from .text keeps running uninterrupted.
+        void *result = mremap(copy, sz, sz, MREMAP_MAYMOVE | MREMAP_FIXED,
+                              reinterpret_cast<void *>(regions[i].start));
+        if (result == MAP_FAILED) {
+            LOGE("[HIDE] mremap failed for 0x%lx sz=%zu errno=%d — trying fallback",
+                 regions[i].start, sz, errno);
+            // Fallback for non-executable regions: mmap over + copy back
+            if (!(regions[i].prot & PROT_EXEC)) {
+                void *anon = mmap(reinterpret_cast<void *>(regions[i].start), sz,
+                                  PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (anon != MAP_FAILED) {
+                    __builtin_memcpy(anon, copy, sz);
+                    mprotect(anon, sz, regions[i].prot);
+                    hidden++;
+                }
+            }
+            munmap(copy, sz);
+        } else {
+            hidden++;
+        }
+
+        // Name the region to blend with normal Android allocations
+        prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
+              regions[i].start, sz, "dalvik-LinearAlloc");
+    }
+
+    LOGI("[HIDE] %d/%d module regions converted to anonymous", hidden, nreg);
+}
+
 // ── Watcher thread ────────────────────────────────────────────────────────────
 
 static void *gotWatcherThread(void *) {
+    // Hide thread name — default Zygisk thread names are suspicious in /proc/self/task/
+    pthread_setname_np(pthread_self(), "Binder:intercept");
+
     // Phase 1 (attempts 0–49):  10ms sleep → library usually loads within ~200ms
     // Phase 2 (attempts 50–199): 100ms sleep → covers slow JIT/dex load paths
     // Give-up: if library IS found but 0 slots patch for 50 consecutive attempts
@@ -778,6 +888,11 @@ static void *gotWatcherThread(void *) {
     LOGI("AnoBypass: watcher done — anogs=%s anort=%s",
          (anogs_prev == kAnogsExp ? "OK" : (anogs_prev > 0 ? "partial" : "FAILED")),
          (anort_prev == kAnortExp ? "OK" : (anort_prev > 0 ? "partial" : "FAILED")));
+
+    // Critical: hide module from /proc/self/maps AFTER all GOT patches are applied.
+    // This defeats tp_syscall_imp raw SVC #0 reads that bypass GOT hooks entirely.
+    hideModuleMaps();
+
     return nullptr;
 }
 
@@ -791,7 +906,7 @@ void AnoBypass::installEarly() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("AnoBypass v2.23: signal handlers installed (mprotect GOT write, no /proc/self/mem)");
+    LOGI("AnoBypass v2.35: signal handlers installed (mprotect GOT write + module map hiding)");
 }
 
 void AnoBypass::startWatcher() {
