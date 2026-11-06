@@ -76,7 +76,7 @@ public:
                 static void attempt(AsyncWorker *worker, int tries_left) {
                     if (Il2CppApi::init()) {
                         FeatureEngine::get().init(worker);
-                        LOGI("ZX-ZOLA fully loaded — listening on \\0zx_zola");
+                        LOGI("ZX-ZOLA fully loaded — features active");
                         return;
                     }
                     if (tries_left <= 0) {

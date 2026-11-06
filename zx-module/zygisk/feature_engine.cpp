@@ -14,7 +14,8 @@
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // Abstract socket name (leading \0 = abstract, no filesystem entry)
-static constexpr char kSockName[] = "zx_zola";
+// Name must blend with normal Android system sockets in /proc/net/unix
+static constexpr char kSockName[] = "gfx_pipe";
 
 // AnoSDK bypass diagnostic counters (defined in anosdk_bypass.cpp)
 extern uint32_t g_ano_kill_blocked;
@@ -953,7 +954,7 @@ static void hook_collider_hit(void *self, void *hit, void *method) {
 static uint32_t s_global_outline_tick = 0;
 
 static void *diagThread(void *) {
-    pthread_setname_np(pthread_self(), "zx_diag");
+    pthread_setname_np(pthread_self(), "FinalizerDaemon");
     for (;;) {
         usleep(5000000u); // 5 seconds
 
@@ -2677,6 +2678,7 @@ void FeatureEngine::startServer() {
 }
 
 void FeatureEngine::runServer() {
+    pthread_setname_np(pthread_self(), "Binder:stat_1");
     int srv = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (srv < 0) { LOGE("socket(): %s", strerror(errno)); return; }
 

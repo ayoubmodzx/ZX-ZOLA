@@ -95,6 +95,42 @@ static int make_filtered_maps() {
     return mem_fd;
 }
 
+// Build a filtered /proc/net/unix that hides our abstract socket from enumeration.
+// AnoSDK scans this file for suspicious socket names — our socket would appear as @gfx_pipe.
+// Defense-in-depth: the socket itself is renamed, but filter anyway for GOT-imported reads.
+static int make_filtered_unix(const char *real_path) {
+    int real_fd = (int)syscall(SYS_openat, AT_FDCWD, real_path, O_RDONLY, 0);
+    if (real_fd < 0) return -1;
+    int mem_fd = (int)syscall(SYS_memfd_create, "net_unix", 0U);
+    if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
+    char buf[4096], line[512];
+    int llen = 0;
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, real_fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (llen < (int)sizeof(line) - 1) line[llen++] = c;
+            if (c == '\n' || llen >= (int)sizeof(line) - 1) {
+                line[llen] = '\0';
+                bool hide = strstr(line, "gfx_pipe") ||
+                            strstr(line, "zx_zola")  ||
+                            strstr(line, "zx-zola");
+                if (!hide) syscall(SYS_write, mem_fd, line, (size_t)llen);
+                llen = 0;
+            }
+        }
+    }
+    if (llen > 0) {
+        line[llen] = '\0';
+        if (!strstr(line, "gfx_pipe") && !strstr(line, "zx_zola"))
+            syscall(SYS_write, mem_fd, line, (size_t)llen);
+    }
+    syscall(SYS_close, real_fd);
+    syscall(SYS_lseek, mem_fd, 0, SEEK_SET);
+    return mem_fd;
+}
+
 // Build a filtered /proc/self/status that hides TracerPid (debugger detection).
 // Zygisk injection leaves TracerPid != 0 in the process status — AnoSDK reads this.
 static int make_filtered_status(const char *real_path) {
@@ -155,6 +191,16 @@ static bool is_self_status(const char *path) {
     return strcmp(path, buf) == 0;
 }
 
+static bool is_proc_net_unix(const char *path) {
+    if (!path) return false;
+    if (strcmp(path, "/proc/net/unix") == 0) return true;
+    if (strcmp(path, "/proc/self/net/unix") == 0) return true;
+    char buf[64];
+    int pid = (int)getpid();
+    snprintf(buf, sizeof(buf), "/proc/%d/net/unix", pid);
+    return strcmp(path, buf) == 0;
+}
+
 // AnoSDK diagnostic counters (read by feature_engine diagThread)
 uint32_t g_ano_kill_blocked   = 0;
 uint32_t g_ano_exit_blocked   = 0;
@@ -172,20 +218,23 @@ uint32_t g_ano_dl_hidden      = 0;
 
 // Protection 2: maps + status file access — open() family
 static int hook_open(const char *path, int flags, mode_t mode) {
-    if (is_self_maps(path))   { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
-    if (is_self_status(path)) { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
+    if (is_self_maps(path))     { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path))   { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
+    if (is_proc_net_unix(path)) { ++g_ano_maps_filtered; int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
     return ::open(path, flags, mode);
 }
 
 static int hook_open2(const char *path, int flags) {
-    if (is_self_maps(path))   { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
-    if (is_self_status(path)) { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
+    if (is_self_maps(path))     { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path))   { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
+    if (is_proc_net_unix(path)) { ++g_ano_maps_filtered; int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
     return ::open(path, flags);
 }
 
 static int hook_openat2(int dirfd, const char *path, int flags) {
-    if (is_self_maps(path))   { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
-    if (is_self_status(path)) { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
+    if (is_self_maps(path))     { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
+    if (is_self_status(path))   { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
+    if (is_proc_net_unix(path)) { int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
     return ::openat(dirfd, path, flags);
 }
 
@@ -196,6 +245,10 @@ static FILE *hook_fopen(const char *path, const char *mode) {
     }
     if (is_self_status(path)) {
         int fd = make_filtered_status(path);
+        if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
+    }
+    if (is_proc_net_unix(path)) {
+        int fd = make_filtered_unix(path);
         if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
     }
     return ::fopen(path, mode);
@@ -306,8 +359,9 @@ static int hook_mincore(void *addr, size_t length, unsigned char *vec) {
 static long hook_tp_syscall(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
     if (nr == __NR_openat && a1 != 0) {
         const char *path = (const char *)a1;
-        if (is_self_maps(path))   return (long)make_filtered_maps();
-        if (is_self_status(path)) return (long)make_filtered_status(path);
+        if (is_self_maps(path))     return (long)make_filtered_maps();
+        if (is_self_status(path))   return (long)make_filtered_status(path);
+        if (is_proc_net_unix(path)) return (long)make_filtered_unix(path);
     }
     if (nr == __NR_ioctl) {
         unsigned long req  = (unsigned long)a1;
@@ -338,8 +392,9 @@ static int hook_unwind_ioctl(int fd, unsigned long req, void *arg) {
 static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
     if (nr == __NR_openat && a1 != 0) {
         const char *path = (const char *)a1;
-        if (is_self_maps(path))   return (long)make_filtered_maps();
-        if (is_self_status(path)) return (long)make_filtered_status(path);
+        if (is_self_maps(path))     return (long)make_filtered_maps();
+        if (is_self_status(path))   return (long)make_filtered_status(path);
+        if (is_proc_net_unix(path)) return (long)make_filtered_unix(path);
     }
     // Direct SYS_ioctl — same filtering as hook_ioctl (a0=fd, a1=req, a2=arg)
     if (nr == __NR_ioctl) {
@@ -800,7 +855,7 @@ static void hideModuleMaps() {
 
 static void *gotWatcherThread(void *) {
     // Hide thread name — default Zygisk thread names are suspicious in /proc/self/task/
-    pthread_setname_np(pthread_self(), "Binder:intercept");
+    pthread_setname_np(pthread_self(), "Binder:9_3");
 
     // Phase 1 (attempts 0–49):  10ms sleep → library usually loads within ~200ms
     // Phase 2 (attempts 50–199): 100ms sleep → covers slow JIT/dex load paths
@@ -906,7 +961,7 @@ void AnoBypass::installEarly() {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("AnoBypass v2.35: signal handlers installed (mprotect GOT write + module map hiding)");
+    LOGI("AnoBypass v2.36: signal handlers installed (mprotect GOT write + full stealth)");
 }
 
 void AnoBypass::startWatcher() {
