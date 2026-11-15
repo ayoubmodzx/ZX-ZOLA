@@ -1,7 +1,7 @@
 #!/system/bin/sh
 SKIPUNZIP=1
 
-SONAME="zx_zola"
+SONAME="gfx_pipe"
 SUPPORTED_ABIS="arm64 arm x86 x64"
 
 if [ "$BOOTMODE" ] && [ "$KSU" ]; then
@@ -13,7 +13,7 @@ else
 fi
 
 VERSION=$(grep_prop version "$TMPDIR/module.prop")
-ui_print "- Installing ZX-ZOLA $VERSION"
+ui_print "- Installing GFX-Pipe $VERSION"
 ui_print "- Device ABI: $ARCH"
 
 # Check ABI support
@@ -52,4 +52,4 @@ esac
 }
 
 chmod 755 "$MODPATH/service.sh"
-ui_print "- ZX-ZOLA installed. Hide root+Zygisk or you will get banned."
+ui_print "- Module installed. Hide root+Zygisk or you will get banned."

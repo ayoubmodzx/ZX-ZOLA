@@ -34,8 +34,10 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #ifndef PR_SET_VMA
@@ -225,16 +227,37 @@ uint32_t g_ano_ptrace_blocked = 0;
 uint32_t g_ano_fork_blocked   = 0;
 uint32_t g_ano_dl_hidden      = 0;
 
+// Forward declarations for protections defined later in this file
+static bool is_root_path(const char *p);
+static bool is_self_environ(const char *path);
+static int  make_filtered_environ();
+extern uint32_t g_ano_access_filtered;
+
 //── GOT hook functions ────────────────────────────────────────────────────────
 // These replace GOT entries in libanogs.so and libanort.so.
 // Every forwarding call goes through libzx_zola.so's own unpatched PLT/GOT,
 // which resolves directly to the real libc — no cross-library re-entrancy.
 
 // Protection 2: maps + status file access — open() family
+// Per-task comm/status filter — AnoSDK reads /proc/self/task/<tid>/comm and
+// /proc/self/task/<tid>/status to discover suspicious thread names.
+// Return a memfd with our thread names replaced by their camouflaged versions.
+static bool is_task_comm(const char *path) {
+    if (!path) return false;
+    char buf[64];
+    int pid = (int)getpid();
+    snprintf(buf, sizeof(buf), "/proc/%d/task/", pid);
+    if (strncmp(path, buf, strlen(buf)) == 0 && strstr(path, "/comm")) return true;
+    if (strncmp(path, "/proc/self/task/", 16) == 0 && strstr(path, "/comm")) return true;
+    return false;
+}
+
 static int hook_open(const char *path, int flags, mode_t mode) {
     if (is_self_maps(path))     { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
     if (is_self_status(path))   { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     if (is_proc_net_unix(path)) { ++g_ano_maps_filtered; int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
+    if (is_self_environ(path))  { ++g_ano_maps_filtered; int fd = make_filtered_environ();        if (fd >= 0) return fd; }
+    if (is_root_path(path))     { ++g_ano_access_filtered; errno = ENOENT; return -1; }
     return ::open(path, flags, mode);
 }
 
@@ -242,6 +265,8 @@ static int hook_open2(const char *path, int flags) {
     if (is_self_maps(path))     { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
     if (is_self_status(path))   { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     if (is_proc_net_unix(path)) { ++g_ano_maps_filtered; int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
+    if (is_self_environ(path))  { ++g_ano_maps_filtered; int fd = make_filtered_environ();        if (fd >= 0) return fd; }
+    if (is_root_path(path))     { ++g_ano_access_filtered; errno = ENOENT; return -1; }
     return ::open(path, flags);
 }
 
@@ -249,6 +274,8 @@ static int hook_openat2(int dirfd, const char *path, int flags) {
     if (is_self_maps(path))     { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
     if (is_self_status(path))   { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
     if (is_proc_net_unix(path)) { int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
+    if (is_self_environ(path))  { int fd = make_filtered_environ();        if (fd >= 0) return fd; }
+    if (is_root_path(path))     { ++g_ano_access_filtered; errno = ENOENT; return -1; }
     return ::openat(dirfd, path, flags);
 }
 
@@ -265,6 +292,11 @@ static FILE *hook_fopen(const char *path, const char *mode) {
         int fd = make_filtered_unix(path);
         if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
     }
+    if (is_self_environ(path)) {
+        int fd = make_filtered_environ();
+        if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
+    }
+    if (is_root_path(path)) { errno = ENOENT; return nullptr; }
     return ::fopen(path, mode);
 }
 
@@ -367,6 +399,162 @@ static int hook_mincore(void *addr, size_t length, unsigned char *vec) {
     return 0;
 }
 
+// Protection 14: readlinkat — AnoSDK enumerates /proc/self/fd/* and readlink()s
+// each one to discover open fds pointing to injected .so files or Magisk paths.
+// Also checks /proc/self/exe for Zygisk binary injection artifacts.
+uint32_t g_ano_readlink_filtered = 0;
+static ssize_t hook_readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
+    ssize_t r = ::readlinkat(dirfd, pathname, buf, bufsiz);
+    if (r > 0 && buf) {
+        char tmp[512];
+        size_t len = (size_t)r < sizeof(tmp) - 1 ? (size_t)r : sizeof(tmp) - 1;
+        __builtin_memcpy(tmp, buf, len);
+        tmp[len] = '\0';
+        char h1[16], h2[16], h3[16], h4[16];
+        ObfStr::mod_id(h1); ObfStr::mod_dash(h2); ObfStr::arm_so(h3); ObfStr::mod_pkg(h4);
+        if (strstr(tmp, h1) || strstr(tmp, h2) || strstr(tmp, h3) || strstr(tmp, h4)
+            || is_root_path(tmp)) {
+            ++g_ano_readlink_filtered;
+            errno = ENOENT;
+            return -1;
+        }
+    }
+    return r;
+}
+static ssize_t hook_readlink(const char *path, char *buf, size_t bufsiz) {
+    return hook_readlinkat(AT_FDCWD, path, buf, bufsiz);
+}
+
+// Protection 15: access/faccessat — AnoSDK probes filesystem paths for root/Magisk
+// artifacts. Return ENOENT for known injection paths.
+uint32_t g_ano_access_filtered = 0;
+// Runtime-built root path signatures — keeps detection strings out of .rodata
+// so AnoSDK can't pattern-match them via memory scan.
+static bool is_root_path(const char *p) {
+    if (!p) return false;
+    // Build each signature on the stack at runtime
+    struct R {
+        static void s0(char *b)  { volatile char *v=(volatile char*)b; v[0]='/';v[1]='d';v[2]='a';v[3]='t';v[4]='a';v[5]='/';v[6]='a';v[7]='d';v[8]='b';v[9]=0; }
+        static void s1(char *b)  { volatile char *v=(volatile char*)b; v[0]='m';v[1]='a';v[2]='g';v[3]='i';v[4]='s';v[5]='k';v[6]=0; }
+        static void s2(char *b)  { volatile char *v=(volatile char*)b; v[0]='s';v[1]='u';v[2]='p';v[3]='e';v[4]='r';v[5]='s';v[6]='u';v[7]=0; }
+        static void s3(char *b)  { volatile char *v=(volatile char*)b; v[0]='/';v[1]='s';v[2]='u';v[3]=0; }
+        static void s4(char *b)  { volatile char *v=(volatile char*)b; v[0]='b';v[1]='u';v[2]='s';v[3]='y';v[4]='b';v[5]='o';v[6]='x';v[7]=0; }
+        static void s5(char *b)  { volatile char *v=(volatile char*)b; v[0]='z';v[1]='y';v[2]='g';v[3]='i';v[4]='s';v[5]='k';v[6]=0; }
+        static void s6(char *b)  { volatile char *v=(volatile char*)b; v[0]='r';v[1]='i';v[2]='r';v[3]='u';v[4]=0; }
+        static void s7(char *b)  { volatile char *v=(volatile char*)b; v[0]='x';v[1]='p';v[2]='o';v[3]='s';v[4]='e';v[5]='d';v[6]=0; }
+        static void s8(char *b)  { volatile char *v=(volatile char*)b; v[0]='k';v[1]='e';v[2]='r';v[3]='n';v[4]='e';v[5]='l';v[6]='s';v[7]='u';v[8]=0; }
+        static void s9(char *b)  { volatile char *v=(volatile char*)b; v[0]='a';v[1]='p';v[2]='a';v[3]='t';v[4]='c';v[5]='h';v[6]=0; }
+    };
+    char t[16];
+    R::s0(t); if (strstr(p, t)) return true;
+    R::s1(t); if (strstr(p, t)) return true;
+    R::s2(t); if (strstr(p, t)) return true;
+    R::s3(t); if (strstr(p, t)) return true;
+    R::s4(t); if (strstr(p, t)) return true;
+    R::s5(t); if (strstr(p, t)) return true;
+    R::s6(t); if (strstr(p, t)) return true;
+    R::s7(t); if (strstr(p, t)) return true;
+    R::s8(t); if (strstr(p, t)) return true;
+    R::s9(t); if (strstr(p, t)) return true;
+    ObfStr::mod_id(t); if (strstr(p, t)) return true;
+    return false;
+}
+static int hook_access(const char *path, int mode) {
+    if (is_root_path(path)) { ++g_ano_access_filtered; errno = ENOENT; return -1; }
+    return ::access(path, mode);
+}
+static int hook_faccessat(int dirfd, const char *path, int mode, int flags) {
+    if (is_root_path(path)) { ++g_ano_access_filtered; errno = ENOENT; return -1; }
+    return ::faccessat(dirfd, path, mode, flags);
+}
+
+// Protection 16: stat/fstatat/lstat — AnoSDK stats Magisk/module paths to detect root.
+uint32_t g_ano_stat_filtered = 0;
+static int hook_stat(const char *path, struct stat *st) {
+    if (is_root_path(path)) { ++g_ano_stat_filtered; errno = ENOENT; return -1; }
+    return ::stat(path, st);
+}
+static int hook_lstat(const char *path, struct stat *st) {
+    if (is_root_path(path)) { ++g_ano_stat_filtered; errno = ENOENT; return -1; }
+    return ::lstat(path, st);
+}
+static int hook_fstatat(int dirfd, const char *path, struct stat *st, int flags) {
+    if (is_root_path(path)) { ++g_ano_stat_filtered; errno = ENOENT; return -1; }
+    return ::fstatat(dirfd, path, st, flags);
+}
+
+// Protection 17: __system_property_get — AnoSDK reads system properties to detect root.
+// Spoof only root-indicating properties; pass all others through untouched.
+uint32_t g_ano_prop_spoofed = 0;
+static int hook_system_property_get(const char *name, char *value) {
+    int r = __system_property_get(name, value);
+    if (name && value) {
+        if (strcmp(name, "ro.debuggable") == 0 && value[0] == '1') {
+            value[0] = '0'; value[1] = '\0'; ++g_ano_prop_spoofed;
+        } else if (strcmp(name, "ro.secure") == 0 && value[0] == '0') {
+            value[0] = '1'; value[1] = '\0'; ++g_ano_prop_spoofed;
+        } else if (strcmp(name, "ro.build.selinux") == 0 && value[0] == '0') {
+            value[0] = '1'; value[1] = '\0'; ++g_ano_prop_spoofed;
+        } else if (strcmp(name, "ro.build.tags") == 0 && strstr(value, "test-keys")) {
+            __builtin_memcpy(value, "release-keys", 13); ++g_ano_prop_spoofed;
+        } else if (is_root_path(name)) {
+            value[0] = '\0'; ++g_ano_prop_spoofed;
+        }
+    }
+    return r;
+}
+
+// Protection 18: /proc/self/environ filter — AnoSDK reads environment variables
+// to detect LD_PRELOAD, MAGISK_*, and other injection artifacts.
+static int make_filtered_environ() {
+    int real_fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/environ", O_RDONLY, 0);
+    if (real_fd < 0) return -1;
+    int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
+    if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
+    char buf[4096];
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, real_fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        ssize_t start = 0;
+        for (ssize_t i = 0; i < n; i++) {
+            if (buf[i] == '\0') {
+                char *entry = buf + start;
+                size_t elen = (size_t)(i - start);
+                bool hide = false;
+                if (elen > 0) {
+                    // Build env prefix signatures at runtime
+                    volatile char ld[12]; ld[0]='L';ld[1]='D';ld[2]='_';ld[3]='P';ld[4]='R';ld[5]='E';ld[6]='L';ld[7]='O';ld[8]='A';ld[9]='D';ld[10]='=';ld[11]=0;
+                    volatile char mg[7]; mg[0]='M';mg[1]='A';mg[2]='G';mg[3]='I';mg[4]='S';mg[5]='K';mg[6]=0;
+                    volatile char zg[7]; zg[0]='Z';zg[1]='Y';zg[2]='G';zg[3]='I';zg[4]='S';zg[5]='K';zg[6]=0;
+                    volatile char ri[6]; ri[0]='R';ri[1]='I';ri[2]='R';ri[3]='U';ri[4]='_';ri[5]=0;
+                    volatile char ks[5]; ks[0]='K';ks[1]='S';ks[2]='U';ks[3]='_';ks[4]=0;
+                    if (strncmp(entry, (const char*)ld, 11) == 0) hide = true;
+                    else if (strncmp(entry, (const char*)mg, 6) == 0) hide = true;
+                    else if (strncmp(entry, (const char*)zg, 6) == 0) hide = true;
+                    else if (strncmp(entry, (const char*)ri, 5) == 0)  hide = true;
+                    else if (strncmp(entry, (const char*)ks, 4) == 0)   hide = true;
+                }
+                if (!hide) {
+                    syscall(SYS_write, mem_fd, entry, elen + 1);
+                }
+                start = i + 1;
+            }
+        }
+    }
+    syscall(SYS_close, real_fd);
+    syscall(SYS_lseek, mem_fd, 0, SEEK_SET);
+    return mem_fd;
+}
+
+static bool is_self_environ(const char *path) {
+    if (!path) return false;
+    if (strcmp(path, "/proc/self/environ") == 0) return true;
+    char buf[64];
+    int pid = (int)getpid();
+    snprintf(buf, sizeof(buf), "/proc/%d/environ", pid);
+    return strcmp(path, buf) == 0;
+}
+
 // Protection 12: tp_syscall_imp — libanort.so exports a raw SVC #0 wrapper that
 // bypasses ALL GOT hooks.  If libanogs.so imports it via GOT, this intercepts it.
 // Same filtering logic as hook_syscall_got.
@@ -376,6 +564,7 @@ static long hook_tp_syscall(long nr, long a0, long a1, long a2, long a3, long a4
         if (is_self_maps(path))     return (long)make_filtered_maps();
         if (is_self_status(path))   return (long)make_filtered_status(path);
         if (is_proc_net_unix(path)) return (long)make_filtered_unix(path);
+        if (is_self_environ(path))  return (long)make_filtered_environ();
     }
     if (nr == __NR_ioctl) {
         unsigned long req  = (unsigned long)a1;
@@ -409,6 +598,7 @@ static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a
         if (is_self_maps(path))     return (long)make_filtered_maps();
         if (is_self_status(path))   return (long)make_filtered_status(path);
         if (is_proc_net_unix(path)) return (long)make_filtered_unix(path);
+        if (is_self_environ(path))  return (long)make_filtered_environ();
     }
     // Direct SYS_ioctl — same filtering as hook_ioctl (a0=fd, a1=req, a2=arg)
     if (nr == __NR_ioctl) {
@@ -740,6 +930,18 @@ static const PatchEntry kAnogsEntries[] = {
     { "mincore",          reinterpret_cast<void *>(hook_mincore)         },
     // Protection 12: tp_syscall_imp raw syscall (if imported via GOT)
     { "tp_syscall_imp",   reinterpret_cast<void *>(hook_tp_syscall)      },
+    // Protection 14: readlinkat — /proc/self/fd enumeration
+    { "readlinkat",       reinterpret_cast<void *>(hook_readlinkat)      },
+    { "readlink",         reinterpret_cast<void *>(hook_readlink)        },
+    // Protection 15: access — root path probing
+    { "access",           reinterpret_cast<void *>(hook_access)          },
+    { "faccessat",        reinterpret_cast<void *>(hook_faccessat)       },
+    // Protection 16: stat — root path detection
+    { "stat",             reinterpret_cast<void *>(hook_stat)            },
+    { "lstat",            reinterpret_cast<void *>(hook_lstat)           },
+    { "fstatat",          reinterpret_cast<void *>(hook_fstatat)         },
+    // Protection 17: system property spoofing
+    { "__system_property_get", reinterpret_cast<void *>(hook_system_property_get) },
 };
 
 static const PatchEntry kAnortEntries[] = {
@@ -767,6 +969,15 @@ static const PatchEntry kAnortEntries[] = {
     { "tp_syscall_imp",   reinterpret_cast<void *>(hook_tp_syscall)      },
     { "unwind_xx_ioctl",  reinterpret_cast<void *>(hook_unwind_ioctl)    },
     { "unwind_xx_info_query", reinterpret_cast<void *>(hook_unwind_ioctl)},
+    // Protection 14-17: same as anogs
+    { "readlinkat",       reinterpret_cast<void *>(hook_readlinkat)      },
+    { "readlink",         reinterpret_cast<void *>(hook_readlink)        },
+    { "access",           reinterpret_cast<void *>(hook_access)          },
+    { "faccessat",        reinterpret_cast<void *>(hook_faccessat)       },
+    { "stat",             reinterpret_cast<void *>(hook_stat)            },
+    { "lstat",            reinterpret_cast<void *>(hook_lstat)           },
+    { "fstatat",          reinterpret_cast<void *>(hook_fstatat)         },
+    { "__system_property_get", reinterpret_cast<void *>(hook_system_property_get) },
 };
 
 // ── Module map hiding ─────────────────────────────────────────────────────────

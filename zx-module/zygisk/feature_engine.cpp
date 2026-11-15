@@ -26,6 +26,12 @@ extern uint32_t g_ano_ioctl_zeroed;
 extern uint32_t g_ano_ptrace_blocked;
 extern uint32_t g_ano_fork_blocked;
 extern uint32_t g_ano_dl_hidden;
+extern uint32_t g_ano_inotify_blocked;
+extern uint32_t g_ano_mincore_spoofed;
+extern uint32_t g_ano_readlink_filtered;
+extern uint32_t g_ano_access_filtered;
+extern uint32_t g_ano_stat_filtered;
+extern uint32_t g_ano_prop_spoofed;
 
 FeatureEngine &FeatureEngine::get() {
     static FeatureEngine instance;
@@ -1004,6 +1010,9 @@ static void *diagThread(void *) {
              g_ano_kill_blocked, g_ano_exit_blocked, g_ano_abort_blocked,
              g_ano_maps_filtered, g_ano_ioctl_zeroed, g_ano_ptrace_blocked,
              g_ano_fork_blocked, g_ano_dl_hidden);
+        LOGI("║ [ANOSDK] inotify=%u mincore=%u readlink=%u access=%u stat=%u prop=%u",
+             g_ano_inotify_blocked, g_ano_mincore_spoofed, g_ano_readlink_filtered,
+             g_ano_access_filtered, g_ano_stat_filtered, g_ano_prop_spoofed);
 
         // Problems detection
         if (s_esp && s_diag_outline_vis == 0)
