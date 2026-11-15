@@ -203,10 +203,16 @@ static bool is_self_maps(const char *path) {
 static bool is_self_status(const char *path) {
     if (!path) return false;
     if (strcmp(path, "/proc/self/status") == 0) return true;
+    if (strcmp(path, "/proc/self/wchan") == 0)  return true;
     char buf[64];
     int pid = (int)getpid();
     snprintf(buf, sizeof(buf), "/proc/%d/status", pid);
-    return strcmp(path, buf) == 0;
+    if (strcmp(path, buf) == 0) return true;
+    // Per-task status — AnoSDK reads /proc/self/task/<tid>/status for TracerPid
+    snprintf(buf, sizeof(buf), "/proc/%d/task/", pid);
+    if (strncmp(path, buf, strlen(buf)) == 0 && strstr(path, "/status")) return true;
+    if (strncmp(path, "/proc/self/task/", 16) == 0 && strstr(path, "/status")) return true;
+    return false;
 }
 
 static bool is_proc_net_unix(const char *path) {
@@ -862,6 +868,64 @@ static int hook_statfs(const char *path, struct statfs *buf) {
     return ::statfs(path, buf);
 }
 
+// Protection 26: dlsym — AnoSDK resolves symbol addresses via dlsym() and
+// compares them against its own GOT entries to detect GOT hooking.  Return our
+// hook addresses for hooked symbols so the comparison passes.
+static void *hook_dlsym(void *handle, const char *name) {
+    if (name) {
+        struct M { const char *s; void *h; };
+        static const M kMap[] = {
+            {"open",             (void*)hook_open},
+            {"__open_2",         (void*)hook_open2},
+            {"openat",           (void*)hook_openat2},
+            {"__openat_2",       (void*)hook_openat2},
+            {"fopen",            (void*)hook_fopen},
+            {"popen",            (void*)hook_popen},
+            {"syscall",          (void*)hook_syscall_got},
+            {"ptrace",           (void*)hook_ptrace},
+            {"fork",             (void*)hook_fork},
+            {"dl_iterate_phdr",  (void*)hook_dl_iterate_phdr},
+            {"ioctl",            (void*)hook_ioctl},
+            {"access",           (void*)hook_access},
+            {"faccessat",        (void*)hook_faccessat},
+            {"stat",             (void*)hook_stat},
+            {"lstat",            (void*)hook_lstat},
+            {"fstat",            (void*)hook_fstat},
+            {"fstatat",          (void*)hook_fstatat},
+            {"readlink",         (void*)hook_readlink},
+            {"readlinkat",       (void*)hook_readlinkat},
+            {"getenv",           (void*)hook_getenv},
+            {"opendir",          (void*)hook_opendir},
+            {"readdir",          (void*)hook_readdir},
+            {"dladdr",           (void*)hook_dladdr},
+            {"prctl",            (void*)hook_prctl},
+            {"mincore",          (void*)hook_mincore},
+            {"kill",             (void*)hook_kill},
+            {"inotify_init",     (void*)hook_inotify_init},
+            {"__system_property_get", (void*)hook_system_property_get},
+        };
+        for (const auto &e : kMap) {
+            if (strcmp(name, e.s) == 0) return e.h;
+        }
+    }
+    return ::dlsym(handle, name);
+}
+
+// Protection 27: dlopen — AnoSDK may try to dlopen libraries by name to scan
+// them.  Block opening our module or root-related paths.
+static void *hook_dlopen(const char *filename, int flags) {
+    if (filename) {
+        char h1[16], h2[16], h3[16];
+        ObfStr::mod_id(h1); ObfStr::mod_dash(h2); ObfStr::arm_so(h3);
+        if (strstr(filename, h1) || strstr(filename, h2) || strstr(filename, h3)
+            || is_root_path(filename)) {
+            errno = ENOENT;
+            return nullptr;
+        }
+    }
+    return ::dlopen(filename, flags);
+}
+
 // ── GOT patching infrastructure ───────────────────────────────────────────────
 
 struct PatchEntry {
@@ -1137,6 +1201,10 @@ static const PatchEntry kAnogsEntries[] = {
     { "prctl",            reinterpret_cast<void *>(hook_prctl)             },
     // Protection 25: statfs — filesystem type probing
     { "statfs",           reinterpret_cast<void *>(hook_statfs)            },
+    // Protection 26: dlsym — GOT integrity check defense
+    { "dlsym",            reinterpret_cast<void *>(hook_dlsym)             },
+    // Protection 27: dlopen — prevent module/root library loading
+    { "dlopen",           reinterpret_cast<void *>(hook_dlopen)            },
 };
 
 static const PatchEntry kAnortEntries[] = {
@@ -1186,6 +1254,10 @@ static const PatchEntry kAnortEntries[] = {
     { "pread",            reinterpret_cast<void *>(hook_pread)             },
     // Protection 24: prctl — thread/VMA name detection
     { "prctl",            reinterpret_cast<void *>(hook_prctl)             },
+    // Protection 26: dlsym — GOT integrity check defense
+    { "dlsym",            reinterpret_cast<void *>(hook_dlsym)             },
+    // Protection 27: dlopen — prevent module/root library loading
+    { "dlopen",           reinterpret_cast<void *>(hook_dlopen)            },
 };
 
 // ── Module map hiding ─────────────────────────────────────────────────────────
