@@ -39,6 +39,8 @@
 #include <sys/types.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <sys/vfs.h>
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA              0x53564d41
@@ -231,7 +233,12 @@ uint32_t g_ano_dl_hidden      = 0;
 static bool is_root_path(const char *p);
 static bool is_self_environ(const char *path);
 static int  make_filtered_environ();
+static bool is_root_dir_entry(const char *name);
 extern uint32_t g_ano_access_filtered;
+extern uint32_t g_ano_getenv_filtered;
+extern uint32_t g_ano_readdir_filtered;
+extern uint32_t g_ano_dladdr_spoofed;
+extern uint32_t g_ano_fstat_filtered;
 
 //── GOT hook functions ────────────────────────────────────────────────────────
 // These replace GOT entries in libanogs.so and libanort.so.
@@ -680,6 +687,181 @@ static int hook_dl_iterate_phdr(
     return ::dl_iterate_phdr(dl_hide_trampoline, &ctx);
 }
 
+// Protection 19: getenv — AnoSDK calls getenv() directly to read LD_PRELOAD,
+// MAGISK_*, ZYGISK_*, RIRU_*, KSU_ environment variables.  This bypasses our
+// /proc/self/environ filter.  Return NULL for all root-indicating env vars.
+uint32_t g_ano_getenv_filtered = 0;
+static char *hook_getenv(const char *name) {
+    if (!name) return ::getenv(name);
+    volatile char ld[11]; ld[0]='L';ld[1]='D';ld[2]='_';ld[3]='P';ld[4]='R';ld[5]='E';ld[6]='L';ld[7]='O';ld[8]='A';ld[9]='D';ld[10]=0;
+    volatile char ldl[16]; ldl[0]='L';ldl[1]='D';ldl[2]='_';ldl[3]='L';ldl[4]='I';ldl[5]='B';ldl[6]='R';ldl[7]='A';ldl[8]='R';ldl[9]='Y';ldl[10]='_';ldl[11]='P';ldl[12]='A';ldl[13]='T';ldl[14]='H';ldl[15]=0;
+    volatile char mg[8]; mg[0]='M';mg[1]='A';mg[2]='G';mg[3]='I';mg[4]='S';mg[5]='K';mg[6]='_';mg[7]=0;
+    volatile char zg[8]; zg[0]='Z';zg[1]='Y';zg[2]='G';zg[3]='I';zg[4]='S';zg[5]='K';zg[6]='_';zg[7]=0;
+    volatile char ri[6]; ri[0]='R';ri[1]='I';ri[2]='R';ri[3]='U';ri[4]='_';ri[5]=0;
+    volatile char ks[5]; ks[0]='K';ks[1]='S';ks[2]='U';ks[3]='_';ks[4]=0;
+    if (strcmp(name, (const char*)ld) == 0)             { ++g_ano_getenv_filtered; return nullptr; }
+    if (strcmp(name, (const char*)ldl) == 0)            { ++g_ano_getenv_filtered; return nullptr; }
+    if (strncmp(name, (const char*)mg, 7) == 0)        { ++g_ano_getenv_filtered; return nullptr; }
+    if (strncmp(name, (const char*)zg, 7) == 0)        { ++g_ano_getenv_filtered; return nullptr; }
+    if (strncmp(name, (const char*)ri, 5) == 0)        { ++g_ano_getenv_filtered; return nullptr; }
+    if (strncmp(name, (const char*)ks, 4) == 0)        { ++g_ano_getenv_filtered; return nullptr; }
+    if (is_root_path(name))                            { ++g_ano_getenv_filtered; return nullptr; }
+    return ::getenv(name);
+}
+
+// Protection 20: opendir + readdir — AnoSDK enumerates /data/adb/, /sbin/, etc.
+// to discover Magisk/root files via directory listing.
+uint32_t g_ano_readdir_filtered = 0;
+static bool is_root_dir_entry(const char *name) {
+    if (!name) return false;
+    struct D {
+        static void s0(char *b)  { volatile char *v=(volatile char*)b; v[0]='s';v[1]='u';v[2]=0; }
+        static void s1(char *b)  { volatile char *v=(volatile char*)b; v[0]='m';v[1]='a';v[2]='g';v[3]='i';v[4]='s';v[5]='k';v[6]=0; }
+        static void s2(char *b)  { volatile char *v=(volatile char*)b; v[0]='.';v[1]='m';v[2]='a';v[3]='g';v[4]='i';v[5]='s';v[6]='k';v[7]=0; }
+        static void s3(char *b)  { volatile char *v=(volatile char*)b; v[0]='b';v[1]='u';v[2]='s';v[3]='y';v[4]='b';v[5]='o';v[6]='x';v[7]=0; }
+        static void s4(char *b)  { volatile char *v=(volatile char*)b; v[0]='s';v[1]='u';v[2]='p';v[3]='e';v[4]='r';v[5]='s';v[6]='u';v[7]=0; }
+        static void s5(char *b)  { volatile char *v=(volatile char*)b; v[0]='z';v[1]='y';v[2]='g';v[3]='i';v[4]='s';v[5]='k';v[6]=0; }
+        static void s6(char *b)  { volatile char *v=(volatile char*)b; v[0]='r';v[1]='i';v[2]='r';v[3]='u';v[4]=0; }
+        static void s7(char *b)  { volatile char *v=(volatile char*)b; v[0]='x';v[1]='p';v[2]='o';v[3]='s';v[4]='e';v[5]='d';v[6]=0; }
+        static void s8(char *b)  { volatile char *v=(volatile char*)b; v[0]='k';v[1]='e';v[2]='r';v[3]='n';v[4]='e';v[5]='l';v[6]='s';v[7]='u';v[8]=0; }
+        static void s9(char *b)  { volatile char *v=(volatile char*)b; v[0]='a';v[1]='p';v[2]='a';v[3]='t';v[4]='c';v[5]='h';v[6]=0; }
+        static void s10(char *b) { volatile char *v=(volatile char*)b; v[0]='d';v[1]='a';v[2]='e';v[3]='m';v[4]='o';v[5]='n';v[6]='s';v[7]='u';v[8]=0; }
+    };
+    char t[16];
+    D::s0(t);  if (strcmp(name, t) == 0) return true;
+    D::s1(t);  if (strstr(name, t)) return true;
+    D::s2(t);  if (strcmp(name, t) == 0) return true;
+    D::s3(t);  if (strstr(name, t)) return true;
+    D::s4(t);  if (strstr(name, t)) return true;
+    D::s5(t);  if (strstr(name, t)) return true;
+    D::s6(t);  if (strstr(name, t)) return true;
+    D::s7(t);  if (strstr(name, t)) return true;
+    D::s8(t);  if (strstr(name, t)) return true;
+    D::s9(t);  if (strstr(name, t)) return true;
+    D::s10(t); if (strstr(name, t)) return true;
+    char h1[16];
+    ObfStr::mod_id(h1);
+    if (strstr(name, h1)) return true;
+    return false;
+}
+static DIR *hook_opendir(const char *name) {
+    if (name && is_root_path(name)) {
+        ++g_ano_readdir_filtered;
+        errno = ENOENT;
+        return nullptr;
+    }
+    return ::opendir(name);
+}
+static struct dirent *hook_readdir(DIR *dirp) {
+    struct dirent *entry;
+    for (;;) {
+        entry = ::readdir(dirp);
+        if (!entry) return nullptr;
+        const char *n = entry->d_name;
+        if (n[0] == '.' && (n[1] == '\0' || (n[1] == '.' && n[2] == '\0')))
+            return entry;
+        if (is_root_dir_entry(n)) { ++g_ano_readdir_filtered; continue; }
+        return entry;
+    }
+}
+
+// Protection 21: dladdr — AnoSDK reverse-lookups function pointers via dladdr()
+// to discover injected .so files.  If the result's dli_fname contains our module
+// name, return 0 (address not found) to hide the module's presence.
+uint32_t g_ano_dladdr_spoofed = 0;
+static int hook_dladdr(const void *addr, Dl_info *info) {
+    int r = ::dladdr(addr, info);
+    if (r && info && info->dli_fname) {
+        char h1[16], h2[16], h3[16];
+        ObfStr::mod_id(h1); ObfStr::mod_dash(h2); ObfStr::arm_so(h3);
+        if (strstr(info->dli_fname, h1) || strstr(info->dli_fname, h2) || strstr(info->dli_fname, h3)) {
+            ++g_ano_dladdr_spoofed;
+            __builtin_memset(info, 0, sizeof(Dl_info));
+            return 0;
+        }
+        if (is_root_path(info->dli_fname)) {
+            ++g_ano_dladdr_spoofed;
+            __builtin_memset(info, 0, sizeof(Dl_info));
+            return 0;
+        }
+    }
+    return r;
+}
+
+// Protection 22: fstat — AnoSDK may stat open file descriptors to detect injected
+// .so files by inode/device.  Check via /proc/self/fd/<fd> readlink target.
+uint32_t g_ano_fstat_filtered = 0;
+static int hook_fstat(int fd, struct stat *st) {
+    char link_path[64], target[512];
+    snprintf(link_path, sizeof(link_path), "/proc/self/fd/%d", fd);
+    ssize_t len = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD, link_path, target, sizeof(target) - 1);
+    if (len > 0) {
+        target[len] = '\0';
+        char h1[16], h2[16], h3[16];
+        ObfStr::mod_id(h1); ObfStr::mod_dash(h2); ObfStr::arm_so(h3);
+        if (strstr(target, h1) || strstr(target, h2) || strstr(target, h3) || is_root_path(target)) {
+            ++g_ano_fstat_filtered;
+            errno = EBADF;
+            return -1;
+        }
+    }
+    return ::fstat(fd, st);
+}
+
+// Protection 23: pread — libanort.so uses pread() to read file content by fd.
+// If the fd points to /proc/self/maps or /proc/self/environ, serve filtered content.
+static ssize_t hook_pread(int fd, void *buf, size_t count, off_t offset) {
+    char link_path[64], target[256];
+    snprintf(link_path, sizeof(link_path), "/proc/self/fd/%d", fd);
+    ssize_t len = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD, link_path, target, sizeof(target) - 1);
+    if (len > 0) {
+        target[len] = '\0';
+        if (is_self_maps(target)) {
+            int ffd = make_filtered_maps();
+            if (ffd >= 0) {
+                ssize_t r = ::pread(ffd, buf, count, offset);
+                ::close(ffd);
+                return r;
+            }
+        }
+        if (is_self_environ(target)) {
+            int ffd = make_filtered_environ();
+            if (ffd >= 0) {
+                ssize_t r = ::pread(ffd, buf, count, offset);
+                ::close(ffd);
+                return r;
+            }
+        }
+    }
+    return ::pread(fd, buf, count, offset);
+}
+
+// Protection 24: prctl — intercept PR_GET_NAME to prevent thread name detection.
+// AnoSDK can call prctl(PR_GET_NAME) on suspicious threads.  Also intercept
+// PR_SET_VMA_ANON_NAME to sanitize VMA naming that could reveal our module.
+static int hook_prctl(int option, unsigned long a2, unsigned long a3,
+                      unsigned long a4, unsigned long a5) {
+    if (option == PR_SET_VMA && a2 == PR_SET_VMA_ANON_NAME && a3 != 0) {
+        const char *vma_name = (const char *)a4;
+        if (vma_name) {
+            char h1[16];
+            ObfStr::mod_id(h1);
+            if (strstr(vma_name, h1) || is_root_path(vma_name))
+                return ::prctl(option, a2, a3, (unsigned long)"", a5);
+        }
+    }
+    return ::prctl(option, a2, a3, a4, a5);
+}
+
+// Protection 25: statfs — AnoSDK checks filesystem type of root-related paths.
+static int hook_statfs(const char *path, struct statfs *buf) {
+    if (path && is_root_path(path)) {
+        errno = ENOENT;
+        return -1;
+    }
+    return ::statfs(path, buf);
+}
+
 // ── GOT patching infrastructure ───────────────────────────────────────────────
 
 struct PatchEntry {
@@ -942,6 +1124,19 @@ static const PatchEntry kAnogsEntries[] = {
     { "fstatat",          reinterpret_cast<void *>(hook_fstatat)         },
     // Protection 17: system property spoofing
     { "__system_property_get", reinterpret_cast<void *>(hook_system_property_get) },
+    // Protection 19: getenv — direct env var reads
+    { "getenv",           reinterpret_cast<void *>(hook_getenv)            },
+    // Protection 20: opendir/readdir — directory enumeration
+    { "opendir",          reinterpret_cast<void *>(hook_opendir)           },
+    { "readdir",          reinterpret_cast<void *>(hook_readdir)           },
+    // Protection 21: dladdr — reverse function pointer lookup
+    { "dladdr",           reinterpret_cast<void *>(hook_dladdr)            },
+    // Protection 22: fstat — fd stat detection
+    { "fstat",            reinterpret_cast<void *>(hook_fstat)             },
+    // Protection 24: prctl — thread/VMA name detection
+    { "prctl",            reinterpret_cast<void *>(hook_prctl)             },
+    // Protection 25: statfs — filesystem type probing
+    { "statfs",           reinterpret_cast<void *>(hook_statfs)            },
 };
 
 static const PatchEntry kAnortEntries[] = {
@@ -978,6 +1173,19 @@ static const PatchEntry kAnortEntries[] = {
     { "lstat",            reinterpret_cast<void *>(hook_lstat)           },
     { "fstatat",          reinterpret_cast<void *>(hook_fstatat)         },
     { "__system_property_get", reinterpret_cast<void *>(hook_system_property_get) },
+    // Protection 19: getenv — direct env var reads
+    { "getenv",           reinterpret_cast<void *>(hook_getenv)            },
+    // Protection 20: opendir/readdir — directory enumeration
+    { "opendir",          reinterpret_cast<void *>(hook_opendir)           },
+    { "readdir",          reinterpret_cast<void *>(hook_readdir)           },
+    // Protection 21: dladdr — reverse function pointer lookup
+    { "dladdr",           reinterpret_cast<void *>(hook_dladdr)            },
+    // Protection 22: fstat — fd stat detection
+    { "fstat",            reinterpret_cast<void *>(hook_fstat)             },
+    // Protection 23: pread — direct fd read bypass
+    { "pread",            reinterpret_cast<void *>(hook_pread)             },
+    // Protection 24: prctl — thread/VMA name detection
+    { "prctl",            reinterpret_cast<void *>(hook_prctl)             },
 };
 
 // ── Module map hiding ─────────────────────────────────────────────────────────

@@ -32,6 +32,10 @@ extern uint32_t g_ano_readlink_filtered;
 extern uint32_t g_ano_access_filtered;
 extern uint32_t g_ano_stat_filtered;
 extern uint32_t g_ano_prop_spoofed;
+extern uint32_t g_ano_getenv_filtered;
+extern uint32_t g_ano_readdir_filtered;
+extern uint32_t g_ano_dladdr_spoofed;
+extern uint32_t g_ano_fstat_filtered;
 
 FeatureEngine &FeatureEngine::get() {
     static FeatureEngine instance;
@@ -1013,6 +1017,9 @@ static void *diagThread(void *) {
         LOGI("║ [ANOSDK] inotify=%u mincore=%u readlink=%u access=%u stat=%u prop=%u",
              g_ano_inotify_blocked, g_ano_mincore_spoofed, g_ano_readlink_filtered,
              g_ano_access_filtered, g_ano_stat_filtered, g_ano_prop_spoofed);
+        LOGI("║ [ANOSDK] getenv=%u readdir=%u dladdr=%u fstat=%u",
+             g_ano_getenv_filtered, g_ano_readdir_filtered,
+             g_ano_dladdr_spoofed, g_ano_fstat_filtered);
 
         // Problems detection
         if (s_esp && s_diag_outline_vis == 0)
