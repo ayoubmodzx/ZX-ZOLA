@@ -38,8 +38,12 @@ extern uint32_t g_ano_dladdr_spoofed;
 extern uint32_t g_ano_fstat_filtered;
 extern uint32_t g_ano_read_filtered;
 extern uint32_t g_ano_svc_trapped;
+extern uint32_t g_ano_mount_filtered;
 extern uint32_t g_ano_mmap_filtered;
 extern uint32_t g_ano_fgets_filtered;
+
+extern char s_diag_paths[][128];
+extern int  s_diag_path_count;
 
 FeatureEngine &FeatureEngine::get() {
     static FeatureEngine instance;
@@ -1082,8 +1086,13 @@ static void *diagThread(void *) {
              g_ano_getenv_filtered, g_ano_readdir_filtered,
              g_ano_dladdr_spoofed, g_ano_fstat_filtered,
              g_ano_read_filtered, g_ano_mmap_filtered, g_ano_fgets_filtered);
-        LOGI("║ [SECCOMP] svc_trapped=%u (raw SVC intercepted from AnoSDK text)",
-             g_ano_svc_trapped);
+        LOGI("║ [SECCOMP] svc_trapped=%u mount_filtered=%u",
+             g_ano_svc_trapped, g_ano_mount_filtered);
+        if (s_diag_path_count > 0) {
+            LOGI("║ [SVC-DIAG] %d unfiltered openat paths from raw SVC:", s_diag_path_count);
+            for (int i = 0; i < s_diag_path_count && i < 32; i++)
+                LOGI("║   [%d] %s", i, s_diag_paths[i]);
+        }
 
         // Problems detection
         if (s_esp && s_diag_outline_vis == 0)

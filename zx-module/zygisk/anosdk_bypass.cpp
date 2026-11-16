@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.51 — GOT + trampoline seccomp (no IP-range dep), 35 protections
+// AnoSDK bypass v2.52 — GOT + trampoline seccomp, 35 protections + mountinfo/status/diag fixes
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -148,8 +148,8 @@ static inline long safe_syscall(long nr, long a0=0, long a1=0, long a2=0,
 // all lines referencing our module.  All reads use raw syscalls so this function
 // itself never recurses through any patched GOT slot.
 
-static int make_filtered_maps() {
-    int real_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)"/proc/self/maps", (long)O_RDONLY, 0L);
+static int make_filtered_maps(const char *proc_path = "/proc/self/maps") {
+    int real_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)proc_path, (long)O_RDONLY, 0L);
     if (real_fd < 0) return -1;
 
     int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
@@ -220,8 +220,9 @@ static int make_filtered_unix(const char *real_path) {
     return mem_fd;
 }
 
-// Build a filtered /proc/self/status that hides TracerPid (debugger detection).
-// Zygisk injection leaves TracerPid != 0 in the process status — AnoSDK reads this.
+// Build a filtered /proc/self/status that hides TracerPid, Seccomp, NoNewPrivs.
+// AnoSDK reads TracerPid for debugger check, and Seccomp:/NoNewPrivs: to detect
+// seccomp filters — if those reveal a filter, it flags the process as tampered.
 static int make_filtered_status(const char *real_path) {
     int real_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)real_path, (long)O_RDONLY, 0L);
     if (real_fd < 0) return -1;
@@ -239,6 +240,15 @@ static int make_filtered_status(const char *real_path) {
                 line[llen] = '\0';
                 if (strncmp(line, "TracerPid:", 10) == 0) {
                     const char *zeroed = "TracerPid:\t0\n";
+                    syscall(SYS_write, mem_fd, zeroed, __builtin_strlen(zeroed));
+                } else if (strncmp(line, "Seccomp:", 8) == 0) {
+                    const char *zeroed = "Seccomp:\t0\n";
+                    syscall(SYS_write, mem_fd, zeroed, __builtin_strlen(zeroed));
+                } else if (strncmp(line, "Seccomp_filters:", 16) == 0) {
+                    const char *zeroed = "Seccomp_filters:\t0\n";
+                    syscall(SYS_write, mem_fd, zeroed, __builtin_strlen(zeroed));
+                } else if (strncmp(line, "NoNewPrivs:", 11) == 0) {
+                    const char *zeroed = "NoNewPrivs:\t0\n";
                     syscall(SYS_write, mem_fd, zeroed, __builtin_strlen(zeroed));
                 } else {
                     syscall(SYS_write, mem_fd, line, (size_t)llen);
@@ -258,17 +268,63 @@ static bool is_self_maps(const char *path) {
     if (strcmp(path, "/proc/self/maps")  == 0) return true;
     if (strcmp(path, "/proc/self/smaps") == 0) return true;
     if (strcmp(path, "/proc/self/smaps_rollup") == 0) return true;
-    if (strcmp(path, "/proc/self/mountinfo") == 0) return true;
-    if (strcmp(path, "/proc/self/map_files") == 0) return true;
     char buf[64];
     int pid = (int)getpid();
     snprintf(buf, sizeof(buf), "/proc/%d/maps",  pid); if (strcmp(path, buf) == 0) return true;
     snprintf(buf, sizeof(buf), "/proc/%d/smaps", pid); if (strcmp(path, buf) == 0) return true;
-    snprintf(buf, sizeof(buf), "/proc/%d/mountinfo", pid); if (strcmp(path, buf) == 0) return true;
-    // Per-thread maps (AnoSDK may scan each thread's maps separately)
     snprintf(buf, sizeof(buf), "/proc/%d/task/",  pid);
-    if (path && strncmp(path, buf, strlen(buf)) == 0 && strstr(path, "/maps")) return true;
+    if (strncmp(path, buf, strlen(buf)) == 0 && strstr(path, "/maps")) return true;
+    if (strncmp(path, "/proc/self/task/", 16) == 0 && strstr(path, "/maps")) return true;
     return false;
+}
+
+static bool is_self_mountinfo(const char *path) {
+    if (!path) return false;
+    if (strcmp(path, "/proc/self/mountinfo") == 0) return true;
+    if (strcmp(path, "/proc/self/mounts") == 0) return true;
+    if (strcmp(path, "/proc/mounts") == 0) return true;
+    char buf[64];
+    int pid = (int)getpid();
+    snprintf(buf, sizeof(buf), "/proc/%d/mountinfo", pid); if (strcmp(path, buf) == 0) return true;
+    snprintf(buf, sizeof(buf), "/proc/%d/mounts", pid); if (strcmp(path, buf) == 0) return true;
+    return false;
+}
+
+static int make_filtered_mountinfo(const char *real_path) {
+    int real_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)real_path, (long)O_RDONLY, 0L);
+    if (real_fd < 0) return -1;
+    int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
+    if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
+    char f1[16], f2[16], f3[16];
+    ObfStr::mod_id(f1); ObfStr::mod_dash(f2); ObfStr::mod_pkg(f3);
+    char buf[4096], line[1024];
+    int llen = 0;
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, real_fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            char c = buf[i];
+            if (llen < (int)sizeof(line) - 1) line[llen++] = c;
+            if (c == '\n' || llen >= (int)sizeof(line) - 1) {
+                line[llen] = '\0';
+                bool hide = strstr(line, f1) || strstr(line, f2) || strstr(line, f3)
+                         || strstr(line, "magisk") || strstr(line, "Magisk")
+                         || strstr(line, "/sbin/.magisk") || strstr(line, "KSU")
+                         || strstr(line, "kernelsu") || strstr(line, "tmpfs /system/")
+                         || strstr(line, "tmpfs /vendor/") || strstr(line, "tmpfs /product/");
+                if (!hide) syscall(SYS_write, mem_fd, line, (size_t)llen);
+                llen = 0;
+            }
+        }
+    }
+    if (llen > 0) {
+        line[llen] = '\0';
+        if (!strstr(line, f1) && !strstr(line, f2) && !strstr(line, "magisk"))
+            syscall(SYS_write, mem_fd, line, (size_t)llen);
+    }
+    syscall(SYS_close, real_fd);
+    syscall(SYS_lseek, mem_fd, 0, SEEK_SET);
+    return mem_fd;
 }
 
 static bool is_self_status(const char *path) {
@@ -306,6 +362,23 @@ uint32_t g_ano_ptrace_blocked = 0;
 uint32_t g_ano_fork_blocked   = 0;
 uint32_t g_ano_dl_hidden      = 0;
 uint32_t g_ano_svc_trapped    = 0;
+uint32_t g_ano_mount_filtered = 0;
+
+// SVC path diagnostic: log first 32 unique unfiltered openat paths from SIGSYS
+static constexpr int kMaxDiagPaths = 32;
+static char s_diag_paths[kMaxDiagPaths][128];
+static int  s_diag_path_count = 0;
+
+static void diag_log_svc_path(const char *path) {
+    if (!path || s_diag_path_count >= kMaxDiagPaths) return;
+    for (int i = 0; i < s_diag_path_count; i++)
+        if (strcmp(s_diag_paths[i], path) == 0) return;
+    size_t len = __builtin_strlen(path);
+    if (len >= sizeof(s_diag_paths[0])) len = sizeof(s_diag_paths[0]) - 1;
+    __builtin_memcpy(s_diag_paths[s_diag_path_count], path, len);
+    s_diag_paths[s_diag_path_count][len] = '\0';
+    s_diag_path_count++;
+}
 
 // Forward declarations for protections defined later in this file
 static bool is_root_path(const char *p);
@@ -351,35 +424,42 @@ static bool is_task_comm(const char *path) {
 }
 
 static int hook_open(const char *path, int flags, mode_t mode) {
-    if (is_self_maps(path))     { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
-    if (is_self_status(path))   { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
-    if (is_proc_net_unix(path)) { ++g_ano_maps_filtered; int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
-    if (is_self_environ(path))  { ++g_ano_maps_filtered; int fd = make_filtered_environ();        if (fd >= 0) return fd; }
-    if (is_root_path(path))     { ++g_ano_access_filtered; errno = ENOENT; return -1; }
+    if (is_self_maps(path))      { ++g_ano_maps_filtered;  int fd = make_filtered_maps(path);        if (fd >= 0) return fd; }
+    if (is_self_mountinfo(path)) { ++g_ano_mount_filtered; int fd = make_filtered_mountinfo(path);   if (fd >= 0) return fd; }
+    if (is_self_status(path))    { ++g_ano_maps_filtered;  int fd = make_filtered_status(path);      if (fd >= 0) return fd; }
+    if (is_proc_net_unix(path))  { ++g_ano_maps_filtered;  int fd = make_filtered_unix(path);        if (fd >= 0) return fd; }
+    if (is_self_environ(path))   { ++g_ano_maps_filtered;  int fd = make_filtered_environ();         if (fd >= 0) return fd; }
+    if (is_root_path(path))      { ++g_ano_access_filtered; errno = ENOENT; return -1; }
     return ::open(path, flags, mode);
 }
 
 static int hook_open2(const char *path, int flags) {
-    if (is_self_maps(path))     { ++g_ano_maps_filtered; int fd = make_filtered_maps();           if (fd >= 0) return fd; }
-    if (is_self_status(path))   { ++g_ano_maps_filtered; int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
-    if (is_proc_net_unix(path)) { ++g_ano_maps_filtered; int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
-    if (is_self_environ(path))  { ++g_ano_maps_filtered; int fd = make_filtered_environ();        if (fd >= 0) return fd; }
-    if (is_root_path(path))     { ++g_ano_access_filtered; errno = ENOENT; return -1; }
+    if (is_self_maps(path))      { ++g_ano_maps_filtered;  int fd = make_filtered_maps(path);        if (fd >= 0) return fd; }
+    if (is_self_mountinfo(path)) { ++g_ano_mount_filtered; int fd = make_filtered_mountinfo(path);   if (fd >= 0) return fd; }
+    if (is_self_status(path))    { ++g_ano_maps_filtered;  int fd = make_filtered_status(path);      if (fd >= 0) return fd; }
+    if (is_proc_net_unix(path))  { ++g_ano_maps_filtered;  int fd = make_filtered_unix(path);        if (fd >= 0) return fd; }
+    if (is_self_environ(path))   { ++g_ano_maps_filtered;  int fd = make_filtered_environ();         if (fd >= 0) return fd; }
+    if (is_root_path(path))      { ++g_ano_access_filtered; errno = ENOENT; return -1; }
     return ::open(path, flags);
 }
 
 static int hook_openat2(int dirfd, const char *path, int flags) {
-    if (is_self_maps(path))     { int fd = make_filtered_maps();           if (fd >= 0) return fd; }
-    if (is_self_status(path))   { int fd = make_filtered_status(path);     if (fd >= 0) return fd; }
-    if (is_proc_net_unix(path)) { int fd = make_filtered_unix(path);       if (fd >= 0) return fd; }
-    if (is_self_environ(path))  { int fd = make_filtered_environ();        if (fd >= 0) return fd; }
-    if (is_root_path(path))     { ++g_ano_access_filtered; errno = ENOENT; return -1; }
+    if (is_self_maps(path))      { int fd = make_filtered_maps(path);        if (fd >= 0) return fd; }
+    if (is_self_mountinfo(path)) { int fd = make_filtered_mountinfo(path);   if (fd >= 0) return fd; }
+    if (is_self_status(path))    { int fd = make_filtered_status(path);      if (fd >= 0) return fd; }
+    if (is_proc_net_unix(path))  { int fd = make_filtered_unix(path);        if (fd >= 0) return fd; }
+    if (is_self_environ(path))   { int fd = make_filtered_environ();         if (fd >= 0) return fd; }
+    if (is_root_path(path))      { ++g_ano_access_filtered; errno = ENOENT; return -1; }
     return ::openat(dirfd, path, flags);
 }
 
 static FILE *hook_fopen(const char *path, const char *mode) {
     if (is_self_maps(path)) {
-        int fd = make_filtered_maps();
+        int fd = make_filtered_maps(path);
+        if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
+    }
+    if (is_self_mountinfo(path)) {
+        int fd = make_filtered_mountinfo(path);
         if (fd >= 0) { FILE *f = ::fdopen(fd, "r"); if (f) return f; ::close(fd); }
     }
     if (is_self_status(path)) {
@@ -659,10 +739,11 @@ static bool is_self_environ(const char *path) {
 static long hook_tp_syscall(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
     if (nr == __NR_openat && a1 != 0) {
         const char *path = (const char *)a1;
-        if (is_self_maps(path))     return (long)make_filtered_maps();
-        if (is_self_status(path))   return (long)make_filtered_status(path);
-        if (is_proc_net_unix(path)) return (long)make_filtered_unix(path);
-        if (is_self_environ(path))  return (long)make_filtered_environ();
+        if (is_self_maps(path))      return (long)make_filtered_maps(path);
+        if (is_self_mountinfo(path)) return (long)make_filtered_mountinfo(path);
+        if (is_self_status(path))    return (long)make_filtered_status(path);
+        if (is_proc_net_unix(path))  return (long)make_filtered_unix(path);
+        if (is_self_environ(path))   return (long)make_filtered_environ();
     }
     if (nr == __NR_ioctl) {
         unsigned long req  = (unsigned long)a1;
@@ -693,10 +774,11 @@ static int hook_unwind_ioctl(int fd, unsigned long req, void *arg) {
 static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a4, long a5) {
     if (nr == __NR_openat && a1 != 0) {
         const char *path = (const char *)a1;
-        if (is_self_maps(path))     return (long)make_filtered_maps();
-        if (is_self_status(path))   return (long)make_filtered_status(path);
-        if (is_proc_net_unix(path)) return (long)make_filtered_unix(path);
-        if (is_self_environ(path))  return (long)make_filtered_environ();
+        if (is_self_maps(path))      return (long)make_filtered_maps(path);
+        if (is_self_mountinfo(path)) return (long)make_filtered_mountinfo(path);
+        if (is_self_status(path))    return (long)make_filtered_status(path);
+        if (is_proc_net_unix(path))  return (long)make_filtered_unix(path);
+        if (is_self_environ(path))   return (long)make_filtered_environ();
     }
     // Direct SYS_ioctl — same filtering as hook_ioctl (a0=fd, a1=req, a2=arg)
     if (nr == __NR_ioctl) {
@@ -908,7 +990,15 @@ static ssize_t hook_pread(int fd, void *buf, size_t count, off_t offset) {
     if (len > 0) {
         target[len] = '\0';
         if (is_self_maps(target)) {
-            int ffd = make_filtered_maps();
+            int ffd = make_filtered_maps(target);
+            if (ffd >= 0) {
+                ssize_t r = ::pread(ffd, buf, count, offset);
+                ::close(ffd);
+                return r;
+            }
+        }
+        if (is_self_mountinfo(target)) {
+            int ffd = make_filtered_mountinfo(target);
             if (ffd >= 0) {
                 ssize_t r = ::pread(ffd, buf, count, offset);
                 ::close(ffd);
@@ -1032,7 +1122,19 @@ static ssize_t hook_read(int fd, void *buf, size_t count) {
         char target[256];
         if (is_proc_fd(fd, target, sizeof(target))) {
             if (is_self_maps(target)) {
-                int ffd = make_filtered_maps();
+                int ffd = make_filtered_maps(target);
+                if (ffd >= 0) {
+                    off_t off = ::lseek(fd, 0, SEEK_CUR);
+                    if (off < 0) off = 0;
+                    ssize_t r = ::pread(ffd, buf, count, off);
+                    if (r > 0) ::lseek(fd, off + r, SEEK_SET);
+                    ::close(ffd);
+                    ++g_ano_read_filtered;
+                    return r >= 0 ? r : 0;
+                }
+            }
+            if (is_self_mountinfo(target)) {
+                int ffd = make_filtered_mountinfo(target);
                 if (ffd >= 0) {
                     off_t off = ::lseek(fd, 0, SEEK_CUR);
                     if (off < 0) off = 0;
@@ -1612,11 +1714,13 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx) {
         case __NR_openat: {
             if (a1) {
                 const char *path = (const char *)a1;
-                if (is_self_maps(path))     { ++g_ano_svc_trapped; result = (long)make_filtered_maps();       break; }
-                if (is_self_status(path))   { ++g_ano_svc_trapped; result = (long)make_filtered_status(path); break; }
-                if (is_proc_net_unix(path)) { ++g_ano_svc_trapped; result = (long)make_filtered_unix(path);   break; }
-                if (is_self_environ(path))  { ++g_ano_svc_trapped; result = (long)make_filtered_environ();    break; }
-                if (is_root_path(path))     { ++g_ano_svc_trapped; result = -ENOENT; break; }
+                if (is_self_maps(path))      { ++g_ano_svc_trapped; result = (long)make_filtered_maps(path);      break; }
+                if (is_self_mountinfo(path)) { ++g_ano_svc_trapped; result = (long)make_filtered_mountinfo(path); break; }
+                if (is_self_status(path))    { ++g_ano_svc_trapped; result = (long)make_filtered_status(path);    break; }
+                if (is_proc_net_unix(path))  { ++g_ano_svc_trapped; result = (long)make_filtered_unix(path);      break; }
+                if (is_self_environ(path))   { ++g_ano_svc_trapped; result = (long)make_filtered_environ();       break; }
+                if (is_root_path(path))      { ++g_ano_svc_trapped; result = -ENOENT; break; }
+                diag_log_svc_path(path);
             }
             result = safe_syscall(__NR_openat, a0, a1, a2, a3);
             break;
