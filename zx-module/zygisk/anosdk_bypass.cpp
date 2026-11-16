@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.41 — GOT patching, zero libc inline hooks, 34 protections
+// AnoSDK bypass v2.50 — GOT patching + seccomp SVC filter, 35 protections
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -41,6 +41,30 @@
 #include <unistd.h>
 #include <dirent.h>
 #include <sys/vfs.h>
+#include <sys/ucontext.h>
+#include <linux/filter.h>
+
+#ifndef __NR_seccomp
+#define __NR_seccomp 277
+#endif
+#ifndef SECCOMP_SET_MODE_FILTER
+#define SECCOMP_SET_MODE_FILTER 1
+#endif
+#ifndef SECCOMP_FILTER_FLAG_TSYNC
+#define SECCOMP_FILTER_FLAG_TSYNC (1UL << 0)
+#endif
+#ifndef SECCOMP_RET_TRAP
+#define SECCOMP_RET_TRAP  0x00030000U
+#endif
+#ifndef SECCOMP_RET_ALLOW
+#define SECCOMP_RET_ALLOW 0x7fff0000U
+#endif
+#ifndef AUDIT_ARCH_AARCH64
+#define AUDIT_ARCH_AARCH64 0xC00000B7U
+#endif
+#ifndef SYS_SECCOMP
+#define SYS_SECCOMP 1
+#endif
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA              0x53564d41
@@ -234,6 +258,7 @@ uint32_t g_ano_ioctl_zeroed   = 0;
 uint32_t g_ano_ptrace_blocked = 0;
 uint32_t g_ano_fork_blocked   = 0;
 uint32_t g_ano_dl_hidden      = 0;
+uint32_t g_ano_svc_trapped    = 0;
 
 // Forward declarations for protections defined later in this file
 static bool is_root_path(const char *p);
@@ -1091,8 +1116,13 @@ static unsigned long hook_getauxval(unsigned long type) {
 // report SIG_DFL so the handler address is never exposed.
 static int hook_sigaction(int sig, const struct sigaction *act,
                           struct sigaction *oldact) {
+    // Block AnoSDK from overriding our SIGSYS handler (seccomp SVC filter)
+    if (sig == SIGSYS && act != nullptr)
+        return 0;
+
     int r = ::sigaction(sig, act, oldact);
-    if (r == 0 && oldact && !act && (sig == SIGABRT || sig == SIGTERM)) {
+    if (r == 0 && oldact && !act &&
+        (sig == SIGABRT || sig == SIGTERM || sig == SIGSYS)) {
         if (oldact->sa_handler != SIG_DFL && oldact->sa_handler != SIG_IGN) {
             oldact->sa_handler = SIG_DFL;
             sigemptyset(&oldact->sa_mask);
@@ -1503,6 +1533,192 @@ static const PatchEntry kAnortEntries[] = {
     { "clock_gettime",    reinterpret_cast<void *>(hook_clock_gettime)     },
 };
 
+// ── Protection 35: seccomp SVC filter ─────────────────────────────────────────
+// libanogs.so contains 51 inline SVC #0 instructions that bypass ALL GOT hooks.
+// These raw syscalls read /proc/self/maps, /proc/self/status, and send ioctl
+// reports without touching any libc function we can intercept via GOT patching.
+//
+// Fix: install a seccomp-bpf filter that checks the instruction_pointer of each
+// syscall.  When the IP falls inside libanogs.so or libanort.so text segments
+// and the syscall is one of our filtered set (openat, readlinkat, ioctl), the
+// kernel delivers SIGSYS instead of executing the syscall.  Our SIGSYS handler
+// applies the same filtering logic as our GOT hooks: /proc paths get sanitised
+// memfds, ioctl payloads get zeroed, everything else passes through.
+//
+// This closes the last major detection gap: raw SVC now gets the same treatment
+// as GOT-hooked libc calls.
+
+struct SvcLibRange {
+    uintptr_t start;
+    uintptr_t end;
+};
+static SvcLibRange s_svc_anogs = {0, 0};
+static SvcLibRange s_svc_anort = {0, 0};
+
+static SvcLibRange findLibTextRange(const char *so_name) {
+    SvcLibRange range = {0, 0};
+    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    if (fd < 0) return range;
+    char buf[4096], line[512];
+    int llen = 0;
+    for (;;) {
+        ssize_t n = (ssize_t)syscall(SYS_read, fd, buf, sizeof(buf));
+        if (n <= 0) break;
+        for (ssize_t i = 0; i < n; i++) {
+            if (llen < (int)sizeof(line) - 1) line[llen++] = buf[i];
+            if (buf[i] == '\n' || llen >= (int)sizeof(line) - 1) {
+                line[llen] = '\0';
+                if (strstr(line, so_name) && strstr(line, "r-xp")) {
+                    uintptr_t s, e;
+                    if (sscanf(line, "%lx-%lx", &s, &e) == 2) {
+                        if (range.start == 0 || s < range.start) range.start = s;
+                        if (e > range.end) range.end = e;
+                    }
+                }
+                llen = 0;
+            }
+        }
+    }
+    syscall(SYS_close, fd);
+    return range;
+}
+
+static void sigsys_handler(int sig, siginfo_t *info, void *uctx) {
+    (void)sig; (void)info;
+    ucontext_t *ctx = static_cast<ucontext_t *>(uctx);
+    long nr = (long)ctx->uc_mcontext.regs[8];
+    long a0 = (long)ctx->uc_mcontext.regs[0];
+    long a1 = (long)ctx->uc_mcontext.regs[1];
+    long a2 = (long)ctx->uc_mcontext.regs[2];
+    long a3 = (long)ctx->uc_mcontext.regs[3];
+    long a4 = (long)ctx->uc_mcontext.regs[4];
+    long a5 = (long)ctx->uc_mcontext.regs[5];
+
+    long result;
+
+    switch (nr) {
+        case __NR_openat: {
+            ++g_ano_svc_trapped;
+            if (a1) {
+                const char *path = (const char *)a1;
+                if (is_self_maps(path))     { result = (long)make_filtered_maps();           break; }
+                if (is_self_status(path))   { result = (long)make_filtered_status(path);     break; }
+                if (is_proc_net_unix(path)) { result = (long)make_filtered_unix(path);       break; }
+                if (is_self_environ(path))  { result = (long)make_filtered_environ();        break; }
+                if (is_root_path(path))     { result = -ENOENT; break; }
+            }
+            result = syscall(SYS_openat, a0, a1, a2, a3);
+            break;
+        }
+        case __NR_readlinkat: {
+            ++g_ano_svc_trapped;
+            if (a1) {
+                const char *path = (const char *)a1;
+                char pidpath[64];
+                snprintf(pidpath, sizeof(pidpath), "/proc/%d/exe", (int)getpid());
+                if (strcmp(path, "/proc/self/exe") == 0 || strcmp(path, pidpath) == 0) {
+                    const char *fake = "/system/bin/app_process64";
+                    size_t len = __builtin_strlen(fake);
+                    if (len > (size_t)a3) len = (size_t)a3;
+                    __builtin_memcpy((char *)a2, fake, len);
+                    result = (long)len;
+                    break;
+                }
+            }
+            result = syscall(SYS_readlinkat, a0, a1, a2, a3);
+            break;
+        }
+        case __NR_ioctl: {
+            unsigned long req  = (unsigned long)a1;
+            unsigned long type = (req >> 8) & 0xFF;
+            unsigned long num  = req & 0xFF;
+            bool is_system = type == 0x54 || type == 0x66 || type == 0x53 ||
+                             type == 0x89 || type == 0x00;
+            if (!is_system && a2 != 0 && num >= 0x10) {
+                ++g_ano_svc_trapped;
+                __builtin_memset((void *)a2, 0, 64);
+            }
+            result = syscall(SYS_ioctl, a0, a1, a2, a3);
+            break;
+        }
+        default:
+            result = syscall(nr, a0, a1, a2, a3, a4, a5);
+            break;
+    }
+
+    ctx->uc_mcontext.regs[0] = (uint64_t)result;
+}
+
+static bool installSvcFilter(const SvcLibRange &anogs, const SvcLibRange &anort) {
+    // Install SIGSYS handler FIRST — the seccomp filter delivers SIGSYS
+    struct sigaction sa{};
+    sa.sa_sigaction = sigsys_handler;
+    sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
+    sigemptyset(&sa.sa_mask);
+    if (::sigaction(SIGSYS, &sa, nullptr) != 0) {
+        LOGE("[SECCOMP] sigaction(SIGSYS) failed errno=%d", errno);
+        return false;
+    }
+
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+    uint32_t ag_hi = (uint32_t)(anogs.start >> 32);
+    uint32_t ag_lo = (uint32_t)(anogs.start & 0xFFFFFFFFULL);
+    uint32_t ag_end= (uint32_t)(anogs.end   & 0xFFFFFFFFULL);
+
+    uint32_t ar_hi = (uint32_t)(anort.start >> 32);
+    uint32_t ar_lo = (uint32_t)(anort.start & 0xFFFFFFFFULL);
+    uint32_t ar_end= (uint32_t)(anort.end   & 0xFFFFFFFFULL);
+
+    // seccomp_data on little-endian aarch64:
+    //   offset 0: nr (32-bit)     offset 4: arch (32-bit)
+    //   offset 8: IP low 32      offset 12: IP high 32
+    struct sock_filter filt[] = {
+        /* 0 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 4),
+        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 17),
+        /* 2 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        /* 3 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     3, 0),
+        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 2, 0),
+        /* 5 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl,      1, 0),
+        /* 6 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        // ── Check anogs text range ──
+        /* 7 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
+        /* 8 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ag_hi, 0, 4),
+        /* 9 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
+        /*10 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, ag_lo, 0, 2),
+        /*11 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, ag_end,1, 0),
+        /*12 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        // ── Check anort text range ──
+        /*13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
+        /*14 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ar_hi, 0, 4),
+        /*15 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
+        /*16 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, ar_lo, 0, 2),
+        /*17 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, ar_end,1, 0),
+        /*18 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        /*19 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+    };
+
+    struct sock_fprog prog = {
+        .len    = (unsigned short)(sizeof(filt) / sizeof(filt[0])),
+        .filter = filt,
+    };
+
+    long ret = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
+                       SECCOMP_FILTER_FLAG_TSYNC, &prog);
+    if (ret != 0) {
+        ret = prctl(PR_SET_SECCOMP, 2 /*SECCOMP_MODE_FILTER*/,
+                    (unsigned long)&prog, 0, 0);
+    }
+
+    if (ret == 0) {
+        LOGI("[SECCOMP] SVC filter installed — anogs=[0x%lx,0x%lx) anort=[0x%lx,0x%lx)",
+             anogs.start, anogs.end, anort.start, anort.end);
+    } else {
+        LOGE("[SECCOMP] install failed errno=%d — raw SVC bypass unprotected", errno);
+    }
+    return ret == 0;
+}
+
 // ── Module map hiding ─────────────────────────────────────────────────────────
 // libanort.so uses tp_syscall_imp (raw SVC #0) to read /proc/self/maps directly,
 // bypassing ALL GOT hooks.  If our module shows up in maps → server-side ban.
@@ -1701,6 +1917,19 @@ static void *gotWatcherThread(void *) {
     LOGI("AnoBypass: watcher done — anogs=%s anort=%s",
          (anogs_prev == kAnogsExp ? "OK" : (anogs_prev > 0 ? "partial" : "FAILED")),
          (anort_prev == kAnortExp ? "OK" : (anort_prev > 0 ? "partial" : "FAILED")));
+
+    // Protection 35: seccomp SVC filter — intercept raw SVC #0 from AnoSDK.
+    // Must install BEFORE hideModuleMaps so findLibTextRange can still read maps.
+    {
+        char _ag[16], _ar[16];
+        ObfStr::anogs(_ag); ObfStr::anort(_ar);
+        s_svc_anogs = findLibTextRange(_ag);
+        s_svc_anort = findLibTextRange(_ar);
+        if (s_svc_anogs.start || s_svc_anort.start)
+            installSvcFilter(s_svc_anogs, s_svc_anort);
+        else
+            LOGE("[SECCOMP] no lib text ranges found — SVC filter skipped");
+    }
 
     // Critical: hide module from /proc/self/maps AFTER all GOT patches are applied.
     // This defeats tp_syscall_imp raw SVC #0 reads that bypass GOT hooks entirely.

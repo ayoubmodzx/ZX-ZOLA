@@ -37,6 +37,7 @@ extern uint32_t g_ano_readdir_filtered;
 extern uint32_t g_ano_dladdr_spoofed;
 extern uint32_t g_ano_fstat_filtered;
 extern uint32_t g_ano_read_filtered;
+extern uint32_t g_ano_svc_trapped;
 extern uint32_t g_ano_mmap_filtered;
 extern uint32_t g_ano_fgets_filtered;
 
@@ -1081,6 +1082,8 @@ static void *diagThread(void *) {
              g_ano_getenv_filtered, g_ano_readdir_filtered,
              g_ano_dladdr_spoofed, g_ano_fstat_filtered,
              g_ano_read_filtered, g_ano_mmap_filtered, g_ano_fgets_filtered);
+        LOGI("║ [SECCOMP] svc_trapped=%u (raw SVC intercepted from AnoSDK text)",
+             g_ano_svc_trapped);
 
         // Problems detection
         if (s_esp && s_diag_outline_vis == 0)

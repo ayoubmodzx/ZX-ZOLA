@@ -1,6 +1,6 @@
 id=zx_zola_v2
 name=ZX-ZOLA v2
-version=v2.41
-versionCode=42
+version=v2.50
+versionCode=50
 author=ayoub
 description=FF 64-bit | Async il2cpp | Zero GL overhead | Root/Zygisk must be hidden
