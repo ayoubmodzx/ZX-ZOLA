@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.22 — GOT patching, zero libc inline hooks
+// AnoSDK bypass v2.41 — GOT patching, zero libc inline hooks, 34 protections
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -245,6 +245,19 @@ extern uint32_t g_ano_getenv_filtered;
 extern uint32_t g_ano_readdir_filtered;
 extern uint32_t g_ano_dladdr_spoofed;
 extern uint32_t g_ano_fstat_filtered;
+
+// Forward declarations for hooks referenced by dlsym map (P26)
+static ssize_t hook_read(int fd, void *buf, size_t count);
+static ssize_t hook___read_chk(int fd, void *buf, size_t count, size_t buflen);
+static char *hook_fgets(char *s, int size, FILE *stream);
+static char *hook___fgets_chk(char *s, int size, FILE *stream, size_t slen);
+static void *hook_mmap(void *addr, size_t length, int prot, int flags, int fd, off_t offset);
+static int hook_execl(const char *path, const char *arg, ...);
+static int hook_execv(const char *path, char *const argv[]);
+static unsigned long hook_getauxval(unsigned long type);
+static void *hook_dlopen(const char *filename, int flags);
+static ssize_t hook_pread(int fd, void *buf, size_t count, off_t offset);
+static int hook_statfs(const char *path, struct statfs *buf);
 
 //── GOT hook functions ────────────────────────────────────────────────────────
 // These replace GOT entries in libanogs.so and libanort.so.
@@ -903,12 +916,207 @@ static void *hook_dlsym(void *handle, const char *name) {
             {"kill",             (void*)hook_kill},
             {"inotify_init",     (void*)hook_inotify_init},
             {"__system_property_get", (void*)hook_system_property_get},
+            {"read",             (void*)hook_read},
+            {"__read_chk",       (void*)hook___read_chk},
+            {"fgets",            (void*)hook_fgets},
+            {"__fgets_chk",      (void*)hook___fgets_chk},
+            {"mmap",             (void*)hook_mmap},
+            {"getauxval",        (void*)hook_getauxval},
+            {"execl",            (void*)hook_execl},
+            {"execv",            (void*)hook_execv},
+            {"sigaction",        (void*)hook_sigaction},
+            {"statfs",           (void*)hook_statfs},
+            {"pread",            (void*)hook_pread},
+            {"dlopen",           (void*)hook_dlopen},
+            {"clock_gettime",    (void*)hook_clock_gettime},
         };
         for (const auto &e : kMap) {
             if (strcmp(name, e.s) == 0) return e.h;
         }
     }
     return ::dlsym(handle, name);
+}
+
+// Protection 28: read / __read_chk — if tp_syscall_imp opens /proc files via raw
+// SVC #0, subsequent read() calls still go through the GOT.  Check fd targets
+// and serve filtered content for /proc/self/status, environ, net/unix.
+// /proc/self/maps is already invisible via hideModuleMaps().
+uint32_t g_ano_read_filtered = 0;
+static bool is_proc_fd(int fd, char *out, size_t outsz) {
+    char lp[48];
+    snprintf(lp, sizeof(lp), "/proc/self/fd/%d", fd);
+    ssize_t r = (ssize_t)syscall(SYS_readlinkat, AT_FDCWD, lp, out, outsz - 1);
+    if (r > 0) { out[r] = '\0'; return true; }
+    return false;
+}
+static ssize_t hook_read(int fd, void *buf, size_t count) {
+    if (fd >= 0 && count > 0) {
+        char target[256];
+        if (is_proc_fd(fd, target, sizeof(target))) {
+            if (is_self_maps(target)) {
+                int ffd = make_filtered_maps();
+                if (ffd >= 0) {
+                    off_t off = ::lseek(fd, 0, SEEK_CUR);
+                    if (off < 0) off = 0;
+                    ssize_t r = ::pread(ffd, buf, count, off);
+                    if (r > 0) ::lseek(fd, off + r, SEEK_SET);
+                    ::close(ffd);
+                    ++g_ano_read_filtered;
+                    return r >= 0 ? r : 0;
+                }
+            }
+            if (is_self_status(target)) {
+                int ffd = make_filtered_status(target);
+                if (ffd >= 0) {
+                    off_t off = ::lseek(fd, 0, SEEK_CUR);
+                    if (off < 0) off = 0;
+                    ssize_t r = ::pread(ffd, buf, count, off);
+                    if (r > 0) ::lseek(fd, off + r, SEEK_SET);
+                    ::close(ffd);
+                    ++g_ano_read_filtered;
+                    return r >= 0 ? r : 0;
+                }
+            }
+            if (is_proc_net_unix(target)) {
+                int ffd = make_filtered_unix(target);
+                if (ffd >= 0) {
+                    off_t off = ::lseek(fd, 0, SEEK_CUR);
+                    if (off < 0) off = 0;
+                    ssize_t r = ::pread(ffd, buf, count, off);
+                    if (r > 0) ::lseek(fd, off + r, SEEK_SET);
+                    ::close(ffd);
+                    ++g_ano_read_filtered;
+                    return r >= 0 ? r : 0;
+                }
+            }
+            if (is_self_environ(target)) {
+                int ffd = make_filtered_environ();
+                if (ffd >= 0) {
+                    off_t off = ::lseek(fd, 0, SEEK_CUR);
+                    if (off < 0) off = 0;
+                    ssize_t r = ::pread(ffd, buf, count, off);
+                    if (r > 0) ::lseek(fd, off + r, SEEK_SET);
+                    ::close(ffd);
+                    ++g_ano_read_filtered;
+                    return r >= 0 ? r : 0;
+                }
+            }
+        }
+    }
+    return ::read(fd, buf, count);
+}
+static ssize_t hook___read_chk(int fd, void *buf, size_t count, size_t buflen) {
+    (void)buflen;
+    return hook_read(fd, buf, count);
+}
+
+// Protection 29: fgets / __fgets_chk — line-by-line reads of /proc files opened
+// via raw syscall.  Check underlying fd via fileno().
+uint32_t g_ano_fgets_filtered = 0;
+static char *hook_fgets(char *s, int size, FILE *stream) {
+    if (stream && size > 0) {
+        int fd = fileno(stream);
+        if (fd >= 0) {
+            char target[256];
+            if (is_proc_fd(fd, target, sizeof(target))) {
+                if (is_self_status(target) || is_self_maps(target) ||
+                    is_proc_net_unix(target) || is_self_environ(target)) {
+                    ++g_ano_fgets_filtered;
+                    if (is_self_status(target)) {
+                        char *r = ::fgets(s, size, stream);
+                        if (r && strncmp(s, "TracerPid:", 10) == 0) {
+                            snprintf(s, (size_t)size, "TracerPid:\t0\n");
+                        }
+                        return r;
+                    }
+                }
+            }
+        }
+    }
+    return ::fgets(s, size, stream);
+}
+static char *hook___fgets_chk(char *s, int size, FILE *stream, size_t slen) {
+    (void)slen;
+    return hook_fgets(s, size, stream);
+}
+
+// Protection 30: mmap — AnoSDK could mmap /proc/self/maps or other /proc files.
+// Block mmap on suspicious /proc file descriptors.
+uint32_t g_ano_mmap_filtered = 0;
+static void *hook_mmap(void *addr, size_t length, int prot, int flags,
+                       int fd, off_t offset) {
+    if (fd >= 0 && !(flags & MAP_ANONYMOUS)) {
+        char target[256];
+        if (is_proc_fd(fd, target, sizeof(target))) {
+            if (is_self_maps(target) || is_self_status(target) ||
+                is_proc_net_unix(target) || is_self_environ(target)) {
+                ++g_ano_mmap_filtered;
+                errno = ENODEV;
+                return MAP_FAILED;
+            }
+        }
+    }
+    return ::mmap(addr, length, prot, flags, fd, offset);
+}
+
+// Protection 31: execl/execv — AnoSDK can exec shell commands to probe root.
+static int hook_execl(const char *path, const char *arg, ...) {
+    (void)path; (void)arg;
+    errno = EACCES;
+    return -1;
+}
+static int hook_execv(const char *path, char *const argv[]) {
+    (void)path; (void)argv;
+    errno = EACCES;
+    return -1;
+}
+
+// Protection 32: getauxval — AT_SECURE reveals LD_PRELOAD injection.
+// AT_HWCAP/AT_HWCAP2 are safe to pass through.
+#include <sys/auxv.h>
+static unsigned long hook_getauxval(unsigned long type) {
+    if (type == AT_SECURE) return 0;
+    return ::getauxval(type);
+}
+
+// Protection 33: sigaction — AnoSDK reads back signal handlers via
+// sigaction(sig, NULL, &old) and may dladdr() the handler address.
+// When querying SIGABRT/SIGTERM (which we installed noop handlers on),
+// report SIG_DFL so the handler address is never exposed.
+static int hook_sigaction(int sig, const struct sigaction *act,
+                          struct sigaction *oldact) {
+    int r = ::sigaction(sig, act, oldact);
+    if (r == 0 && oldact && !act && (sig == SIGABRT || sig == SIGTERM)) {
+        if (oldact->sa_handler != SIG_DFL && oldact->sa_handler != SIG_IGN) {
+            oldact->sa_handler = SIG_DFL;
+            sigemptyset(&oldact->sa_mask);
+            oldact->sa_flags = 0;
+        }
+    }
+    return r;
+}
+
+// Protection 34: clock_gettime — AnoSDK measures execution time across hooked
+// functions.  If a GOT-hooked call takes significantly longer than a direct SVC,
+// it raises a timing anomaly flag.  Compensate by caching the baseline timestamp
+// and returning it when calls arrive in rapid succession (< 100 µs apart),
+// which masks the overhead of our hook chain.
+#include <time.h>
+static thread_local struct timespec s_last_ts = {};
+static thread_local uint64_t       s_last_ns = 0;
+static int hook_clock_gettime(clockid_t clk, struct timespec *tp) {
+    int r = ::clock_gettime(clk, tp);
+    if (r == 0 && tp && (clk == CLOCK_MONOTONIC || clk == CLOCK_MONOTONIC_RAW)) {
+        uint64_t now = (uint64_t)tp->tv_sec * 1000000000ULL + (uint64_t)tp->tv_nsec;
+        uint64_t delta = now - s_last_ns;
+        if (s_last_ns != 0 && delta < 100000) {
+            *tp = s_last_ts;
+        } else {
+            s_last_ts = *tp;
+            s_last_ns = now;
+        }
+    }
+    return r;
 }
 
 // Protection 27: dlopen — AnoSDK may try to dlopen libraries by name to scan
@@ -1205,6 +1413,22 @@ static const PatchEntry kAnogsEntries[] = {
     { "dlsym",            reinterpret_cast<void *>(hook_dlsym)             },
     // Protection 27: dlopen — prevent module/root library loading
     { "dlopen",           reinterpret_cast<void *>(hook_dlopen)            },
+    // Protection 28: read — filter /proc reads from SVC-opened fds
+    { "read",             reinterpret_cast<void *>(hook_read)              },
+    { "__read_chk",       reinterpret_cast<void *>(hook___read_chk)        },
+    // Protection 29: fgets — line-by-line /proc reads
+    { "fgets",            reinterpret_cast<void *>(hook_fgets)             },
+    { "__fgets_chk",      reinterpret_cast<void *>(hook___fgets_chk)       },
+    // Protection 30: mmap — block mmap of /proc file fds
+    { "mmap",             reinterpret_cast<void *>(hook_mmap)              },
+    // Protection 31: execl — block command execution
+    { "execl",            reinterpret_cast<void *>(hook_execl)             },
+    // Protection 32: getauxval — spoof AT_SECURE
+    { "getauxval",        reinterpret_cast<void *>(hook_getauxval)         },
+    // Protection 33: sigaction — hide our signal handler addresses
+    { "sigaction",        reinterpret_cast<void *>(hook_sigaction)         },
+    // Protection 34: clock_gettime — timing anomaly defense
+    { "clock_gettime",    reinterpret_cast<void *>(hook_clock_gettime)     },
 };
 
 static const PatchEntry kAnortEntries[] = {
@@ -1258,6 +1482,19 @@ static const PatchEntry kAnortEntries[] = {
     { "dlsym",            reinterpret_cast<void *>(hook_dlsym)             },
     // Protection 27: dlopen — prevent module/root library loading
     { "dlopen",           reinterpret_cast<void *>(hook_dlopen)            },
+    // Protection 28: read — filter /proc reads from SVC-opened fds
+    { "read",             reinterpret_cast<void *>(hook_read)              },
+    { "__read_chk",       reinterpret_cast<void *>(hook___read_chk)        },
+    // Protection 29: fgets — line-by-line /proc reads
+    { "fgets",            reinterpret_cast<void *>(hook_fgets)             },
+    // Protection 30: mmap — block mmap of /proc file fds
+    { "mmap",             reinterpret_cast<void *>(hook_mmap)              },
+    // Protection 31: execv — block command execution (anort imports execv)
+    { "execv",            reinterpret_cast<void *>(hook_execv)             },
+    // Protection 33: sigaction — hide our signal handler addresses
+    { "sigaction",        reinterpret_cast<void *>(hook_sigaction)         },
+    // Protection 34: clock_gettime — timing anomaly defense
+    { "clock_gettime",    reinterpret_cast<void *>(hook_clock_gettime)     },
 };
 
 // ── Module map hiding ─────────────────────────────────────────────────────────

@@ -36,6 +36,9 @@ extern uint32_t g_ano_getenv_filtered;
 extern uint32_t g_ano_readdir_filtered;
 extern uint32_t g_ano_dladdr_spoofed;
 extern uint32_t g_ano_fstat_filtered;
+extern uint32_t g_ano_read_filtered;
+extern uint32_t g_ano_mmap_filtered;
+extern uint32_t g_ano_fgets_filtered;
 
 FeatureEngine &FeatureEngine::get() {
     static FeatureEngine instance;
@@ -663,9 +666,66 @@ void FeatureEngine::resolveClasses() {
         }
     }
 
-    m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
+    // Broader ESP method fallback: if SetOutlineVisible was not found by name, scan ALL
+    // Player methods for ANY outline-related substring and use the first match.
+    if (m_cls.Player && (!m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer)) {
+        static const char *kOutlinePatterns[] = {
+            "Outline", "outline", "SetOutline", "ShowOutline",
+            "EnableOutline", "SetPlayerOutline", "OutlineEnable",
+            "OUTLINE", "OutLine", "setOutline", nullptr
+        };
+        for (int i = 0; kOutlinePatterns[i]; ++i) {
+            MethodInfo *m = Il2CppApi::scanMethods(m_cls.Player, kOutlinePatterns[i]);
+            if (m && m->methodPointer && m->parameters_count >= 1) {
+                LOGI("[ESP-FALLBACK] found outline method via '%s': name=%s pc=%d ptr=%p",
+                     kOutlinePatterns[i], m->name ? m->name : "?",
+                     (int)m->parameters_count, m->methodPointer);
+                m_mth.setOutlineVisible = m;
+                break;
+            }
+        }
+    }
 
-    // Runtime dump disabled — /sdcard writes are visible to AnoSDK storage scanner
+    // Broader headshot fallback: scan HitDetect + Player for any head-related gate
+    if (!m_mth.isPlayerHead || !m_mth.isPlayerHead->methodPointer) {
+        static const char *kHeadPatterns[] = {
+            "IsPlayerHead", "IsHeadShot", "CheckHeadShot", "IsHead",
+            "HeadHit", "CheckHead", "HitHead", "DamageHead", nullptr
+        };
+        Il2CppClass *targets[] = { m_cls.HitDetect, m_cls.Player, nullptr };
+        for (int t = 0; targets[t]; ++t) {
+            for (int i = 0; kHeadPatterns[i]; ++i) {
+                MethodInfo *m = Il2CppApi::scanMethods(targets[t], kHeadPatterns[i]);
+                if (m && m->methodPointer) {
+                    LOGI("[HS-FALLBACK] found head method via '%s': name=%s ptr=%p",
+                         kHeadPatterns[i], m->name ? m->name : "?", m->methodPointer);
+                    m_mth.isPlayerHead = m;
+                    goto head_done;
+                }
+            }
+        }
+        head_done:;
+    }
+
+    // Auto-dump: when critical ESP or AIM methods are missing, dump Assembly-CSharp
+    // classes to the app's private cache dir (AnoSDK does not scan /data/data/*/cache).
+    // This lets the user pull the dump via adb and provide it for analysis.
+    {
+        bool esp_missing  = !m_mth.setOutlineVisible || !m_mth.setOutlineVisible->methodPointer;
+        bool aim_missing  = !m_mth.setAimRotation    || !m_mth.setAimRotation->methodPointer;
+        bool head_missing = !m_mth.isPlayerHead      || !m_mth.isPlayerHead->methodPointer;
+        if (esp_missing || aim_missing || head_missing) {
+            LOGE("[AUTO-DUMP] Critical methods missing (esp=%d aim=%d head=%d) — dumping runtime",
+                 esp_missing, aim_missing, head_missing);
+            char dump_path[256];
+            snprintf(dump_path, sizeof(dump_path),
+                     "/data/data/com.dts.freefireth/cache/zx_runtime_dump.cs");
+            Il2CppApi::dumpRuntime(dump_path, "Assembly-CSharp");
+            LOGI("[AUTO-DUMP] Dump written to %s — pull via: adb shell cat %s", dump_path, dump_path);
+        }
+    }
+
+    m_ready = (m_cls.Player != nullptr || m_cls.Weapon != nullptr);
 
     LOGI("resolved Player:%p Weapon:%p Grass:%p Vehicle:%p | dmg:%p recoil:%p rof:%p speed:%p cam_fov:%p",
          m_cls.Player, m_cls.Weapon, m_cls.Grass, m_cls.Vehicle,
@@ -1017,9 +1077,10 @@ static void *diagThread(void *) {
         LOGI("║ [ANOSDK] inotify=%u mincore=%u readlink=%u access=%u stat=%u prop=%u",
              g_ano_inotify_blocked, g_ano_mincore_spoofed, g_ano_readlink_filtered,
              g_ano_access_filtered, g_ano_stat_filtered, g_ano_prop_spoofed);
-        LOGI("║ [ANOSDK] getenv=%u readdir=%u dladdr=%u fstat=%u",
+        LOGI("║ [ANOSDK] getenv=%u readdir=%u dladdr=%u fstat=%u read=%u mmap=%u fgets=%u",
              g_ano_getenv_filtered, g_ano_readdir_filtered,
-             g_ano_dladdr_spoofed, g_ano_fstat_filtered);
+             g_ano_dladdr_spoofed, g_ano_fstat_filtered,
+             g_ano_read_filtered, g_ano_mmap_filtered, g_ano_fgets_filtered);
 
         // Problems detection
         if (s_esp && s_diag_outline_vis == 0)
