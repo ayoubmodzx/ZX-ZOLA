@@ -861,12 +861,14 @@ static ssize_t hook_pread(int fd, void *buf, size_t count, off_t offset) {
 static int hook_prctl(int option, unsigned long a2, unsigned long a3,
                       unsigned long a4, unsigned long a5) {
     if (option == PR_SET_VMA && a2 == PR_SET_VMA_ANON_NAME && a3 != 0) {
-        const char *vma_name = (const char *)a4;
+        // prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, start, len, name)
+        //       option       a2                     a3    a4   a5
+        const char *vma_name = (const char *)a5;
         if (vma_name) {
             char h1[16];
             ObfStr::mod_id(h1);
             if (strstr(vma_name, h1) || is_root_path(vma_name))
-                return ::prctl(option, a2, a3, (unsigned long)"", a5);
+                return ::prctl(option, a2, a3, a4, (unsigned long)"");
         }
     }
     return ::prctl(option, a2, a3, a4, a5);
