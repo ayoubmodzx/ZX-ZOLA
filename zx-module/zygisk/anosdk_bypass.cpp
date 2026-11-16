@@ -881,6 +881,10 @@ static int hook_statfs(const char *path, struct statfs *buf) {
     return ::statfs(path, buf);
 }
 
+// Forward declarations for hooks defined later but referenced in kMap
+static int hook_sigaction(int sig, const struct sigaction *act, struct sigaction *oldact);
+static int hook_clock_gettime(clockid_t clk, struct timespec *tp);
+
 // Protection 26: dlsym — AnoSDK resolves symbol addresses via dlsym() and
 // compares them against its own GOT entries to detect GOT hooking.  Return our
 // hook addresses for hooked symbols so the comparison passes.
