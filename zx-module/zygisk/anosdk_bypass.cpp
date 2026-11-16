@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.50 — GOT patching + seccomp SVC filter, 35 protections
+// AnoSDK bypass v2.51 — GOT + trampoline seccomp (no IP-range dep), 35 protections
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -96,13 +96,60 @@ struct ObfStr {
 #define R_AARCH64_JUMP_SLOT 1026
 #endif
 
+// ── Syscall trampoline ───────────────────────────────────────────────────────
+// Executable page with a bare SVC #0 that our seccomp BPF whitelists by IP.
+// After seccomp is installed, ALL openat/readlinkat in the process are trapped
+// EXCEPT when issued from this page — so our own filter functions and
+// pass-through paths call through here to avoid recursive SIGSYS.
+static void *s_trampoline = nullptr;
+static uintptr_t s_trampoline_start = 0;
+static uintptr_t s_trampoline_end   = 0;
+
+typedef long (*trampoline_fn_t)(long, long, long, long, long, long, long);
+
+static bool setupTrampoline() {
+    void *page = mmap(nullptr, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) return false;
+
+    static const uint32_t code[] = {
+        0xAA0003E8, // MOV X8, X0   — syscall nr
+        0xAA0103E0, // MOV X0, X1   — arg0
+        0xAA0203E1, // MOV X1, X2   — arg1
+        0xAA0303E2, // MOV X2, X3   — arg2
+        0xAA0403E3, // MOV X3, X4   — arg3
+        0xAA0503E4, // MOV X4, X5   — arg4
+        0xAA0603E5, // MOV X5, X6   — arg5
+        0xD4000001, // SVC #0
+        0xD65F03C0, // RET
+    };
+
+    __builtin_memcpy(page, code, sizeof(code));
+    mprotect(page, 4096, PROT_READ | PROT_EXEC);
+
+    s_trampoline       = page;
+    s_trampoline_start = (uintptr_t)page;
+    s_trampoline_end   = s_trampoline_start + 4096;
+
+    prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
+          (unsigned long)page, (unsigned long)4096, "linker_alloc_small");
+    return true;
+}
+
+static inline long safe_syscall(long nr, long a0=0, long a1=0, long a2=0,
+                                long a3=0, long a4=0, long a5=0) {
+    if (__builtin_expect(s_trampoline != nullptr, 1))
+        return ((trampoline_fn_t)s_trampoline)(nr, a0, a1, a2, a3, a4, a5);
+    return syscall(nr, a0, a1, a2, a3, a4, a5);
+}
+
 // ── /proc/self/maps filter ────────────────────────────────────────────────────
 // Creates a memfd populated with a filtered copy of /proc/self/maps that omits
 // all lines referencing our module.  All reads use raw syscalls so this function
 // itself never recurses through any patched GOT slot.
 
 static int make_filtered_maps() {
-    int real_fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    int real_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)"/proc/self/maps", (long)O_RDONLY, 0L);
     if (real_fd < 0) return -1;
 
     int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
@@ -141,7 +188,7 @@ static int make_filtered_maps() {
 // AnoSDK scans this file for suspicious socket names — our socket would appear as @gfx_pipe.
 // Defense-in-depth: the socket itself is renamed, but filter anyway for GOT-imported reads.
 static int make_filtered_unix(const char *real_path) {
-    int real_fd = (int)syscall(SYS_openat, AT_FDCWD, real_path, O_RDONLY, 0);
+    int real_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)real_path, (long)O_RDONLY, 0L);
     if (real_fd < 0) return -1;
     int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
     if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
@@ -176,7 +223,7 @@ static int make_filtered_unix(const char *real_path) {
 // Build a filtered /proc/self/status that hides TracerPid (debugger detection).
 // Zygisk injection leaves TracerPid != 0 in the process status — AnoSDK reads this.
 static int make_filtered_status(const char *real_path) {
-    int real_fd = (int)syscall(SYS_openat, AT_FDCWD, real_path, O_RDONLY, 0);
+    int real_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)real_path, (long)O_RDONLY, 0L);
     if (real_fd < 0) return -1;
     int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
     if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
@@ -558,7 +605,7 @@ static int hook_system_property_get(const char *name, char *value) {
 // Protection 18: /proc/self/environ filter — AnoSDK reads environment variables
 // to detect LD_PRELOAD, MAGISK_*, and other injection artifacts.
 static int make_filtered_environ() {
-    int real_fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/environ", O_RDONLY, 0);
+    int real_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)"/proc/self/environ", (long)O_RDONLY, 0L);
     if (real_fd < 0) return -1;
     int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
     if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
@@ -1195,7 +1242,7 @@ static bool patchGotSlot(uintptr_t slot_addr, uintptr_t new_val) {
 // Return the load base of a named library by scanning /proc/self/maps.
 // Uses raw syscalls — must not call any function whose GOT we may be patching.
 static uintptr_t findLibBase(const char *so_name) {
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    int fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)"/proc/self/maps", (long)O_RDONLY, 0L);
     if (fd < 0) return 0;
     char buf[4096], line[512];
     int llen = 0;
@@ -1548,41 +1595,6 @@ static const PatchEntry kAnortEntries[] = {
 // This closes the last major detection gap: raw SVC now gets the same treatment
 // as GOT-hooked libc calls.
 
-struct SvcLibRange {
-    uintptr_t start;
-    uintptr_t end;
-};
-static SvcLibRange s_svc_anogs = {0, 0};
-static SvcLibRange s_svc_anort = {0, 0};
-
-static SvcLibRange findLibTextRange(const char *so_name) {
-    SvcLibRange range = {0, 0};
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
-    if (fd < 0) return range;
-    char buf[4096], line[512];
-    int llen = 0;
-    for (;;) {
-        ssize_t n = (ssize_t)syscall(SYS_read, fd, buf, sizeof(buf));
-        if (n <= 0) break;
-        for (ssize_t i = 0; i < n; i++) {
-            if (llen < (int)sizeof(line) - 1) line[llen++] = buf[i];
-            if (buf[i] == '\n' || llen >= (int)sizeof(line) - 1) {
-                line[llen] = '\0';
-                if (strstr(line, so_name) && strstr(line, "r-xp")) {
-                    uintptr_t s, e;
-                    if (sscanf(line, "%lx-%lx", &s, &e) == 2) {
-                        if (range.start == 0 || s < range.start) range.start = s;
-                        if (e > range.end) range.end = e;
-                    }
-                }
-                llen = 0;
-            }
-        }
-    }
-    syscall(SYS_close, fd);
-    return range;
-}
-
 static void sigsys_handler(int sig, siginfo_t *info, void *uctx) {
     (void)sig; (void)info;
     ucontext_t *ctx = static_cast<ucontext_t *>(uctx);
@@ -1598,25 +1610,24 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx) {
 
     switch (nr) {
         case __NR_openat: {
-            ++g_ano_svc_trapped;
             if (a1) {
                 const char *path = (const char *)a1;
-                if (is_self_maps(path))     { result = (long)make_filtered_maps();           break; }
-                if (is_self_status(path))   { result = (long)make_filtered_status(path);     break; }
-                if (is_proc_net_unix(path)) { result = (long)make_filtered_unix(path);       break; }
-                if (is_self_environ(path))  { result = (long)make_filtered_environ();        break; }
-                if (is_root_path(path))     { result = -ENOENT; break; }
+                if (is_self_maps(path))     { ++g_ano_svc_trapped; result = (long)make_filtered_maps();       break; }
+                if (is_self_status(path))   { ++g_ano_svc_trapped; result = (long)make_filtered_status(path); break; }
+                if (is_proc_net_unix(path)) { ++g_ano_svc_trapped; result = (long)make_filtered_unix(path);   break; }
+                if (is_self_environ(path))  { ++g_ano_svc_trapped; result = (long)make_filtered_environ();    break; }
+                if (is_root_path(path))     { ++g_ano_svc_trapped; result = -ENOENT; break; }
             }
-            result = syscall(SYS_openat, a0, a1, a2, a3);
+            result = safe_syscall(__NR_openat, a0, a1, a2, a3);
             break;
         }
         case __NR_readlinkat: {
-            ++g_ano_svc_trapped;
             if (a1) {
                 const char *path = (const char *)a1;
                 char pidpath[64];
                 snprintf(pidpath, sizeof(pidpath), "/proc/%d/exe", (int)getpid());
                 if (strcmp(path, "/proc/self/exe") == 0 || strcmp(path, pidpath) == 0) {
+                    ++g_ano_svc_trapped;
                     const char *fake = "/system/bin/app_process64";
                     size_t len = __builtin_strlen(fake);
                     if (len > (size_t)a3) len = (size_t)a3;
@@ -1625,32 +1636,23 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx) {
                     break;
                 }
             }
-            result = syscall(SYS_readlinkat, a0, a1, a2, a3);
-            break;
-        }
-        case __NR_ioctl: {
-            unsigned long req  = (unsigned long)a1;
-            unsigned long type = (req >> 8) & 0xFF;
-            unsigned long num  = req & 0xFF;
-            bool is_system = type == 0x54 || type == 0x66 || type == 0x53 ||
-                             type == 0x89 || type == 0x00;
-            if (!is_system && a2 != 0 && num >= 0x10) {
-                ++g_ano_svc_trapped;
-                __builtin_memset((void *)a2, 0, 64);
-            }
-            result = syscall(SYS_ioctl, a0, a1, a2, a3);
+            result = safe_syscall(__NR_readlinkat, a0, a1, a2, a3);
             break;
         }
         default:
-            result = syscall(nr, a0, a1, a2, a3, a4, a5);
+            result = safe_syscall(nr, a0, a1, a2, a3, a4, a5);
             break;
     }
 
     ctx->uc_mcontext.regs[0] = (uint64_t)result;
 }
 
-static bool installSvcFilter(const SvcLibRange &anogs, const SvcLibRange &anort) {
-    // Install SIGSYS handler FIRST — the seccomp filter delivers SIGSYS
+static bool installSvcFilter() {
+    if (!s_trampoline) {
+        LOGE("[SECCOMP] no trampoline — cannot install");
+        return false;
+    }
+
     struct sigaction sa{};
     sa.sa_sigaction = sigsys_handler;
     sa.sa_flags     = SA_SIGINFO | SA_NODEFER;
@@ -1662,40 +1664,29 @@ static bool installSvcFilter(const SvcLibRange &anogs, const SvcLibRange &anort)
 
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
-    uint32_t ag_hi = (uint32_t)(anogs.start >> 32);
-    uint32_t ag_lo = (uint32_t)(anogs.start & 0xFFFFFFFFULL);
-    uint32_t ag_end= (uint32_t)(anogs.end   & 0xFFFFFFFFULL);
+    uint32_t tr_hi  = (uint32_t)(s_trampoline_start >> 32);
+    uint32_t tr_lo  = (uint32_t)(s_trampoline_start & 0xFFFFFFFFULL);
+    uint32_t tr_end = (uint32_t)(s_trampoline_end   & 0xFFFFFFFFULL);
 
-    uint32_t ar_hi = (uint32_t)(anort.start >> 32);
-    uint32_t ar_lo = (uint32_t)(anort.start & 0xFFFFFFFFULL);
-    uint32_t ar_end= (uint32_t)(anort.end   & 0xFFFFFFFFULL);
-
-    // seccomp_data on little-endian aarch64:
-    //   offset 0: nr (32-bit)     offset 4: arch (32-bit)
-    //   offset 8: IP low 32      offset 12: IP high 32
+    // BPF: trap ALL openat/readlinkat EXCEPT when IP is in our trampoline page.
+    // No AnoSDK IP-range check — catches raw SVC from anywhere (anonymous mmap,
+    // JIT, copied code stubs).
     struct sock_filter filt[] = {
         /* 0 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 4),
-        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 17),
+        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 11),
         /* 2 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
-        /* 3 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     3, 0),
-        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 2, 0),
-        /* 5 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl,      1, 0),
-        /* 6 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        // ── Check anogs text range ──
-        /* 7 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
-        /* 8 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ag_hi, 0, 4),
-        /* 9 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
-        /*10 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, ag_lo, 0, 2),
-        /*11 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, ag_end,1, 0),
+        /* 3 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     2, 0),
+        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 1, 0),
+        /* 5 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        // ── Whitelist our trampoline page ──
+        /* 6 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
+        /* 7 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, tr_hi, 0, 4),
+        /* 8 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
+        /* 9 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_lo, 0, 2),
+        /*10 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_end, 1, 0),
+        /*11 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         /*12 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-        // ── Check anort text range ──
-        /*13 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
-        /*14 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, ar_hi, 0, 4),
-        /*15 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
-        /*16 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, ar_lo, 0, 2),
-        /*17 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, ar_end,1, 0),
-        /*18 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-        /*19 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /*13 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
 
     struct sock_fprog prog = {
@@ -1705,17 +1696,14 @@ static bool installSvcFilter(const SvcLibRange &anogs, const SvcLibRange &anort)
 
     long ret = syscall(__NR_seccomp, SECCOMP_SET_MODE_FILTER,
                        SECCOMP_FILTER_FLAG_TSYNC, &prog);
-    if (ret != 0) {
-        ret = prctl(PR_SET_SECCOMP, 2 /*SECCOMP_MODE_FILTER*/,
-                    (unsigned long)&prog, 0, 0);
-    }
+    if (ret != 0)
+        ret = prctl(PR_SET_SECCOMP, 2, (unsigned long)&prog, 0, 0);
 
-    if (ret == 0) {
-        LOGI("[SECCOMP] SVC filter installed — anogs=[0x%lx,0x%lx) anort=[0x%lx,0x%lx)",
-             anogs.start, anogs.end, anort.start, anort.end);
-    } else {
-        LOGE("[SECCOMP] install failed errno=%d — raw SVC bypass unprotected", errno);
-    }
+    if (ret == 0)
+        LOGI("[SECCOMP] SVC filter installed — trampoline=[0x%lx,0x%lx)",
+             s_trampoline_start, s_trampoline_end);
+    else
+        LOGE("[SECCOMP] install failed errno=%d", errno);
     return ret == 0;
 }
 
@@ -1729,7 +1717,7 @@ static bool installSvcFilter(const SvcLibRange &anogs, const SvcLibRange &anort)
 // content, but /proc/self/maps no longer shows a filename.
 
 static void hideModuleMaps() {
-    int fd = (int)syscall(SYS_openat, AT_FDCWD, "/proc/self/maps", O_RDONLY, 0);
+    int fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD, (long)"/proc/self/maps", (long)O_RDONLY, 0L);
     if (fd < 0) return;
 
     struct Region { uintptr_t start, end; int prot; };
@@ -1918,22 +1906,7 @@ static void *gotWatcherThread(void *) {
          (anogs_prev == kAnogsExp ? "OK" : (anogs_prev > 0 ? "partial" : "FAILED")),
          (anort_prev == kAnortExp ? "OK" : (anort_prev > 0 ? "partial" : "FAILED")));
 
-    // Protection 35: seccomp SVC filter — intercept raw SVC #0 from AnoSDK.
-    // Must install BEFORE hideModuleMaps so findLibTextRange can still read maps.
-    {
-        char _ag[16], _ar[16];
-        ObfStr::anogs(_ag); ObfStr::anort(_ar);
-        s_svc_anogs = findLibTextRange(_ag);
-        s_svc_anort = findLibTextRange(_ar);
-        if (s_svc_anogs.start || s_svc_anort.start)
-            installSvcFilter(s_svc_anogs, s_svc_anort);
-        else
-            LOGE("[SECCOMP] no lib text ranges found — SVC filter skipped");
-    }
-
-    // Critical: hide module from /proc/self/maps AFTER all GOT patches are applied.
-    // This defeats tp_syscall_imp raw SVC #0 reads that bypass GOT hooks entirely.
-    hideModuleMaps();
+    // seccomp + hideModuleMaps now run in installEarly() — before AnoSDK even loads
 
     return nullptr;
 }
@@ -1943,15 +1916,26 @@ static void *gotWatcherThread(void *) {
 static void noop_sighandler(int) {}
 
 void AnoBypass::installEarly() {
-    // Custom no-op handler instead of SIG_IGN — AnoSDK reads back sigaction()
-    // and flags SIG_IGN on SIGABRT as anomalous. A custom handler address
-    // looks normal when queried via sigaction(sig, NULL, &old).
+    // 1. Trampoline — must exist before seccomp filter
+    if (!setupTrampoline())
+        LOGE("init: trampoline mmap failed");
+
+    // 2. Signal handlers — custom no-op instead of SIG_IGN (AnoSDK flags SIG_IGN)
     struct sigaction sa{};
     sa.sa_handler = noop_sighandler;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGABRT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
-    LOGI("init: signal handlers installed");
+
+    // 3. Hide module maps IMMEDIATELY — before AnoSDK even loads.
+    //    Defeats raw SVC openat /proc/self/maps before GOT hooks are in place.
+    hideModuleMaps();
+
+    // 4. Seccomp SVC filter — traps ALL openat/readlinkat except our trampoline.
+    //    Installed before AnoSDK loads so there's zero race window.
+    installSvcFilter();
+
+    LOGI("init: trampoline + signal handlers + hide + seccomp installed");
 }
 
 void AnoBypass::startWatcher() {
