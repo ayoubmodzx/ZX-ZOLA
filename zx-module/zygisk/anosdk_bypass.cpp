@@ -733,6 +733,67 @@ static bool is_self_environ(const char *path) {
     return strcmp(path, buf) == 0;
 }
 
+// ── Detection report dump ────────────────────────────────────────────────────
+// Writes AnoSDK ioctl payloads + SVC diagnostic paths to a file the user can
+// pull via: adb shell cat /data/data/com.dts.freefireth/cache/zx_detect_dump.txt
+#include <sys/ioctl.h>
+#include <time.h>
+
+static int  s_dump_fd      = -1;
+static int  s_dump_count   = 0;
+static bool s_dump_opened  = false;
+
+static void dump_open() {
+    if (s_dump_opened) return;
+    s_dump_opened = true;
+    s_dump_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD,
+        (long)"/data/data/com.dts.freefireth/cache/zx_detect_dump.txt",
+        (long)(O_WRONLY | O_CREAT | O_TRUNC), (long)0666);
+    if (s_dump_fd >= 0) {
+        const char *hdr = "=== ZX-ZOLA v2.52 AnoSDK Detection Dump ===\n\n";
+        syscall(SYS_write, s_dump_fd, hdr, __builtin_strlen(hdr));
+    }
+}
+
+static void dump_write(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void dump_write(const char *fmt, ...) {
+    if (s_dump_fd < 0) dump_open();
+    if (s_dump_fd < 0) return;
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (len > 0) syscall(SYS_write, s_dump_fd, buf, (size_t)len);
+}
+
+static void dump_hex(const uint8_t *data, size_t len) {
+    if (s_dump_fd < 0) dump_open();
+    if (s_dump_fd < 0) return;
+    char line[128];
+    for (size_t off = 0; off < len; off += 16) {
+        int pos = snprintf(line, sizeof(line), "  %04zx: ", off);
+        for (size_t j = 0; j < 16 && (off + j) < len; j++)
+            pos += snprintf(line + pos, sizeof(line) - pos, "%02x ", data[off + j]);
+        for (size_t j = (len - off < 16 ? len - off : 16); j < 16; j++)
+            pos += snprintf(line + pos, sizeof(line) - pos, "   ");
+        pos += snprintf(line + pos, sizeof(line) - pos, " |");
+        for (size_t j = 0; j < 16 && (off + j) < len; j++) {
+            char c = (char)data[off + j];
+            line[pos++] = (c >= 0x20 && c < 0x7f) ? c : '.';
+        }
+        line[pos++] = '|'; line[pos++] = '\n'; line[pos] = '\0';
+        syscall(SYS_write, s_dump_fd, line, (size_t)pos);
+    }
+}
+
+void dump_svc_paths() {
+    if (s_diag_path_count == 0) return;
+    dump_write("\n--- Unfiltered SVC openat paths (%d total) ---\n", s_diag_path_count);
+    for (int i = 0; i < s_diag_path_count; i++)
+        dump_write("  [%d] %s\n", i, s_diag_paths[i]);
+}
+
 // Protection 12: tp_syscall_imp — libanort.so exports a raw SVC #0 wrapper that
 // bypasses ALL GOT hooks.  If libanogs.so imports it via GOT, this intercepts it.
 // Same filtering logic as hook_syscall_got.
@@ -750,8 +811,14 @@ static long hook_tp_syscall(long nr, long a0, long a1, long a2, long a3, long a4
         unsigned long type = (req >> 8) & 0xFF;
         unsigned long num  = req & 0xFF;
         bool is_system = type == 0x54 || type == 0x66 || type == 0x53 || type == 0x89 || type == 0x00;
-        if (!is_system && a2 != 0 && num >= 0x10)
-            __builtin_memset((void *)a2, 0, 64);
+        if (!is_system && a2 != 0) {
+            size_t psz = (req >> 16) & 0x3FFF;
+            if (psz == 0) psz = 64; if (psz > 512) psz = 512;
+            dump_write("[TP-IOCTL] fd=%ld req=0x%lx cmd=0x%02lx size=%zu %s\n",
+                       a0, req, num, psz, num < 0x10 ? "(HEARTBEAT)" : "(ZEROED)");
+            dump_hex((const uint8_t *)a2, psz);
+            if (num >= 0x10) { ++g_ano_ioctl_zeroed; __builtin_memset((void *)a2, 0, psz); }
+        }
     }
     return syscall(nr, a0, a1, a2, a3, a4, a5);
 }
@@ -762,9 +829,13 @@ static int hook_unwind_ioctl(int fd, unsigned long req, void *arg) {
     unsigned long type = (req >> 8) & 0xFF;
     unsigned long num  = req & 0xFF;
     bool is_system = type == 0x54 || type == 0x66 || type == 0x53 || type == 0x89 || type == 0x00;
-    if (!is_system && arg && num >= 0x10) {
-        ++g_ano_ioctl_zeroed;
-        __builtin_memset(arg, 0, 64);
+    if (!is_system && arg) {
+        size_t psz = (req >> 16) & 0x3FFF;
+        if (psz == 0) psz = 64; if (psz > 512) psz = 512;
+        dump_write("[UNWIND-IOCTL] fd=%d req=0x%lx cmd=0x%02lx size=%zu %s\n",
+                   fd, req, num, psz, num < 0x10 ? "(HEARTBEAT)" : "(ZEROED)");
+        dump_hex((const uint8_t *)arg, psz);
+        if (num >= 0x10) { ++g_ano_ioctl_zeroed; __builtin_memset(arg, 0, psz); }
     }
     return ::ioctl(fd, req, arg);
 }
@@ -780,14 +851,19 @@ static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a
         if (is_proc_net_unix(path))  return (long)make_filtered_unix(path);
         if (is_self_environ(path))   return (long)make_filtered_environ();
     }
-    // Direct SYS_ioctl — same filtering as hook_ioctl (a0=fd, a1=req, a2=arg)
     if (nr == __NR_ioctl) {
         unsigned long req  = (unsigned long)a1;
         unsigned long type = (req >> 8) & 0xFF;
         unsigned long num  = req & 0xFF;
         bool is_system = type == 0x54 || type == 0x66 || type == 0x53 || type == 0x89 || type == 0x00;
-        if (!is_system && a2 != 0 && num >= 0x10)
-            __builtin_memset((void *)a2, 0, 64);
+        if (!is_system && a2 != 0) {
+            size_t psz = (req >> 16) & 0x3FFF;
+            if (psz == 0) psz = 64; if (psz > 512) psz = 512;
+            dump_write("[GOT-IOCTL] fd=%ld req=0x%lx cmd=0x%02lx size=%zu %s\n",
+                       a0, req, num, psz, num < 0x10 ? "(HEARTBEAT)" : "(ZEROED)");
+            dump_hex((const uint8_t *)a2, psz);
+            if (num >= 0x10) { ++g_ano_ioctl_zeroed; __builtin_memset((void *)a2, 0, psz); }
+        }
     }
     return syscall(nr, a0, a1, a2, a3, a4, a5);
 }
@@ -795,43 +871,50 @@ static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a
 // Protection 9: ioctl interception — AnoSDK sends ban-triggering detection reports via ioctl.
 // cmd layout (AnoSDK v4.x+): cmd < 0x10 = init/heartbeat (MUST pass through).
 //                              cmd >= 0x10 = detection report → zero out payload, block ban.
-// We log every call so logcat shows exactly what AnoSDK is trying to report.
-// Note: AnoSDK opens its own fd (usually /dev/anoSDK or a socket) — we can't know which fd
-// it uses, so we intercept ALL ioctl and pass non-AnoSDK calls through unchanged.
-#include <sys/ioctl.h>
+// Full payload dumped to file + logcat before zeroing.
 static int hook_ioctl(int fd, unsigned long req, void *arg) {
-    // ioctl encoding: bits[15:8] = type/magic (device), bits[7:0] = number (cmd)
-    // Standard Linux ioctls use type bytes like 'T'(0x54), 'f'(0x66), 'S'(0x53), etc.
-    // AnoSDK uses a private type byte — log ALL calls first time to discover it.
-    // Only zero payload when type byte is NOT a known system type.
     unsigned long type = (req >> 8) & 0xFF;
     unsigned long num  = req & 0xFF;
 
-    // Known safe system ioctl type bytes — never zero these
     bool is_system_ioctl =
-        type == 0x54 || // 'T' — terminal ioctls (TIOCGWINSZ etc.)
-        type == 0x66 || // 'f' — file ioctls (FIONREAD etc.)
-        type == 0x53 || // 'S' — socket ioctls
-        type == 0x89 || // socket/network ioctls
-        type == 0x00;   // anonymous ioctls
+        type == 0x54 || type == 0x66 || type == 0x53 ||
+        type == 0x89 || type == 0x00;
 
     if (!is_system_ioctl) {
+        size_t payload_sz = (req >> 16) & 0x3FFF;
+        if (payload_sz == 0) payload_sz = 64;
+        if (payload_sz > 512) payload_sz = 512;
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+
         if (arg) {
             const uint8_t *p = (const uint8_t *)arg;
-            LOGI("[IOCTL-BAN] fd=%d req=0x%lx type=0x%lx num=0x%lx payload: "
-                 "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
+            s_dump_count++;
+
+            LOGI("[IOCTL-BAN] #%d fd=%d req=0x%lx type=0x%lx num=0x%lx size=%zu "
+                 "first32: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x "
                  "%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-                 fd, req, type, num,
+                 s_dump_count, fd, req, type, num, payload_sz,
                  p[0],p[1],p[2],p[3],p[4],p[5],p[6],p[7],
                  p[8],p[9],p[10],p[11],p[12],p[13],p[14],p[15],
                  p[16],p[17],p[18],p[19],p[20],p[21],p[22],p[23],
                  p[24],p[25],p[26],p[27],p[28],p[29],p[30],p[31]);
+
+            dump_write("[IOCTL #%d] t=%.3f fd=%d req=0x%lx type=0x%02lx cmd=0x%02lx size=%zu %s\n",
+                       s_dump_count, ts.tv_sec + ts.tv_nsec / 1e9,
+                       fd, req, type, num, payload_sz,
+                       num < 0x10 ? "(HEARTBEAT — passed through)" : "(REPORT — ZEROED)");
+            dump_hex(p, payload_sz);
+
             if (num >= 0x10) {
                 ++g_ano_ioctl_zeroed;
-                __builtin_memset(arg, 0, 64);
+                __builtin_memset(arg, 0, payload_sz);
             }
         } else {
             LOGI("[IOCTL-BAN] fd=%d req=0x%lx type=0x%lx num=0x%lx (null arg)", fd, req, type, num);
+            dump_write("[IOCTL] t=%.3f fd=%d req=0x%lx type=0x%02lx cmd=0x%02lx (null arg)\n",
+                       ts.tv_sec + ts.tv_nsec / 1e9, fd, req, type, num);
         }
     }
     return ::ioctl(fd, req, arg);

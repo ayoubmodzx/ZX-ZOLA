@@ -1093,6 +1093,8 @@ static void *diagThread(void *) {
             for (int i = 0; i < s_diag_path_count && i < 32; i++)
                 LOGI("║   [%d] %s", i, s_diag_paths[i]);
         }
+        extern void dump_svc_paths();
+        dump_svc_paths();
 
         // Problems detection
         if (s_esp && s_diag_outline_vis == 0)
