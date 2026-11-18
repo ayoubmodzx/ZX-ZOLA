@@ -4,7 +4,7 @@ project(gfx_pipe)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ── Dobby inline hook engine ──────────────────────────────────────────────────
+# ── Dobby inline hook engine (PAYLOAD only) ──────────────────────────────────
 include(FetchContent)
 FetchContent_Declare(
     Dobby
@@ -20,10 +20,6 @@ set(Plugin.Android.BionicLinkerRestriction OFF CACHE BOOL "" FORCE)
 set(DOBBY_GENERATE_SHARED                  OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Dobby)
 
-# The NDK's c++_static imported target carries libc++_shared in INTERFACE_LINK_LIBRARIES.
-# Dobby's targets do the same. ZygiskNext's linker namespace cannot reach libc++_shared.so,
-# so we must absorb ALL C++ runtime symbols statically — no shared C++ dep at runtime.
-# Clearing every interface dep here stops libc++_shared from appearing in NEEDED.
 foreach(_t dobby_static dobby c++_static c++abi c++)
     if(TARGET ${_t})
         set_property(TARGET ${_t} PROPERTY INTERFACE_LINK_LIBRARIES "")
@@ -31,8 +27,6 @@ foreach(_t dobby_static dobby c++_static c++abi c++)
 endforeach()
 
 # Patch macOS-only @PAGE/@PAGEOFF ARM64 ASM relocations → ELF :lo12: syntax.
-# cmake string(REPLACE) misses occurrences when symbol names differ; use sed
-# across ALL .asm/.S files under dobby_SOURCE_DIR for reliability.
 execute_process(
     COMMAND find "${dobby_SOURCE_DIR}" "(" -name "*.asm" -o -name "*.S" ")"
     OUTPUT_VARIABLE _dobby_asm_files
@@ -47,56 +41,14 @@ if(_dobby_asm_files)
         execute_process(COMMAND sed -i
             "s/\\(cdecl([^)]*))\\)@PAGE/\\1/g;s/\\([A-Za-z_][A-Za-z0-9_]*\\)@PAGE/\\1/g"
             "${_f}")
-        message(STATUS "Dobby @PAGE patch: ${_f}")
     endforeach()
 endif()
 
-# ── Global flags ──────────────────────────────────────────────────────────────
+# ── Global flags ─────────────────────────────────────────────────────────────
 set(CMAKE_CXX_FLAGS_RELEASE   "-Oz -ffunction-sections -fdata-sections -flto=thin")
 set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed -Wl,--strip-all -Wl,-z,relro,-z,now -flto=thin")
 
-add_library(gfx_pipe SHARED
-    zygisk/main.cpp
-    zygisk/il2cpp_api.cpp
-    zygisk/hook_engine.cpp
-    zygisk/async_worker.cpp
-    zygisk/feature_engine.cpp
-    zygisk/anosdk_bypass.cpp
-    zygisk/memory_guard.cpp
-)
-
-# ZygiskNext's builtin linker registers modules by SONAME — it must match the
-# filename that customize.sh installs (arm64-v8a.so), not the CMake default
-# (libgfx_pipe.so), or the module fails to preload with "not preloaded".
-set_target_properties(gfx_pipe PROPERTIES
-    PREFIX ""
-    SUFFIX ".so"
-    OUTPUT_NAME "arm64-v8a"
-)
-
-target_include_directories(gfx_pipe PRIVATE include)
-
-# Per-target: hide everything by default; zygisk_module_entry has explicit default attr
-target_compile_options(gfx_pipe PRIVATE
-    -fvisibility=hidden
-    -fvisibility-inlines-hidden
-)
-
-if(TARGET dobby_static)
-    set(_dobby_link_target dobby_static)
-else()
-    set(_dobby_link_target dobby)
-endif()
-
-target_link_libraries(gfx_pipe PRIVATE
-    log
-    dl
-    ${_dobby_link_target}
-)
-
-# Static C++ runtime absorption — runs AFTER objects so lld sees references first.
-# compiler-rt builtins (provides __emutls_get_address) live in the clang lib dir
-# which is NOT in the NDK sysroot's default search path — find it explicitly.
+# ── compiler-rt builtins (shared by both targets) ───────────────────────────
 execute_process(
     COMMAND ${CMAKE_CXX_COMPILER} --print-file-name=libclang_rt.builtins-aarch64-android.a
     OUTPUT_VARIABLE _compiler_rt_path
@@ -108,12 +60,83 @@ if(NOT IS_ABSOLUTE "${_compiler_rt_path}")
     list(GET _compiler_rt_candidates 0 _compiler_rt_path)
 endif()
 if(NOT _compiler_rt_path OR NOT EXISTS "${_compiler_rt_path}")
-    message(FATAL_ERROR "Cannot find libclang_rt.builtins-aarch64-android.a in NDK ${CMAKE_ANDROID_NDK}")
+    message(FATAL_ERROR "Cannot find libclang_rt.builtins-aarch64-android.a")
 endif()
-message(STATUS "compiler-rt builtins: ${_compiler_rt_path}")
 get_filename_component(_compiler_rt_dir "${_compiler_rt_path}" DIRECTORY)
 
-target_link_options(gfx_pipe PRIVATE
+if(TARGET dobby_static)
+    set(_dobby_link_target dobby_static)
+else()
+    set(_dobby_link_target dobby)
+endif()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TARGET 1: ENTRY STUB  (loaded by ZygiskNext — must stay < 250 KB)
+#   No Dobby, no heavy deps — just the Zygisk API shim that dlopen's payload.so
+# ═══════════════════════════════════════════════════════════════════════════════
+add_library(zx_entry SHARED
+    zygisk/entry.cpp
+)
+
+set_target_properties(zx_entry PROPERTIES
+    PREFIX ""
+    SUFFIX ".so"
+    OUTPUT_NAME "arm64-v8a"
+)
+
+target_include_directories(zx_entry PRIVATE include)
+
+target_compile_options(zx_entry PRIVATE
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+)
+
+target_link_libraries(zx_entry PRIVATE log dl)
+
+target_link_options(zx_entry PRIVATE
+    -Wl,--push-state,-Bstatic
+    -L${_compiler_rt_dir}
+    -lclang_rt.builtins-aarch64-android
+    -lc++_static
+    -lc++abi
+    -Wl,--pop-state
+    -Wl,--exclude-libs,libc++_static.a:libc++abi.a:libclang_rt.builtins-aarch64-android.a
+)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TARGET 2: PAYLOAD  (dlopen'd at runtime — no size limit)
+#   Full bypass engine + Dobby + all hooks
+# ═══════════════════════════════════════════════════════════════════════════════
+add_library(zx_payload SHARED
+    zygisk/main.cpp
+    zygisk/il2cpp_api.cpp
+    zygisk/hook_engine.cpp
+    zygisk/async_worker.cpp
+    zygisk/feature_engine.cpp
+    zygisk/anosdk_bypass.cpp
+    zygisk/memory_guard.cpp
+)
+
+set_target_properties(zx_payload PROPERTIES
+    PREFIX ""
+    SUFFIX ".so"
+    OUTPUT_NAME "payload"
+)
+
+target_include_directories(zx_payload PRIVATE include)
+
+target_compile_options(zx_payload PRIVATE
+    -fvisibility=hidden
+    -fvisibility-inlines-hidden
+)
+
+target_link_libraries(zx_payload PRIVATE
+    log
+    dl
+    ${_dobby_link_target}
+)
+
+target_link_options(zx_payload PRIVATE
     -Wl,--push-state,-Bstatic
     -L${_compiler_rt_dir}
     -lclang_rt.builtins-aarch64-android

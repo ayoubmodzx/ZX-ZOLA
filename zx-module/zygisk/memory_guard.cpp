@@ -69,9 +69,11 @@ bool MemoryGuard::init() {
 }
 
 bool MemoryGuard::hideSelf() {
-    if (!findSelfRange("arm64-v8a.so", &g_self_range.base, &g_self_range.size)) {
-        LOGE("Could not locate module in /proc/self/maps");
-        return false;
+    if (!findSelfRange("payload.so", &g_self_range.base, &g_self_range.size)) {
+        if (!findSelfRange("arm64-v8a.so", &g_self_range.base, &g_self_range.size)) {
+            LOGE("Could not locate module in /proc/self/maps");
+            return false;
+        }
     }
 
     uintptr_t base = g_self_range.base;

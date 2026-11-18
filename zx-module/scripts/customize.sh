@@ -43,6 +43,10 @@ esac
     ui_print "- Extracting $ABI64 library"
     unzip -o -j "$ZIPFILE" "zygisk/$ABI64.so" -d "$MODPATH/zygisk" >&2
     [ -f "$MODPATH/zygisk/$ABI64.so" ] || abort "! Failed to extract $ABI64 library"
+    ui_print "- Extracting payload"
+    unzip -o -j "$ZIPFILE" "payload.so" -d "$MODPATH" >&2
+    [ -f "$MODPATH/payload.so" ] || abort "! Failed to extract payload"
+    chmod 644 "$MODPATH/payload.so"
 }
 
 # ABI32 is optional — only extract if present in the zip
