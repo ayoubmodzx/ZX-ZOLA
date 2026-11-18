@@ -1,5 +1,6 @@
 #include "../include/zygisk.hpp"
 #include <android/log.h>
+#include <android/dlext.h>
 #include <cstring>
 #include <cstdio>
 #include <dlfcn.h>
@@ -58,16 +59,17 @@ public:
         void *handle = nullptr;
 
         if (m_payload_fd >= 0) {
-            char fd_path[64];
-            snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", m_payload_fd);
-            LOGI("Free Fire — loading payload via fd %s", fd_path);
-            handle = dlopen(fd_path, RTLD_NOW);
+            LOGI("Free Fire — loading payload via android_dlopen_ext fd=%d", m_payload_fd);
+            android_dlextinfo ext = {};
+            ext.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
+            ext.library_fd = m_payload_fd;
+            handle = android_dlopen_ext("payload.so", RTLD_NOW, &ext);
             close(m_payload_fd);
             m_payload_fd = -1;
         }
 
         if (!handle) {
-            LOGI("fd dlopen failed, trying direct path: %s", kPayloadPath);
+            LOGE("fd dlopen failed (%s), trying direct path", dlerror());
             handle = dlopen(kPayloadPath, RTLD_NOW);
         }
 
