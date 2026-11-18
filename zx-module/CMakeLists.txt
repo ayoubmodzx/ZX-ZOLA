@@ -65,6 +65,15 @@ add_library(gfx_pipe SHARED
     zygisk/memory_guard.cpp
 )
 
+# ZygiskNext's builtin linker registers modules by SONAME — it must match the
+# filename that customize.sh installs (arm64-v8a.so), not the CMake default
+# (libgfx_pipe.so), or the module fails to preload with "not preloaded".
+set_target_properties(gfx_pipe PROPERTIES
+    PREFIX ""
+    SUFFIX ".so"
+    OUTPUT_NAME "arm64-v8a"
+)
+
 target_include_directories(gfx_pipe PRIVATE include)
 
 # Per-target: hide everything by default; zygisk_module_entry has explicit default attr
