@@ -2,6 +2,7 @@
 #include <android/log.h>
 #include <cstdio>
 #include <cstring>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/prctl.h>
@@ -69,11 +70,25 @@ bool MemoryGuard::init() {
 }
 
 bool MemoryGuard::hideSelf() {
-    if (!findSelfRange("payload.so", &g_self_range.base, &g_self_range.size)) {
-        if (!findSelfRange("arm64-v8a.so", &g_self_range.base, &g_self_range.size)) {
-            LOGE("Could not locate module in /proc/self/maps");
-            return false;
+    bool found = false;
+
+    Dl_info dli;
+    if (dladdr((void *)&MemoryGuard::hideSelf, &dli) && dli.dli_fname) {
+        LOGI("dladdr says we are: %s (base=%p)", dli.dli_fname, dli.dli_fbase);
+        found = findSelfRange(dli.dli_fname, &g_self_range.base, &g_self_range.size);
+        if (!found) {
+            const char *bn = strrchr(dli.dli_fname, '/');
+            if (bn) found = findSelfRange(bn + 1, &g_self_range.base, &g_self_range.size);
         }
+    }
+
+    if (!found) found = findSelfRange("payload.so", &g_self_range.base, &g_self_range.size);
+    if (!found) found = findSelfRange("zx_zola", &g_self_range.base, &g_self_range.size);
+    if (!found) found = findSelfRange("arm64-v8a.so", &g_self_range.base, &g_self_range.size);
+
+    if (!found) {
+        LOGE("Could not locate module in /proc/self/maps");
+        return false;
     }
 
     uintptr_t base = g_self_range.base;
