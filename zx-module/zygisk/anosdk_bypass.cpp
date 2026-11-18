@@ -366,8 +366,8 @@ uint32_t g_ano_mount_filtered = 0;
 
 // SVC path diagnostic: log first 32 unique unfiltered openat paths from SIGSYS
 static constexpr int kMaxDiagPaths = 32;
-static char s_diag_paths[kMaxDiagPaths][128];
-static int  s_diag_path_count = 0;
+char s_diag_paths[kMaxDiagPaths][128];
+int  s_diag_path_count = 0;
 
 static void diag_log_svc_path(const char *path) {
     if (!path || s_diag_path_count >= kMaxDiagPaths) return;
