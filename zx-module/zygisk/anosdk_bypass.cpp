@@ -733,65 +733,45 @@ static bool is_self_environ(const char *path) {
     return strcmp(path, buf) == 0;
 }
 
-// ── Detection report dump ────────────────────────────────────────────────────
-// Writes AnoSDK ioctl payloads + SVC diagnostic paths to a file the user can
-// pull via: adb shell cat /data/data/com.dts.freefireth/cache/zx_detect_dump.txt
+// ── Detection report dump (logcat) ───────────────────────────────────────────
+// All AnoSDK ioctl payloads + SVC diagnostic paths dumped to logcat.
+// Capture with: logcat -s ZX-ZOLA | grep DUMP
 #include <sys/ioctl.h>
 #include <time.h>
 
-static int  s_dump_fd      = -1;
-static int  s_dump_count   = 0;
-static bool s_dump_opened  = false;
-
-static void dump_open() {
-    if (s_dump_opened) return;
-    s_dump_opened = true;
-    s_dump_fd = (int)safe_syscall(__NR_openat, (long)AT_FDCWD,
-        (long)"/data/data/com.dts.freefireth/cache/zx_detect_dump.txt",
-        (long)(O_WRONLY | O_CREAT | O_TRUNC), (long)0666);
-    if (s_dump_fd >= 0) {
-        const char *hdr = "=== ZX-ZOLA v2.52 AnoSDK Detection Dump ===\n\n";
-        syscall(SYS_write, s_dump_fd, hdr, __builtin_strlen(hdr));
-    }
-}
+static int s_dump_count = 0;
 
 static void dump_write(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 static void dump_write(const char *fmt, ...) {
-    if (s_dump_fd < 0) dump_open();
-    if (s_dump_fd < 0) return;
-    char buf[1024];
+    char buf[512];
     va_list ap;
     va_start(ap, fmt);
-    int len = vsnprintf(buf, sizeof(buf), fmt, ap);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (len > 0) syscall(SYS_write, s_dump_fd, buf, (size_t)len);
+    LOGI("[DUMP] %s", buf);
 }
 
 static void dump_hex(const uint8_t *data, size_t len) {
-    if (s_dump_fd < 0) dump_open();
-    if (s_dump_fd < 0) return;
-    char line[128];
-    for (size_t off = 0; off < len; off += 16) {
-        int pos = snprintf(line, sizeof(line), "  %04zx: ", off);
-        for (size_t j = 0; j < 16 && (off + j) < len; j++)
-            pos += snprintf(line + pos, sizeof(line) - pos, "%02x ", data[off + j]);
-        for (size_t j = (len - off < 16 ? len - off : 16); j < 16; j++)
-            pos += snprintf(line + pos, sizeof(line) - pos, "   ");
+    for (size_t off = 0; off < len; off += 32) {
+        char line[200];
+        int pos = snprintf(line, sizeof(line), "%04zx: ", off);
+        for (size_t j = 0; j < 32 && (off + j) < len; j++)
+            pos += snprintf(line + pos, sizeof(line) - pos, "%02x", data[off + j]);
         pos += snprintf(line + pos, sizeof(line) - pos, " |");
-        for (size_t j = 0; j < 16 && (off + j) < len; j++) {
+        for (size_t j = 0; j < 32 && (off + j) < len; j++) {
             char c = (char)data[off + j];
             line[pos++] = (c >= 0x20 && c < 0x7f) ? c : '.';
         }
-        line[pos++] = '|'; line[pos++] = '\n'; line[pos] = '\0';
-        syscall(SYS_write, s_dump_fd, line, (size_t)pos);
+        line[pos++] = '|'; line[pos] = '\0';
+        LOGI("[DUMP] %s", line);
     }
 }
 
 void dump_svc_paths() {
     if (s_diag_path_count == 0) return;
-    dump_write("\n--- Unfiltered SVC openat paths (%d total) ---\n", s_diag_path_count);
+    LOGI("[DUMP] === Unfiltered SVC openat paths (%d) ===", s_diag_path_count);
     for (int i = 0; i < s_diag_path_count; i++)
-        dump_write("  [%d] %s\n", i, s_diag_paths[i]);
+        LOGI("[DUMP] SVC-PATH[%d] %s", i, s_diag_paths[i]);
 }
 
 // Protection 12: tp_syscall_imp — libanort.so exports a raw SVC #0 wrapper that
