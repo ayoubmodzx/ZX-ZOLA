@@ -52,8 +52,8 @@ if(_dobby_asm_files)
 endif()
 
 # ── Global flags ──────────────────────────────────────────────────────────────
-set(CMAKE_CXX_FLAGS_RELEASE   "-O2 -ffunction-sections -fdata-sections")
-set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed -Wl,--strip-all -Wl,-z,relro,-z,now")
+set(CMAKE_CXX_FLAGS_RELEASE   "-Oz -ffunction-sections -fdata-sections -flto=thin")
+set(CMAKE_SHARED_LINKER_FLAGS "-Wl,--gc-sections -Wl,--as-needed -Wl,--strip-all -Wl,-z,relro,-z,now -flto=thin")
 
 add_library(gfx_pipe SHARED
     zygisk/main.cpp
