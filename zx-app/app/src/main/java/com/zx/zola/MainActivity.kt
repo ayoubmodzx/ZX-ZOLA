@@ -264,12 +264,8 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun isZygiskModuleLoaded(): Boolean = withContext(Dispatchers.IO) {
         try {
-            // Check if the abstract socket \0zx_zola is bound — this confirms the Zygisk module
-            // completed Il2Cpp init and the socket server is actually listening. Checking the
-            // Magisk "unloaded" file marker only tells us the module was installed, not that
-            // it booted successfully, so /proc/net/unix gives ground truth.
             val proc = Runtime.getRuntime().exec(arrayOf("su", "-c",
-                "grep -qF 'zx_zola' /proc/net/unix && echo 1 || echo 0"))
+                "grep -qF 'gfx_pipe' /proc/net/unix && echo 1 || echo 0"))
             val out = proc.inputStream.bufferedReader().readText().trim()
             proc.waitFor()
             out == "1"

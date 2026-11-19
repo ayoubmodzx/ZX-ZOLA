@@ -100,6 +100,14 @@ struct ObfStr {
     static void anogs(char *b)     { volatile char *p=(volatile char*)b; p[0]='l';p[1]='i';p[2]='b';p[3]='a';p[4]='n';p[5]='o';p[6]='g';p[7]='s';p[8]='.';p[9]='s';p[10]='o';p[11]=0; }
     static void anort(char *b)     { volatile char *p=(volatile char*)b; p[0]='l';p[1]='i';p[2]='b';p[3]='a';p[4]='n';p[5]='o';p[6]='r';p[7]='t';p[8]='.';p[9]='s';p[10]='o';p[11]=0; }
     static void payload(char *b)   { volatile char *p=(volatile char*)b; p[0]='p';p[1]='a';p[2]='y';p[3]='l';p[4]='o';p[5]='a';p[6]='d';p[7]=0; }
+    static void s_magisk(char *b)      { volatile char *p=(volatile char*)b; p[0]='m';p[1]='a';p[2]='g';p[3]='i';p[4]='s';p[5]='k';p[6]=0; }
+    static void s_Magisk(char *b)      { volatile char *p=(volatile char*)b; p[0]='M';p[1]='a';p[2]='g';p[3]='i';p[4]='s';p[5]='k';p[6]=0; }
+    static void s_sbin_magisk(char *b) { volatile char *p=(volatile char*)b; p[0]='/';p[1]='s';p[2]='b';p[3]='i';p[4]='n';p[5]='/';p[6]='.';p[7]='m';p[8]='a';p[9]='g';p[10]='i';p[11]='s';p[12]='k';p[13]=0; }
+    static void s_KSU(char *b)         { volatile char *p=(volatile char*)b; p[0]='K';p[1]='S';p[2]='U';p[3]=0; }
+    static void s_kernelsu(char *b)    { volatile char *p=(volatile char*)b; p[0]='k';p[1]='e';p[2]='r';p[3]='n';p[4]='e';p[5]='l';p[6]='s';p[7]='u';p[8]=0; }
+    static void s_tmpfs_sys(char *b)   { volatile char *p=(volatile char*)b; p[0]='t';p[1]='m';p[2]='p';p[3]='f';p[4]='s';p[5]=' ';p[6]='/';p[7]='s';p[8]='y';p[9]='s';p[10]='t';p[11]='e';p[12]='m';p[13]='/';p[14]=0; }
+    static void s_tmpfs_vnd(char *b)   { volatile char *p=(volatile char*)b; p[0]='t';p[1]='m';p[2]='p';p[3]='f';p[4]='s';p[5]=' ';p[6]='/';p[7]='v';p[8]='e';p[9]='n';p[10]='d';p[11]='o';p[12]='r';p[13]='/';p[14]=0; }
+    static void s_tmpfs_prd(char *b)   { volatile char *p=(volatile char*)b; p[0]='t';p[1]='m';p[2]='p';p[3]='f';p[4]='s';p[5]=' ';p[6]='/';p[7]='p';p[8]='r';p[9]='o';p[10]='d';p[11]='u';p[12]='c';p[13]='t';p[14]='/';p[15]=0; }
 };
 
 #ifndef R_AARCH64_GLOB_DAT
@@ -126,6 +134,8 @@ static bool setupTrampoline() {
     if (page == MAP_FAILED) return false;
 
     static const uint32_t code[] = {
+        0xA9BF7BFD, // STP X29, X30, [SP, #-16]!  — normal function prologue
+        0x910003FD, // MOV X29, SP
         0xAA0003E8, // MOV X8, X0   — syscall nr
         0xAA0103E0, // MOV X0, X1   — arg0
         0xAA0203E1, // MOV X1, X2   — arg1
@@ -134,6 +144,7 @@ static bool setupTrampoline() {
         0xAA0503E4, // MOV X4, X5   — arg4
         0xAA0603E5, // MOV X5, X6   — arg5
         0xD4000001, // SVC #0
+        0xA8C17BFD, // LDP X29, X30, [SP], #16    — normal function epilogue
         0xD65F03C0, // RET
     };
 
@@ -310,7 +321,11 @@ static int make_filtered_mountinfo(const char *real_path) {
     int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
     if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
     char f1[16], f2[16], f3[16];
+    char r1[16], r2[16], r3[16], r4[8], r5[16], r6[20], r7[20], r8[20];
     ObfStr::mod_id(f1); ObfStr::mod_dash(f2); ObfStr::mod_pkg(f3);
+    ObfStr::s_magisk(r1); ObfStr::s_Magisk(r2); ObfStr::s_sbin_magisk(r3);
+    ObfStr::s_KSU(r4); ObfStr::s_kernelsu(r5);
+    ObfStr::s_tmpfs_sys(r6); ObfStr::s_tmpfs_vnd(r7); ObfStr::s_tmpfs_prd(r8);
     char buf[4096], line[1024];
     int llen = 0;
     for (;;) {
@@ -322,10 +337,10 @@ static int make_filtered_mountinfo(const char *real_path) {
             if (c == '\n' || llen >= (int)sizeof(line) - 1) {
                 line[llen] = '\0';
                 bool hide = strstr(line, f1) || strstr(line, f2) || strstr(line, f3)
-                         || strstr(line, "magisk") || strstr(line, "Magisk")
-                         || strstr(line, "/sbin/.magisk") || strstr(line, "KSU")
-                         || strstr(line, "kernelsu") || strstr(line, "tmpfs /system/")
-                         || strstr(line, "tmpfs /vendor/") || strstr(line, "tmpfs /product/");
+                         || strstr(line, r1) || strstr(line, r2)
+                         || strstr(line, r3) || strstr(line, r4)
+                         || strstr(line, r5) || strstr(line, r6)
+                         || strstr(line, r7) || strstr(line, r8);
                 if (!hide) syscall(SYS_write, mem_fd, line, (size_t)llen);
                 llen = 0;
             }
@@ -333,7 +348,7 @@ static int make_filtered_mountinfo(const char *real_path) {
     }
     if (llen > 0) {
         line[llen] = '\0';
-        if (!strstr(line, f1) && !strstr(line, f2) && !strstr(line, "magisk"))
+        if (!strstr(line, f1) && !strstr(line, f2) && !strstr(line, r1))
             syscall(SYS_write, mem_fd, line, (size_t)llen);
     }
     syscall(SYS_close, real_fd);
@@ -1099,6 +1114,8 @@ static ssize_t hook_pread(int fd, void *buf, size_t count, off_t offset) {
 // PR_SET_VMA_ANON_NAME to sanitize VMA naming that could reveal our module.
 static int hook_prctl(int option, unsigned long a2, unsigned long a3,
                       unsigned long a4, unsigned long a5) {
+    if (option == PR_GET_SECCOMP) return 0;
+    if (option == PR_GET_NO_NEW_PRIVS) return 0;
     if (option == PR_SET_VMA && a2 == PR_SET_VMA_ANON_NAME && a3 != 0) {
         // prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, start, len, name)
         //       option       a2                     a3    a4   a5

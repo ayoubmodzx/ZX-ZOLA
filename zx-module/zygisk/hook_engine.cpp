@@ -1,5 +1,4 @@
 #include "hook_engine.hpp"
-#include "../include/dobby.h"
 #include "../include/il2cpp_types.hpp"
 #include <dlfcn.h>
 #include <android/log.h>
@@ -14,59 +13,6 @@
 HookEngine &HookEngine::get() {
     static HookEngine instance;
     return instance;
-}
-
-bool HookEngine::hookAddr(void *target, void *replacement,
-                           void **original, const char *tag) {
-    if (!target || !replacement) {
-        LOGE("[%s] null target or replacement", tag);
-        return false;
-    }
-
-    uintptr_t key = reinterpret_cast<uintptr_t>(target);
-
-    if (m_hooks.count(key) && m_hooks[key].installed) {
-        LOGI("[%s] already hooked at %p, skipping", tag, target);
-        return true;
-    }
-
-    int ret = DobbyHook(target, replacement, original);
-    if (ret != 0) {
-        LOGE("[%s] DobbyHook failed at %p, ret=%d", tag, target, ret);
-        return false;
-    }
-
-    m_hooks[key] = { .original    = (original ? *original : nullptr),
-                     .replacement = replacement,
-                     .trampoline  = original,
-                     .installed   = true,
-                     .method_swap = false };
-
-    LOGI("[%s] dobby-hooked %p -> %p", tag, target, replacement);
-    return true;
-}
-
-bool HookEngine::hookSym(const char *lib, const char *symbol,
-                          void *replacement, void **original, const char *tag) {
-    void *handle = dlopen(lib, RTLD_LAZY | RTLD_NOLOAD);
-    if (!handle) {
-        LOGE("[%s] dlopen %s failed", tag, lib);
-        return false;
-    }
-
-    void *sym = dlsym(handle, symbol);
-    dlclose(handle);
-
-    if (!sym) {
-        sym = dlsym(RTLD_DEFAULT, symbol);
-    }
-
-    if (!sym) {
-        LOGE("[%s] symbol %s not found in %s", tag, symbol, lib);
-        return false;
-    }
-
-    return hookAddr(sym, replacement, original, tag);
 }
 
 // MethodInfo pointer swap — changes the methodPointer field (offset 0 in the
@@ -128,8 +74,7 @@ bool HookEngine::hookMethod(void *methodInfo, void *replacement,
     m_hooks[key] = { .original    = orig,
                      .replacement = replacement,
                      .trampoline  = original,
-                     .installed   = true,
-                     .method_swap = true };
+                     .installed   = true };
 
     LOGI("[%s] method-swap %p: %p -> %p (no .text modification)", tag, methodInfo, orig, replacement);
     return true;
@@ -139,15 +84,7 @@ bool HookEngine::unhook(void *target) {
     uintptr_t key = reinterpret_cast<uintptr_t>(target);
     auto it = m_hooks.find(key);
     if (it == m_hooks.end() || !it->second.installed) return false;
-
-    if (it->second.method_swap) {
-        return unhookMethod(target);
-    }
-
-    DobbyDestroy(target);
-    it->second.installed = false;
-    LOGI("Dobby-unhooked %p", target);
-    return true;
+    return unhookMethod(target);
 }
 
 bool HookEngine::unhookMethod(void *methodInfo) {
@@ -175,12 +112,8 @@ bool HookEngine::unhookMethod(void *methodInfo) {
 void HookEngine::unhookAll() {
     for (auto &[addr, entry] : m_hooks) {
         if (!entry.installed) continue;
-        if (entry.method_swap) {
-            auto *mi = reinterpret_cast<MethodInfo *>(addr);
-            mi->methodPointer = entry.original;
-        } else {
-            DobbyDestroy(reinterpret_cast<void *>(addr));
-        }
+        auto *mi = reinterpret_cast<MethodInfo *>(addr);
+        mi->methodPointer = entry.original;
         entry.installed = false;
     }
     __sync_synchronize();
