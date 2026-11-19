@@ -1,4 +1,4 @@
-// AnoSDK bypass v3.1 — GOT + trampoline seccomp, 41 protections + deep library analysis fixes
+// AnoSDK bypass v3.1 — GOT + svc_page seccomp, 41 protections + deep library analysis fixes
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -21,7 +21,6 @@
 //   • Added dl_iterate_phdr GOT hook (was Dobby)     → library scan defeated
 
 #include "anosdk_bypass.hpp"
-#include <android/log.h>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -84,8 +83,7 @@
 #endif
 
 #define TAG "SurfaceFlinger"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#include "zx_log.h"
 
 // Runtime string builder — keeps module identifiers out of .rodata so AnoSDK
 // memory scanners can't pattern-match our filter strings in anonymous pages.
@@ -117,16 +115,16 @@ struct ObfStr {
 #define R_AARCH64_JUMP_SLOT 1026
 #endif
 
-// ── Syscall trampoline ───────────────────────────────────────────────────────
+// ── Syscall svc_page ───────────────────────────────────────────────────────
 // Executable page with a bare SVC #0 that our seccomp BPF whitelists by IP.
 // After seccomp is installed, ALL openat/readlinkat in the process are trapped
 // EXCEPT when issued from this page — so our own filter functions and
 // pass-through paths call through here to avoid recursive SIGSYS.
-static void *s_trampoline = nullptr;
-static uintptr_t s_trampoline_start = 0;
-static uintptr_t s_trampoline_end   = 0;
+static void *s_svc_page = nullptr;
+static uintptr_t s_svc_page_start = 0;
+static uintptr_t s_svc_page_end   = 0;
 
-typedef long (*trampoline_fn_t)(long, long, long, long, long, long, long);
+typedef long (*svc_page_fn_t)(long, long, long, long, long, long, long);
 
 static bool setupTrampoline() {
     void *page = mmap(nullptr, 4096, PROT_READ | PROT_WRITE,
@@ -151,9 +149,9 @@ static bool setupTrampoline() {
     __builtin_memcpy(page, code, sizeof(code));
     mprotect(page, 4096, PROT_READ | PROT_EXEC);
 
-    s_trampoline       = page;
-    s_trampoline_start = (uintptr_t)page;
-    s_trampoline_end   = s_trampoline_start + 4096;
+    s_svc_page       = page;
+    s_svc_page_start = (uintptr_t)page;
+    s_svc_page_end   = s_svc_page_start + 4096;
 
     prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
           (unsigned long)page, (unsigned long)4096, "linker_alloc_small");
@@ -162,8 +160,8 @@ static bool setupTrampoline() {
 
 static inline long safe_syscall(long nr, long a0=0, long a1=0, long a2=0,
                                 long a3=0, long a4=0, long a5=0) {
-    if (__builtin_expect(s_trampoline != nullptr, 1))
-        return ((trampoline_fn_t)s_trampoline)(nr, a0, a1, a2, a3, a4, a5);
+    if (__builtin_expect(s_svc_page != nullptr, 1))
+        return ((svc_page_fn_t)s_svc_page)(nr, a0, a1, a2, a3, a4, a5);
     return syscall(nr, a0, a1, a2, a3, a4, a5);
 }
 
@@ -934,7 +932,7 @@ struct DlHideCtx {
     int  (*user_cb)(struct dl_phdr_info *, size_t, void *);
     void *user_data;
 };
-static int dl_hide_trampoline(struct dl_phdr_info *info, size_t sz, void *raw) {
+static int dl_hide_svc_page(struct dl_phdr_info *info, size_t sz, void *raw) {
     auto *ctx = static_cast<DlHideCtx *>(raw);
     if (info->dlpi_name) {
         char h1[16], h2[16];
@@ -949,7 +947,7 @@ static int dl_hide_trampoline(struct dl_phdr_info *info, size_t sz, void *raw) {
 static int hook_dl_iterate_phdr(
         int (*cb)(struct dl_phdr_info *, size_t, void *), void *data) {
     DlHideCtx ctx{ cb, data };
-    return ::dl_iterate_phdr(dl_hide_trampoline, &ctx);
+    return ::dl_iterate_phdr(dl_hide_svc_page, &ctx);
 }
 
 // Protection 19: getenv — AnoSDK calls getenv() directly to read LD_PRELOAD,
@@ -1422,11 +1420,11 @@ static int hook_clock_gettime(clockid_t clk, struct timespec *tp) {
 }
 
 // Protection 36: memmem — AnoSDK uses memmem() for memory pattern scanning.
-// It searches process memory for known byte sequences: hook trampolines,
+// It searches process memory for known byte sequences: hook svc_pages,
 // BPF filter structures, Zygisk signatures, Dobby code patterns, etc.
-// Defense: if the needle matches our trampoline SVC instruction bytes or
+// Defense: if the needle matches our svc_page SVC instruction bytes or
 // known scanning patterns, return NULL.  For general searches, skip results
-// that land inside our trampoline page or hidden anonymous module regions.
+// that land inside our svc_page page or hidden anonymous module regions.
 #include <sys/utsname.h>
 uint32_t g_ano_memmem_filtered = 0;
 static void *hook_memmem(const void *haystack, size_t haystacklen,
@@ -1435,7 +1433,7 @@ static void *hook_memmem(const void *haystack, size_t haystacklen,
         return ::memmem(haystack, haystacklen, needle, needlelen);
 
     // Block scanning for SVC #0 instruction pattern (D4000001) which AnoSDK uses
-    // to find raw syscall sites that might be our trampoline
+    // to find raw syscall sites that might be our svc_page
     if (needlelen >= 4) {
         const uint8_t *nb = (const uint8_t *)needle;
         // SVC #0 = 0xD4000001 in little-endian
@@ -1447,10 +1445,10 @@ static void *hook_memmem(const void *haystack, size_t haystacklen,
 
     void *result = ::memmem(haystack, haystacklen, needle, needlelen);
 
-    // If the result lands in our trampoline page, return NULL
-    if (result && s_trampoline_start) {
+    // If the result lands in our svc_page page, return NULL
+    if (result && s_svc_page_start) {
         uintptr_t addr = (uintptr_t)result;
-        if (addr >= s_trampoline_start && addr < s_trampoline_end) {
+        if (addr >= s_svc_page_start && addr < s_svc_page_end) {
             ++g_ano_memmem_filtered;
             return nullptr;
         }
@@ -1949,8 +1947,14 @@ static const PatchEntry kAnortEntries[] = {
     { "clock_gettime",    reinterpret_cast<void *>(hook_clock_gettime)     },
     // Protection 35: signal() — block SIGSYS override via old API
     { "signal",           reinterpret_cast<void *>(hook_signal)            },
+    // Protection 36: memmem — block memory pattern scanning
+    { "memmem",           reinterpret_cast<void *>(hook_memmem)            },
+    // Protection 37: getppid — spoof parent PID
+    { "getppid",          reinterpret_cast<void *>(hook_getppid)           },
     // Protection 38: getuid — defensive UID check
     { "getuid",           reinterpret_cast<void *>(hook_getuid)            },
+    // Protection 39: uname — clean kernel version strings
+    { "uname",            reinterpret_cast<void *>(hook_uname)             },
     // Protection 40: getcwd — hide root working directories
     { "getcwd",           reinterpret_cast<void *>(hook_getcwd)            },
     // Protection 41: __system_property_read_callback — alternate prop API
@@ -2067,8 +2071,8 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx) {
 }
 
 static bool installSvcFilter() {
-    if (!s_trampoline) {
-        LOGE("[SECCOMP] no trampoline — cannot install");
+    if (!s_svc_page) {
+        LOGE("[SECCOMP] no svc_page — cannot install");
         return false;
     }
 
@@ -2083,11 +2087,11 @@ static bool installSvcFilter() {
 
     prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
-    uint32_t tr_hi  = (uint32_t)(s_trampoline_start >> 32);
-    uint32_t tr_lo  = (uint32_t)(s_trampoline_start & 0xFFFFFFFFULL);
-    uint32_t tr_end = (uint32_t)(s_trampoline_end   & 0xFFFFFFFFULL);
+    uint32_t tr_hi  = (uint32_t)(s_svc_page_start >> 32);
+    uint32_t tr_lo  = (uint32_t)(s_svc_page_start & 0xFFFFFFFFULL);
+    uint32_t tr_end = (uint32_t)(s_svc_page_end   & 0xFFFFFFFFULL);
 
-    // BPF: trap filesystem-probing syscalls EXCEPT when IP is in our trampoline.
+    // BPF: trap filesystem-probing syscalls EXCEPT when IP is in our svc_page.
     // Covers raw SVC from anywhere (anonymous mmap, JIT, copied code stubs).
     // Trapped: openat, readlinkat, newfstatat, faccessat, faccessat2, statx
     struct sock_filter filt[] = {
@@ -2101,7 +2105,7 @@ static bool installSvcFilter() {
         /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx,       2, 0),
         /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2,  1, 0),
         /* 9  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        // ── Whitelist our trampoline page ──
+        // ── Whitelist our svc_page page ──
         /*10 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
         /*11 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, tr_hi, 0, 4),
         /*12 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
@@ -2123,8 +2127,8 @@ static bool installSvcFilter() {
         ret = prctl(PR_SET_SECCOMP, 2, (unsigned long)&prog, 0, 0);
 
     if (ret == 0)
-        LOGI("[SECCOMP] SVC filter installed — trampoline=[0x%lx,0x%lx)",
-             s_trampoline_start, s_trampoline_end);
+        LOGI("[SECCOMP] SVC filter installed — svc_page=[0x%lx,0x%lx)",
+             s_svc_page_start, s_svc_page_end);
     else
         LOGE("[SECCOMP] install failed errno=%d", errno);
     return ret == 0;
@@ -2367,7 +2371,7 @@ void AnoBypass::installEarly() {
 
     // 1. Trampoline — must exist before seccomp filter
     if (!setupTrampoline())
-        LOGE("init: trampoline mmap failed");
+        LOGE("init: svc_page mmap failed");
 
     // 2. Signal handlers — custom no-op instead of SIG_IGN (AnoSDK flags SIG_IGN)
     struct sigaction sa{};
@@ -2380,11 +2384,11 @@ void AnoBypass::installEarly() {
     //    Defeats raw SVC openat /proc/self/maps before GOT hooks are in place.
     hideModuleMaps();
 
-    // 4. Seccomp SVC filter — traps ALL openat/readlinkat except our trampoline.
+    // 4. Seccomp SVC filter — traps ALL openat/readlinkat except our svc_page.
     //    Installed before AnoSDK loads so there's zero race window.
     installSvcFilter();
 
-    LOGI("init: trampoline + signal handlers + hide + seccomp installed");
+    LOGI("init: svc_page + signal handlers + hide + seccomp installed");
 }
 
 void AnoBypass::startWatcher() {

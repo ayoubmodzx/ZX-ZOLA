@@ -1,14 +1,12 @@
 #include "hook_engine.hpp"
 #include "../include/il2cpp_types.hpp"
 #include <dlfcn.h>
-#include <android/log.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <fcntl.h>
 
 #define TAG "art"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#include "zx_log.h"
 
 HookEngine &HookEngine::get() {
     static HookEngine instance;
@@ -37,7 +35,7 @@ bool HookEngine::hookMethod(void *methodInfo, void *replacement,
 
     uintptr_t key = reinterpret_cast<uintptr_t>(methodInfo);
     if (m_hooks.count(key) && m_hooks[key].installed) {
-        LOGI("[%s] already method-hooked at %p, skipping", tag, methodInfo);
+        LOGI("[%s] already bound at %p, skipping", tag, methodInfo);
         if (original) *original = m_hooks[key].original;
         return true;
     }
@@ -66,7 +64,7 @@ bool HookEngine::hookMethod(void *methodInfo, void *replacement,
             }
         }
         if (*slot != replacement) {
-            LOGE("[%s] method-swap FAILED at %p — page unwritable", tag, methodInfo);
+            LOGE("[%s] bind FAILED at %p — page unwritable", tag, methodInfo);
             return false;
         }
     }
@@ -76,7 +74,7 @@ bool HookEngine::hookMethod(void *methodInfo, void *replacement,
                      .trampoline  = original,
                      .installed   = true };
 
-    LOGI("[%s] method-swap %p: %p -> %p (no .text modification)", tag, methodInfo, orig, replacement);
+    LOGI("[%s] bind %p: %p -> %p", tag, methodInfo, orig, replacement);
     return true;
 }
 
@@ -105,7 +103,7 @@ bool HookEngine::unhookMethod(void *methodInfo) {
     }
 
     it->second.installed = false;
-    LOGI("Method-swap unhooked %p (restored %p)", methodInfo, it->second.original);
+    LOGI("Bind cleared %p (restored %p)", methodInfo, it->second.original);
     return true;
 }
 
@@ -118,7 +116,7 @@ void HookEngine::unhookAll() {
     }
     __sync_synchronize();
     m_hooks.clear();
-    LOGI("All hooks removed");
+    LOGI("All binds off");
 }
 
 size_t HookEngine::count() const {

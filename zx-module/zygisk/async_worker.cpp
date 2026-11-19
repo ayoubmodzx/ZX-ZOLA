@@ -1,9 +1,8 @@
 #include "async_worker.hpp"
 #include <chrono>
-#include <android/log.h>
 
 #define TAG "HwBinder"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
+#include "zx_log.h"
 
 void AsyncWorker::start() {
     m_running = true;

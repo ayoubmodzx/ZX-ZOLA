@@ -1,5 +1,4 @@
 #include "il2cpp_api.hpp"
-#include <android/log.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -7,8 +6,7 @@
 #include <elf.h>
 
 #define TAG "InputDispatcher"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#include "zx_log.h"
 
 // Cached function pointers — resolved once via ELF parsing, no dlopen needed
 il2cpp_domain_get_t                  il2cpp_domain_get                  = nullptr;

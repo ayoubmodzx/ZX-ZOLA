@@ -8,7 +8,8 @@
 //   3. Hook dl_iterate_phdr to skip our entry in all linker library enumerations
 namespace MemoryGuard {
     bool  init();
-    bool  hideSelf();          // hide this module's loaded pages from scanner
+    bool  hideSelf();
     bool  hideRegion(void *addr, size_t size);
     void  restore();
+    bool  isOurRegion(uintptr_t addr);
 }

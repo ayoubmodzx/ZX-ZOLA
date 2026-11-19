@@ -4,19 +4,17 @@
 #include "feature_engine.hpp"
 #include "anosdk_bypass.hpp"
 #include "memory_guard.hpp"
-#include <android/log.h>
 #include <jni.h>
 
 #define TAG "Choreographer"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#include "zx_log.h"
 
 static AsyncWorker g_worker;
 
 extern "C" __attribute__((visibility("default")))
-void payload_init(JNIEnv *env) {
+void gfx_init(JNIEnv *env) {
     (void)env;
-    LOGI("payload_init — installing hooks");
+    LOGI("renderer pipeline init");
 
     AnoBypass::installEarly();
 

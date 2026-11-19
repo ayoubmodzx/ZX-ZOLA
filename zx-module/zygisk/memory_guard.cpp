@@ -1,5 +1,4 @@
 #include "memory_guard.hpp"
-#include <android/log.h>
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
@@ -11,8 +10,7 @@
 #include <sys/syscall.h>
 
 #define TAG "GC"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#include "zx_log.h"
 
 #ifndef PR_SET_VMA
 #define PR_SET_VMA            0x53564d41
@@ -66,7 +64,7 @@ static bool findSelfRange(const char *so_name,
 
 bool MemoryGuard::init() {
     // No external dependency — ELF-zeroing always available
-    LOGI("MemoryGuard ready (ELF-zeroing + VMA-rename + dl_iterate_phdr hook)");
+    LOGI("MemoryGuard ready (ELF-zeroing + VMA-rename + dl_iterate_phdr filter)");
     return true;
 }
 
@@ -128,6 +126,11 @@ bool MemoryGuard::hideRegion(void *addr, size_t size) {
     ssize_t n = pwrite(fd, zeros, chunk, (off_t)reinterpret_cast<uintptr_t>(addr));
     close(fd);
     return n > 0;
+}
+
+bool MemoryGuard::isOurRegion(uintptr_t addr) {
+    return g_self_range.base != 0 && addr >= g_self_range.base
+           && addr < g_self_range.base + g_self_range.size;
 }
 
 void MemoryGuard::restore() {

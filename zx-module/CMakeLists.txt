@@ -43,6 +43,7 @@ target_include_directories(zx_entry PRIVATE include)
 target_compile_options(zx_entry PRIVATE
     -fvisibility=hidden
     -fvisibility-inlines-hidden
+    -DZX_STRIP_LOGS
 )
 
 target_link_libraries(zx_entry PRIVATE log dl)
@@ -74,7 +75,7 @@ add_library(zx_payload SHARED
 set_target_properties(zx_payload PROPERTIES
     PREFIX ""
     SUFFIX ".so"
-    OUTPUT_NAME "payload"
+    OUTPUT_NAME "libgfx_core"
 )
 
 target_include_directories(zx_payload PRIVATE include)
@@ -82,6 +83,7 @@ target_include_directories(zx_payload PRIVATE include)
 target_compile_options(zx_payload PRIVATE
     -fvisibility=hidden
     -fvisibility-inlines-hidden
+    -DZX_STRIP_LOGS
 )
 
 target_link_libraries(zx_payload PRIVATE

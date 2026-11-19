@@ -1,6 +1,5 @@
 #include "feature_engine.hpp"
 #include "hook_engine.hpp"
-#include <android/log.h>
 #include <cstring>
 #include <cmath>
 #include <cerrno>
@@ -10,8 +9,7 @@
 #include <sys/un.h>
 
 #define TAG "OpenGLRenderer"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+#include "zx_log.h"
 
 // Abstract socket name (leading \0 = abstract, no filesystem entry)
 // Name must blend with normal Android system sockets in /proc/net/unix
@@ -75,7 +73,7 @@ static MethodInfo *s_match_show_team_mth      = nullptr;
 static MethodInfo *s_match_try_init_mth       = nullptr;
 static MethodInfo *s_match_get_inst_mth       = nullptr;
 static FieldInfo *s_enable_outline_field = nullptr;
-// Through-wall render queue trampolines (filled by applyESP hook setup)
+// Through-wall render queue ptrs (filled by applyESP hook setup)
 static void *s_orig_set_render_q    = nullptr;
 static void *s_orig_revert_render_q = nullptr;
 // GameSettingData game-thread permission gate
@@ -334,7 +332,7 @@ void FeatureEngine::resolveClasses() {
     }
 
     // ESP — hook the HUD/UI draw methods that render enemy indicators
-    // IsVisible gate is also hooked for culling, but the real visual effect
+    // IsVisible gate is also ready for culling, but the real visual effect
     // requires forcing the enemy health bar / name plate to always render.
     if (m_cls.Player) {
         m_mth.isVisible = Il2CppApi::getMethod(m_cls.Player, "IsVisible", 0);
@@ -631,7 +629,7 @@ void FeatureEngine::resolveClasses() {
                  m_mth.enableUMAOutline      ? m_mth.enableUMAOutline->methodPointer      : nullptr,
                  m_mth.enableRendererOutline ? m_mth.enableRendererOutline->methodPointer : nullptr);
         } else {
-            LOGE("[ESP] AvatarTrace NOT found — through-wall visibility hook unavailable");
+            LOGE("[ESP] AvatarTrace NOT found — through-wall visibility N/A");
         }
     }
 
@@ -831,8 +829,8 @@ static void *s_orig_get_cur_head_pos    = nullptr;  // Player.get_CurHeadPos —
 static MethodInfo *s_get_cur_head_pos_mth = nullptr;
 static void *s_orig_is_moving           = nullptr;  // Player.IsMoving
 static MethodInfo *s_is_moving_mth      = nullptr;
-// InitOutline hooked target address — calling this address goes through our hook
-static void *s_initoutline_hooked_addr  = nullptr;
+// InitOutline ready target address — calling this address goes through our hook
+static void *s_initoutline_ready_addr  = nullptr;
 // v2.15 ESP fix — outline judge + avatar outline renderer
 static void *s_orig_outline_judge       = nullptr;  // Player.OutlineVisibleJudgeInUpDate
 static void *s_orig_avatar_outline      = nullptr;  // AvatarOutline.EnableOutline
@@ -1047,14 +1045,14 @@ static void *diagThread(void *) {
         for (int i = 0; i < s_enemy_count && i < 8; ++i)
             LOGI("║   enemy[%d]=%p", i, s_enemy_list[i]);
 
-        // Hook trampoline state
-        LOGI("║ [HOOKS] update=%p visible=%p outlineVis=%p initOutline=%p",
+        // Hook ptr state
+        LOGI("║ [BINDS] update=%p visible=%p outlineVis=%p initOutline=%p",
              s_orig_update, s_orig_visible, s_orig_set_outline_vis, s_orig_init_outline);
-        LOGI("║ [HOOKS] headTF=%p headBone=%p getpos=%p gettrans=%p setaimrot=%p",
+        LOGI("║ [BINDS] headTF=%p headBone=%p getpos=%p gettrans=%p setaimrot=%p",
              s_orig_get_head_tf, s_orig_get_head_bone, s_orig_getpos, s_orig_gettrans, s_orig_set_aim_rot);
-        LOGI("║ [HOOKS] isPlayerHead=%p scatterRate=%p outlineJudge=%p avatarOutline=%p",
+        LOGI("║ [BINDS] isPlayerHead=%p scatterRate=%p outlineJudge=%p avatarOutline=%p",
              s_orig_is_player_head, s_orig_scatter_rate, s_orig_outline_judge, s_orig_avatar_outline);
-        LOGI("║ [HOOKS] avatarTraceVis=%p avatarTraceRen=%p updateAiming=%p updateADS=%p",
+        LOGI("║ [BINDS] avatarTraceVis=%p avatarTraceRen=%p updateAiming=%p updateADS=%p",
              s_orig_set_player_visible, s_orig_enable_renderer_outline,
              s_orig_update_aiming, s_orig_update_aiming_ads);
 
@@ -1102,25 +1100,25 @@ static void *diagThread(void *) {
         if (s_esp && s_diag_outline_forced == 0 && s_diag_outline_vis > 0)
             LOGE("║ ⚠ ESP ON, SetOutlineVisible fires but NEVER forced — flag check bug");
         if (s_esp && !s_orig_set_outline_vis)
-            LOGE("║ ⚠ ESP ON but SetOutlineVisible NOT hooked — method not resolved");
+            LOGE("║ ⚠ ESP ON but SetOutlineVisible NOT ready — method not resolved");
         if (s_esp && !s_orig_outline_judge)
-            LOGE("║ ⚠ ESP ON but OutlineJudge NOT hooked — outline resets every frame");
+            LOGE("║ ⚠ ESP ON but OutlineJudge NOT ready — outline resets every frame");
         if (s_esp && s_diag_update_calls == 0)
-            LOGE("║ ⚠ ESP ON but Player.Update NEVER fired — hook not installed");
+            LOGE("║ ⚠ ESP ON but Player.Update NEVER fired — bind N/A");
         if (s_esp && s_enemy_count == 0 && s_diag_update_calls > 10)
             LOGE("║ ⚠ ESP ON, Update fires but 0 enemies — IsLocalPlayer may fail on all");
         if (s_auto_headshot && s_diag_hs_gate == 0 && s_diag_update_calls > 10)
             LOGE("║ ⚠ HEADSHOT ON but IsPlayerHead NEVER fired — not in damage pipeline");
         if (s_auto_headshot && !s_orig_is_player_head)
-            LOGE("║ ⚠ HEADSHOT ON but IsPlayerHead NOT hooked — method not resolved");
+            LOGE("║ ⚠ HEADSHOT ON but IsPlayerHead NOT ready — method not resolved");
         if ((s_auto_headshot || s_full_aimbot) && s_diag_aim_core_runs == 0 && s_diag_update_calls > 10)
-            LOGE("║ ⚠ AIM ON but run_aimbot_core NEVER ran — UpdateAiming not hooked or not firing");
+            LOGE("║ ⚠ AIM ON but run_aimbot_core NEVER ran — UpdateAiming not ready or not firing");
         if ((s_auto_headshot || s_full_aimbot) && s_diag_aim_notarget > 0 && s_diag_aim_snapped == 0)
             LOGE("║ ⚠ AIM ON but NEVER snapped — always no target (enemy list empty or all null)");
         if ((s_auto_headshot || s_full_aimbot) && !s_orig_set_aim_rot)
             LOGE("║ ⚠ AIM ON but SetAimRotation ptr NULL — cannot snap aim");
         if ((s_auto_headshot || s_full_aimbot) && !s_orig_update_aiming)
-            LOGE("║ ⚠ AIM ON but UpdateAiming NOT hooked — aimbot core never triggers");
+            LOGE("║ ⚠ AIM ON but UpdateAiming NOT ready — aimbot core never triggers");
         if (s_local_player == nullptr && s_diag_update_calls > 10)
             LOGE("║ ⚠ Player.Update fires but LocalPlayer STILL null — IsLocalPlayer always=0");
         if (g_ano_kill_blocked > 0 || g_ano_exit_blocked > 0 || g_ano_abort_blocked > 0)
@@ -1349,7 +1347,7 @@ void FeatureEngine::applyNoSpread(bool enable) {
         if (enable && !s_orig_scatter_rate) {
             HookEngine::get().hookMethod(m_mth.getScatterRate,
                 reinterpret_cast<void *>(hook_get_scatter_rate), &s_orig_scatter_rate, "NoSpread-ScatterRate");
-            LOGI("[SCATTER] GetScatterRate hooked: trampoline=%p", s_orig_scatter_rate);
+            LOGI("[SCATTER] GetScatterRate ready: ptr=%p", s_orig_scatter_rate);
         } else if (!enable && !s_anti_recoil && s_orig_scatter_rate) {
             HookEngine::get().unhookMethod(m_mth.getScatterRate);
             s_orig_scatter_rate = nullptr;
@@ -1527,7 +1525,7 @@ static Vec3 hook_get_attackable_center(void *self, void *method) {
         }
 
         // Priority LAST: all specialized head methods failed/null — shift original center up ~0.55m
-        // This works unconditionally since s_orig_attackable_ctr trampoline is always valid when we get here.
+        // This works unconditionally since s_orig_attackable_ctr ptr is always valid when we get here.
         {
             using Fn = Vec3 (*)(void *, void *);
             Vec3 orig = reinterpret_cast<Fn>(s_orig_attackable_ctr)(self, method);
@@ -1737,19 +1735,19 @@ static void hook_update_aiming_ads(void *self, void *method) {
 }
 
 // ── Shared helper: install / remove GetAttackableCenterWS hook ────────────────
-static void installAimCenterHook(MethodInfo *mth) {
+static void installAimCenterBind(MethodInfo *mth) {
     if (!mth || !mth->methodPointer || s_orig_attackable_ctr) return;
     HookEngine::get().hookMethod(mth,
         reinterpret_cast<void *>(hook_get_attackable_center),
         &s_orig_attackable_ctr, "AimCenter");
-    LOGI("[AIM] GetAttackableCenterWS hooked: trampoline=%p", s_orig_attackable_ctr);
+    LOGI("[AIM] GetAttackableCenterWS ready: ptr=%p", s_orig_attackable_ctr);
 }
-static void removeAimCenterHook(MethodInfo *mth) {
+static void removeAimCenterBind(MethodInfo *mth) {
     if (!mth || !mth->methodPointer || !s_orig_attackable_ctr) return;
     if (s_auto_headshot || s_silent_aim || s_full_aimbot || s_esp || s_anti_aim) return; // another feature still needs it
     HookEngine::get().unhookMethod(mth);
     s_orig_attackable_ctr = nullptr;
-    LOGI("[AIM] GetAttackableCenterWS unhooked");
+    LOGI("[AIM] GetAttackableCenterWS cleared");
 }
 
 void FeatureEngine::applyAimAssist(bool enable) {
@@ -1816,24 +1814,24 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer && !s_orig_update) {
             HookEngine::get().hookMethod(m_mth.playerUpdate,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "PlayerUpdate-AHS");
-            LOGI("[HS] Player.Update hooked for local+enemy tracking: trampoline=%p", s_orig_update);
+            LOGI("[HS] Player.Update ready for local+enemy tracking: ptr=%p", s_orig_update);
         }
         // UpdateAiming: per-frame aim-snap to head via run_aimbot_core
         if (m_mth.updateAiming && m_mth.updateAiming->methodPointer && !s_orig_update_aiming) {
             HookEngine::get().hookMethod(m_mth.updateAiming,
                 reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "AHS-UpdateAiming");
-            LOGI("[HS] UpdateAiming hooked for aim-snap: trampoline=%p", s_orig_update_aiming);
+            LOGI("[HS] UpdateAiming ready for aim-snap: ptr=%p", s_orig_update_aiming);
         }
     }
 
     // Hook GetAttackableCenterWS → head position
-    LOGI("[HS-CRASH] about to %s AimCenterHook calcAimTarget=%p ptr=%p",
+    LOGI("[HS-CRASH] about to %s AimCenterBind calcAimTarget=%p ptr=%p",
         enable ? "install" : "remove",
         m_mth.calcAimTarget,
         m_mth.calcAimTarget ? m_mth.calcAimTarget->methodPointer : nullptr);
-    if (enable) installAimCenterHook(m_mth.calcAimTarget);
-    else        removeAimCenterHook(m_mth.calcAimTarget);
-    LOGI("[HS-CRASH] AimCenterHook %s done trampoline=%p", enable ? "install" : "remove", s_orig_attackable_ctr);
+    if (enable) installAimCenterBind(m_mth.calcAimTarget);
+    else        removeAimCenterBind(m_mth.calcAimTarget);
+    LOGI("[HS-CRASH] AimCenterBind %s done ptr=%p", enable ? "install" : "remove", s_orig_attackable_ctr);
 
     // If the singleton is already live (e.g. toggled mid-match), call immediately.
     // Otherwise hook_get_attackable_center will call it lazily on next enemy tick.
@@ -1858,13 +1856,13 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         if (enable && !s_orig_is_player_head) {
             HookEngine::get().hookMethod(m_mth.isPlayerHead,
                 reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
-            LOGI("[HS-GATE] IsPlayerHead hooked: trampoline=%p", s_orig_is_player_head);
+            LOGI("[HS-GATE] IsPlayerHead ready: ptr=%p", s_orig_is_player_head);
         } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_is_player_head) {
             HookEngine::get().unhookMethod(m_mth.isPlayerHead);
             s_orig_is_player_head = nullptr;
         }
     } else {
-        LOGE("[HS-GATE] IsPlayerHead NOT resolved — headshot gate hook unavailable");
+        LOGE("[HS-GATE] IsPlayerHead NOT resolved — headshot gate N/A");
     }
 
     // CheckDamageHitHead / IsInNoHeadShotState — direct damage-gate hooks
@@ -1872,17 +1870,17 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
     // These hooks install only if the method resolves (legacy builds / future updates).
     if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer) {
         if (enable && !s_orig_check_dmg_hithead) {
-            LOGI("[HS-CRASH] BEFORE hookAddr CheckDamageHitHead ptr=%p hook_fn=%p",
+            LOGI("[HS-CRASH] BEFORE bindAddr CheckDamageHitHead ptr=%p bind_fn=%p",
                 m_mth.checkDamageHitHead->methodPointer,
                 reinterpret_cast<void *>(hook_check_dmg_hithead));
             HookEngine::get().hookMethod(m_mth.checkDamageHitHead,
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
-            LOGI("[HS-CRASH] AFTER hookAddr CheckDamageHitHead trampoline=%p", s_orig_check_dmg_hithead);
+            LOGI("[HS-CRASH] AFTER bindAddr CheckDamageHitHead ptr=%p", s_orig_check_dmg_hithead);
         } else if (!enable && !s_silent_aim && !s_full_aimbot && s_orig_check_dmg_hithead) {
             HookEngine::get().unhookMethod(m_mth.checkDamageHitHead);
             s_orig_check_dmg_hithead = nullptr;
         }
-    } else { LOGI("[HS-GATE] CheckDamageHitHead absent in this build (expected) — IsPlayerHead hook covers it"); }
+    } else { LOGI("[HS-GATE] CheckDamageHitHead absent in this build (expected) — IsPlayerHead gate covers it"); }
 
     // TakeDamage(4) diagnostic — install when AutoHeadshot on so we can see if damage
     // pipeline calls CheckDamageHitHead or bypasses it entirely
@@ -1890,7 +1888,7 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         if (enable && !s_orig_take_damage_4_hook) {
             HookEngine::get().hookMethod(m_mth.takeDamage4,
                 reinterpret_cast<void *>(hook_take_damage_4), &s_orig_take_damage_4_hook, "TD4Diag");
-            LOGI("[HS-GATE] TakeDamage(4) diagnostic hooked: trampoline=%p", s_orig_take_damage_4_hook);
+            LOGI("[HS-GATE] TakeDamage(4) diagnostic ready: ptr=%p", s_orig_take_damage_4_hook);
         } else if (!enable && s_orig_take_damage_4_hook) {
             HookEngine::get().unhookMethod(m_mth.takeDamage4);
             s_orig_take_damage_4_hook = nullptr;
@@ -1903,12 +1901,12 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         if (s_orig_update_aiming && m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
             HookEngine::get().unhookMethod(m_mth.updateAiming);
             s_orig_update_aiming = nullptr;
-            LOGI("[HS] UpdateAiming unhooked (auto-headshot off)");
+            LOGI("[HS] UpdateAiming cleared (auto-headshot off)");
         }
         if (s_orig_update && !s_esp && m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
             HookEngine::get().unhookMethod(m_mth.playerUpdate);
             s_orig_update = nullptr;
-            LOGI("[HS] Player.Update unhooked (auto-headshot off)");
+            LOGI("[HS] Player.Update cleared (auto-headshot off)");
         }
     }
 
@@ -1949,16 +1947,16 @@ void FeatureEngine::applySilentAim(bool enable) {
         if (m_mth.isPlayerHead && m_mth.isPlayerHead->methodPointer && !s_orig_is_player_head) {
             HookEngine::get().hookMethod(m_mth.isPlayerHead,
                 reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
-            LOGI("[HS-GATE] IsPlayerHead hooked (SilentAim): trampoline=%p", s_orig_is_player_head);
+            LOGI("[HS-GATE] IsPlayerHead ready (SilentAim): ptr=%p", s_orig_is_player_head);
         }
         // CheckDamageHitHead fallback (does not exist in this build but kept for forward compat)
         if (m_mth.checkDamageHitHead && m_mth.checkDamageHitHead->methodPointer
                 && !s_orig_check_dmg_hithead) {
-            LOGI("[HS-CRASH] BEFORE hookAddr CheckDamageHitHead (SilentAim) ptr=%p",
+            LOGI("[HS-CRASH] BEFORE bindAddr CheckDamageHitHead (SilentAim) ptr=%p",
                 m_mth.checkDamageHitHead->methodPointer);
             HookEngine::get().hookMethod(m_mth.checkDamageHitHead,
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
-            LOGI("[HS-CRASH] AFTER hookAddr CheckDamageHitHead (SilentAim) trampoline=%p", s_orig_check_dmg_hithead);
+            LOGI("[HS-CRASH] AFTER bindAddr CheckDamageHitHead (SilentAim) ptr=%p", s_orig_check_dmg_hithead);
         }
     } else {
         if (!s_auto_headshot && !s_full_aimbot) {
@@ -1973,10 +1971,10 @@ void FeatureEngine::applySilentAim(bool enable) {
         }
     }
 
-    if (enable) installAimCenterHook(m_mth.calcAimTarget);
-    else        removeAimCenterHook(m_mth.calcAimTarget);
+    if (enable) installAimCenterBind(m_mth.calcAimTarget);
+    else        removeAimCenterBind(m_mth.calcAimTarget);
 
-    LOGI("SilentAim: %s  center_hook=%p hithead=%p", enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_check_dmg_hithead);
+    LOGI("SilentAim: %s  center_fn=%p hithead=%p", enable ? "ON" : "OFF", s_orig_attackable_ctr, s_orig_check_dmg_hithead);
 }
 
 void FeatureEngine::applyFullAimbot(bool enable) {
@@ -2022,21 +2020,21 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         }
     }
 
-    if (enable) installAimCenterHook(m_mth.calcAimTarget);
-    else        removeAimCenterHook(m_mth.calcAimTarget);
+    if (enable) installAimCenterBind(m_mth.calcAimTarget);
+    else        removeAimCenterBind(m_mth.calcAimTarget);
 
     // Hook UpdateAiming for per-frame aim snap (hip-fire / normal mode)
     if (m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
         if (enable && !s_orig_update_aiming) {
             HookEngine::get().hookMethod(m_mth.updateAiming,
                 reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "FullAimbot");
-            LOGI("[AIM] UpdateAiming hooked: trampoline=%p", s_orig_update_aiming);
+            LOGI("[AIM] UpdateAiming ready: ptr=%p", s_orig_update_aiming);
         } else if (!enable && s_orig_update_aiming) {
             HookEngine::get().unhookMethod(m_mth.updateAiming);
             s_orig_update_aiming = nullptr;
             s_enemy_count = 0;
             s_local_player = nullptr;
-            LOGI("[AIM] UpdateAiming unhooked, enemy list cleared");
+            LOGI("[AIM] UpdateAiming cleared, enemy list cleared");
         }
     } else {
         LOGE("[AIM] FullAimbot: UpdateAiming ptr null");
@@ -2048,11 +2046,11 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         if (enable && !s_orig_update) {
             HookEngine::get().hookMethod(m_mth.playerUpdate,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "PlayerUpdate-Aimbot");
-            LOGI("[AIM] Player.Update hooked for enemy tracking: trampoline=%p", s_orig_update);
+            LOGI("[AIM] Player.Update ready for enemy tracking: ptr=%p", s_orig_update);
         } else if (!enable && s_orig_update && !s_esp) {
             HookEngine::get().unhookMethod(m_mth.playerUpdate);
             s_orig_update = nullptr;
-            LOGI("[AIM] Player.Update unhooked (aimbot off, esp off)");
+            LOGI("[AIM] Player.Update cleared (aimbot off, esp off)");
         }
     }
 
@@ -2061,7 +2059,7 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         if (enable && !s_orig_update_aiming_ads) {
             HookEngine::get().hookMethod(m_mth.updateAimingADS,
                 reinterpret_cast<void *>(hook_update_aiming_ads), &s_orig_update_aiming_ads, "AimbotADS");
-            LOGI("[AIM] ODKFDOFOHLN hooked: trampoline=%p", s_orig_update_aiming_ads);
+            LOGI("[AIM] ODKFDOFOHLN ready: ptr=%p", s_orig_update_aiming_ads);
         } else if (!enable && s_orig_update_aiming_ads) {
             HookEngine::get().unhookMethod(m_mth.updateAimingADS);
             s_orig_update_aiming_ads = nullptr;
@@ -2075,7 +2073,7 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         if (enable && !s_orig_is_player_head) {
             HookEngine::get().hookMethod(m_mth.isPlayerHead,
                 reinterpret_cast<void *>(hook_is_player_head), &s_orig_is_player_head, "IsPlayerHead");
-            LOGI("[AIM] IsPlayerHead hooked (FullAimbot): trampoline=%p", s_orig_is_player_head);
+            LOGI("[AIM] IsPlayerHead ready (FullAimbot): ptr=%p", s_orig_is_player_head);
         } else if (!enable && !s_auto_headshot && !s_silent_aim && s_orig_is_player_head) {
             HookEngine::get().unhookMethod(m_mth.isPlayerHead);
             s_orig_is_player_head = nullptr;
@@ -2086,7 +2084,7 @@ void FeatureEngine::applyFullAimbot(bool enable) {
         if (enable && !s_orig_check_dmg_hithead) {
             HookEngine::get().hookMethod(m_mth.checkDamageHitHead,
                 reinterpret_cast<void *>(hook_check_dmg_hithead), &s_orig_check_dmg_hithead, "CheckDamageHitHead");
-            LOGI("[AIM] CheckDamageHitHead hooked (FullAimbot): trampoline=%p", s_orig_check_dmg_hithead);
+            LOGI("[AIM] CheckDamageHitHead ready (FullAimbot): ptr=%p", s_orig_check_dmg_hithead);
         } else if (!enable && !s_auto_headshot && !s_silent_aim && s_orig_check_dmg_hithead) {
             HookEngine::get().unhookMethod(m_mth.checkDamageHitHead);
             s_orig_check_dmg_hithead = nullptr;
@@ -2104,10 +2102,10 @@ void FeatureEngine::applyAntiAim(bool enable) {
     // Anti-aim: hook GetAttackableCenterWS on our local player; hook_get_attackable_center
     // returns a 9000m-offset position so enemy aim-assist predictions miss entirely.
     if (m_mth.calcAimTarget) {
-        if (enable) installAimCenterHook(m_mth.calcAimTarget);
-        else        removeAimCenterHook(m_mth.calcAimTarget);
+        if (enable) installAimCenterBind(m_mth.calcAimTarget);
+        else        removeAimCenterBind(m_mth.calcAimTarget);
     }
-    LOGI("AntiAim: %s  center_hook=%p", enable ? "ON" : "OFF", s_orig_attackable_ctr);
+    LOGI("AntiAim: %s  center_fn=%p", enable ? "ON" : "OFF", s_orig_attackable_ctr);
 }
 
 void FeatureEngine::applySpeedHack(bool enable, float multiplier) {
@@ -2143,7 +2141,7 @@ void FeatureEngine::applyHighJump(bool enable) {
                 m_mth.jumpMethod = m;
                 HookEngine::get().hookMethod(m,
                     reinterpret_cast<void *>(hook_jump), &s_orig_jump, "HighJump");
-                LOGI("HighJump: hooked via %s", kJumpNames[i]);
+                LOGI("HighJump: ready via %s", kJumpNames[i]);
                 break;
             }
         }
@@ -2156,7 +2154,7 @@ void FeatureEngine::applyHighJump(bool enable) {
                         m_mth.jumpMethod = m;
                         HookEngine::get().hookMethod(m,
                             reinterpret_cast<void *>(hook_jump), &s_orig_jump, "HighJump");
-                        LOGI("HighJump: hooked via Player::%s", kJumpNames[i]);
+                        LOGI("HighJump: ready via Player::%s", kJumpNames[i]);
                         break;
                     }
                 }
@@ -2188,7 +2186,7 @@ void FeatureEngine::applyVehicleSpeed(bool enable, float multiplier) {
                 m_mth.vehicleAccel = m;
                 HookEngine::get().hookMethod(m,
                     reinterpret_cast<void *>(hook_vehicle), &s_orig_vehicle, "VehicleSpeed");
-                LOGI("VehicleSpeed: hooked via %s", kVehicleNames[i]);
+                LOGI("VehicleSpeed: ready via %s", kVehicleNames[i]);
                 break;
             }
         }
@@ -2354,16 +2352,16 @@ void FeatureEngine::applyESP(bool enable) {
     }
 
     // Layer 3: SetOutlineVisible — Dobby hook (signature fixed: pc=2 → uint8_t visible, int mode).
-    // Hooks every game call so visible=0 is forced to 1; trampoline fills s_orig_set_outline_vis.
+    // Hooks every game call so visible=0 is forced to 1; ptr fills s_orig_set_outline_vis.
     if (m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
         if (enable && !s_orig_set_outline_vis) {
             HookEngine::get().hookMethod(m_mth.setOutlineVisible,
                 reinterpret_cast<void *>(hook_set_outline_vis), &s_orig_set_outline_vis, "ESP-SetOutlineVis");
-            LOGI("[ESP-DIAG] Layer3 SetOutlineVisible HOOKED trampoline=%p", s_orig_set_outline_vis);
+            LOGI("[ESP-DIAG] Layer3 SetOutlineVisible SET ptr=%p", s_orig_set_outline_vis);
         } else if (!enable && s_orig_set_outline_vis) {
             HookEngine::get().unhookMethod(m_mth.setOutlineVisible);
             s_orig_set_outline_vis = nullptr;
-            LOGI("[ESP-DIAG] Layer3 SetOutlineVisible unhooked");
+            LOGI("[ESP-DIAG] Layer3 SetOutlineVisible cleared");
         } else {
             LOGI("[ESP-DIAG] Layer3 ptr=%p (already in target state)", s_orig_set_outline_vis);
         }
@@ -2372,21 +2370,21 @@ void FeatureEngine::applyESP(bool enable) {
     }
 
     // Layer 4: InitOutline — HOOK it so hook_init_outline auto-calls SetOutlineVisible(1) after.
-    // We call InitOutline through its hooked address from hook_get_attackable_center (throttled),
+    // We call InitOutline through its ready address from hook_get_attackable_center (throttled),
     // which triggers: hook_init_outline → original InitOutline → SetOutlineVisible(self, 1).
-    // s_orig_init_outline = trampoline to original (filled by Dobby).
+    // s_orig_init_outline = ptr to original (filled by Dobby).
     if (m_mth.initOutline && m_mth.initOutline->methodPointer) {
         if (enable && !s_orig_init_outline) {
             HookEngine::get().hookMethod(m_mth.initOutline,
                 reinterpret_cast<void *>(hook_init_outline), &s_orig_init_outline, "ESP-InitOutline");
-            s_initoutline_hooked_addr = m_mth.initOutline->methodPointer;
-            LOGI("[ESP-DIAG] Layer4 InitOutline hooked, trampoline=%p hooked_addr=%p",
-                 s_orig_init_outline, s_initoutline_hooked_addr);
+            s_initoutline_ready_addr = m_mth.initOutline->methodPointer;
+            LOGI("[ESP-DIAG] Layer4 InitOutline ready, ptr=%p ready_addr=%p",
+                 s_orig_init_outline, s_initoutline_ready_addr);
         } else if (!enable && s_orig_init_outline) {
             HookEngine::get().unhookMethod(m_mth.initOutline);
             s_orig_init_outline = nullptr;
-            s_initoutline_hooked_addr = nullptr;
-            LOGI("[ESP-DIAG] Layer4 InitOutline unhooked");
+            s_initoutline_ready_addr = nullptr;
+            LOGI("[ESP-DIAG] Layer4 InitOutline cleared");
         }
     } else {
         LOGE("[ESP-DIAG] Layer4 SKIP — InitOutline ptr null");
@@ -2401,12 +2399,12 @@ void FeatureEngine::applyESP(bool enable) {
         if (enable && !s_orig_update) {
             HookEngine::get().hookMethod(m_mth.playerUpdate,
                 reinterpret_cast<void *>(hook_player_update), &s_orig_update, "ESP-UpdateTick");
-            LOGI("[ESP-DIAG] Layer5 Player.Update hooked for proactive outline+renderQ");
+            LOGI("[ESP-DIAG] Layer5 Player.Update ready for proactive outline+renderQ");
         } else if (!enable && s_orig_update) {
             if (!s_tp_has_save && !s_tp_pending) {
                 HookEngine::get().unhookMethod(m_mth.playerUpdate);
                 s_orig_update = nullptr;
-                LOGI("[ESP-DIAG] Layer5 Player.Update unhooked");
+                LOGI("[ESP-DIAG] Layer5 Player.Update cleared");
             }
         }
     } else {
@@ -2455,9 +2453,9 @@ void FeatureEngine::applyESP(bool enable) {
     // Guarantees SetRenderQ + SetOutlineVisible reach enemy instances even when
     // Player.Update only runs for the local player. Shared with headshot/aimbot hooks.
     if (m_mth.calcAimTarget) {
-        if (enable) installAimCenterHook(m_mth.calcAimTarget);
-        else        removeAimCenterHook(m_mth.calcAimTarget);
-        LOGI("[ESP-DIAG] Layer7 aim-center hook: %s trampoline=%p",
+        if (enable) installAimCenterBind(m_mth.calcAimTarget);
+        else        removeAimCenterBind(m_mth.calcAimTarget);
+        LOGI("[ESP-DIAG] Layer7 aim-center bind: %s ptr=%p",
              enable ? "ON" : "OFF", s_orig_attackable_ctr);
     } else {
         LOGE("[ESP-DIAG] Layer7 SKIP — calcAimTarget ptr null");
@@ -2470,11 +2468,11 @@ void FeatureEngine::applyESP(bool enable) {
         if (enable && !s_orig_outline_judge) {
             HookEngine::get().hookMethod(m_mth.outlineJudge,
                 reinterpret_cast<void *>(hook_outline_judge), &s_orig_outline_judge, "ESP-OutlineJudge");
-            LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate HOOKED trampoline=%p", s_orig_outline_judge);
+            LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate SET ptr=%p", s_orig_outline_judge);
         } else if (!enable && s_orig_outline_judge) {
             HookEngine::get().unhookMethod(m_mth.outlineJudge);
             s_orig_outline_judge = nullptr;
-            LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate unhooked");
+            LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate cleared");
         }
     } else {
         LOGE("[ESP-DIAG] Layer8 SKIP — OutlineVisibleJudgeInUpDate not resolved");
@@ -2486,11 +2484,11 @@ void FeatureEngine::applyESP(bool enable) {
         if (enable && !s_orig_avatar_outline) {
             HookEngine::get().hookMethod(m_mth.enableAvatarOutline,
                 reinterpret_cast<void *>(hook_avatar_outline), &s_orig_avatar_outline, "ESP-AvatarOutline");
-            LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline HOOKED trampoline=%p", s_orig_avatar_outline);
+            LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline SET ptr=%p", s_orig_avatar_outline);
         } else if (!enable && s_orig_avatar_outline) {
             HookEngine::get().unhookMethod(m_mth.enableAvatarOutline);
             s_orig_avatar_outline = nullptr;
-            LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline unhooked");
+            LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline cleared");
         }
     } else {
         LOGE("[ESP-DIAG] Layer9 SKIP — AvatarOutline.EnableOutline not resolved");
@@ -2513,12 +2511,12 @@ void FeatureEngine::applyESP(bool enable) {
             HookEngine::get().hookMethod(m_mth.setPlayerVisible,
                 reinterpret_cast<void *>(hook_set_player_visible),
                 &s_orig_set_player_visible, "ESP-SetPlayerVisible");
-            LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible HOOKED trampoline=%p",
+            LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible SET ptr=%p",
                  s_orig_set_player_visible);
         } else if (!enable && s_orig_set_player_visible) {
             HookEngine::get().unhookMethod(m_mth.setPlayerVisible);
             s_orig_set_player_visible = nullptr;
-            LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible unhooked");
+            LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible cleared");
         }
     } else {
         LOGE("[ESP-DIAG] Layer10 SKIP — AvatarTrace.SetPlayerVisible not resolved");
@@ -2531,12 +2529,12 @@ void FeatureEngine::applyESP(bool enable) {
             HookEngine::get().hookMethod(m_mth.enableRendererOutline,
                 reinterpret_cast<void *>(hook_enable_renderer_outline),
                 &s_orig_enable_renderer_outline, "ESP-EnableRendererOutline");
-            LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline HOOKED trampoline=%p",
+            LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline SET ptr=%p",
                  s_orig_enable_renderer_outline);
         } else if (!enable && s_orig_enable_renderer_outline) {
             HookEngine::get().unhookMethod(m_mth.enableRendererOutline);
             s_orig_enable_renderer_outline = nullptr;
-            LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline unhooked");
+            LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline cleared");
         }
     } else {
         LOGE("[ESP-DIAG] Layer11 SKIP — AvatarTrace.EnableRendererOutline not resolved");
