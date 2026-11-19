@@ -1142,6 +1142,8 @@ static int hook_statfs(const char *path, struct statfs *buf) {
 // Forward declarations for hooks defined later but referenced in kMap
 static int hook_sigaction(int sig, const struct sigaction *act, struct sigaction *oldact);
 static int hook_clock_gettime(clockid_t clk, struct timespec *tp);
+typedef void (*sighandler_fwd_t)(int);
+static sighandler_fwd_t hook_signal(int sig, sighandler_fwd_t handler);
 
 // Protection 26: dlsym — AnoSDK resolves symbol addresses via dlsym() and
 // compares them against its own GOT entries to detect GOT hooking.  Return our
@@ -1187,6 +1189,7 @@ static void *hook_dlsym(void *handle, const char *name) {
             {"execl",            (void*)hook_execl},
             {"execv",            (void*)hook_execv},
             {"sigaction",        (void*)hook_sigaction},
+            {"signal",           (void*)hook_signal},
             {"statfs",           (void*)hook_statfs},
             {"pread",            (void*)hook_pread},
             {"dlopen",           (void*)hook_dlopen},
@@ -1373,6 +1376,13 @@ static int hook_sigaction(int sig, const struct sigaction *act,
         }
     }
     return r;
+}
+
+// Protection 35: signal() — old-style signal API can also override SIGSYS handler.
+// We hook sigaction() but AnoSDK also imports signal(). Block SIGSYS override here too.
+static sighandler_fwd_t hook_signal(int sig, sighandler_fwd_t handler) {
+    if (sig == SIGSYS) return SIG_DFL;
+    return ::signal(sig, handler);
 }
 
 // Protection 34: clock_gettime — AnoSDK measures execution time across hooked
@@ -1708,6 +1718,8 @@ static const PatchEntry kAnogsEntries[] = {
     { "sigaction",        reinterpret_cast<void *>(hook_sigaction)         },
     // Protection 34: clock_gettime — timing anomaly defense
     { "clock_gettime",    reinterpret_cast<void *>(hook_clock_gettime)     },
+    // Protection 35: signal() — block SIGSYS override via old API
+    { "signal",           reinterpret_cast<void *>(hook_signal)            },
 };
 
 static const PatchEntry kAnortEntries[] = {
@@ -1774,9 +1786,11 @@ static const PatchEntry kAnortEntries[] = {
     { "sigaction",        reinterpret_cast<void *>(hook_sigaction)         },
     // Protection 34: clock_gettime — timing anomaly defense
     { "clock_gettime",    reinterpret_cast<void *>(hook_clock_gettime)     },
+    // Protection 35: signal() — block SIGSYS override via old API
+    { "signal",           reinterpret_cast<void *>(hook_signal)            },
 };
 
-// ── Protection 35: seccomp SVC filter ─────────────────────────────────────────
+// ── Protection 36: seccomp SVC filter ─────────────────────────────────────────
 // libanogs.so contains 51 inline SVC #0 instructions that bypass ALL GOT hooks.
 // These raw syscalls read /proc/self/maps, /proc/self/status, and send ioctl
 // reports without touching any libc function we can intercept via GOT patching.
