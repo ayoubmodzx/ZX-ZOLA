@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
+#include <elf.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/prctl.h>
@@ -70,62 +71,59 @@ bool MemoryGuard::init() {
 }
 
 bool MemoryGuard::hideSelf() {
-    bool found = false;
-
     Dl_info dli;
-    if (dladdr((void *)&MemoryGuard::hideSelf, &dli) && dli.dli_fname) {
-        LOGI("dladdr says we are: %s (base=%p)", dli.dli_fname, dli.dli_fbase);
-        found = findSelfRange(dli.dli_fname, &g_self_range.base, &g_self_range.size);
-        if (!found) {
-            const char *bn = strrchr(dli.dli_fname, '/');
-            if (bn) found = findSelfRange(bn + 1, &g_self_range.base, &g_self_range.size);
-        }
-    }
-
-    if (!found) found = findSelfRange("payload.so", &g_self_range.base, &g_self_range.size);
-    if (!found) found = findSelfRange("zx_zola", &g_self_range.base, &g_self_range.size);
-    if (!found) found = findSelfRange("arm64-v8a.so", &g_self_range.base, &g_self_range.size);
-
-    if (!found) {
-        LOGE("Could not locate module in /proc/self/maps");
+    if (!dladdr((void *)&MemoryGuard::hideSelf, &dli) || !dli.dli_fbase) {
+        LOGE("dladdr failed — cannot locate module base");
         return false;
     }
 
-    uintptr_t base = g_self_range.base;
-    size_t    sz   = g_self_range.size;
+    uintptr_t base = (uintptr_t)dli.dli_fbase;
+    LOGI("dladdr: base=0x%lx fname=%s", base, dli.dli_fname ? dli.dli_fname : "(null)");
 
-    // 1. Zero the ELF header (first 0x1000 bytes) via /proc/self/mem.
-    //    AnoSDK's string scanner looks for the .so pathname stored in the ELF
-    //    comment/build-id sections.  Zeroing the magic + program-headers
-    //    removes both the "ELF" signature and the embedded path string.
-    //    We write through /proc/self/mem instead of mprotect+memset so we
-    //    never touch page protections of live code pages.
+    // Calculate loaded size from ELF program headers.
+    // hideModuleMaps() already converted file-backed regions to anonymous,
+    // but content (including ELF headers) is still intact in memory.
+    size_t total_size = 0;
+    auto *ehdr = reinterpret_cast<Elf64_Ehdr *>(base);
+    if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) == 0 && ehdr->e_phoff != 0) {
+        auto *phdr = reinterpret_cast<Elf64_Phdr *>(base + ehdr->e_phoff);
+        for (int i = 0; i < ehdr->e_phnum; i++) {
+            if (phdr[i].p_type == PT_LOAD) {
+                size_t seg_end = phdr[i].p_vaddr + phdr[i].p_memsz;
+                if (seg_end > total_size) total_size = seg_end;
+            }
+        }
+        total_size = (total_size + 4095) & ~(size_t)4095;
+    }
+    if (total_size == 0) total_size = 0x100000;
+
+    g_self_range.base = base;
+    g_self_range.size = total_size;
+
+    // Zero the ELF header (first 0x1000 bytes) via /proc/self/mem.
+    // Removes ELF magic, program headers, and embedded path strings.
+    // hideModuleMaps already anonymized the VMA, but the ELF signature
+    // is still in memory — AnoSDK's memory scanner looks for it.
     int fd = open("/proc/self/mem", O_RDWR);
     if (fd >= 0) {
         uint8_t zeros[0x1000] = {};
         ssize_t written = pwrite(fd, zeros, sizeof(zeros), (off_t)base);
         close(fd);
-        if (written > 0) {
+        if (written > 0)
             LOGI("ELF header zeroed at 0x%lx (%zd bytes)", base, (size_t)written);
-        } else {
+        else
             LOGE("pwrite on /proc/self/mem failed");
-        }
     } else {
         LOGE("open(/proc/self/mem) failed");
     }
 
-    // 2. Rename the VMA to an empty anonymous name (kernel 5.17+ / Android 12+).
-    //    This removes "libzx_zola.so" from /proc/self/maps entirely, so
-    //    AnoSDK's maps-scanner sees it as a plain anonymous region.
-    //    Best-effort — silently ignored on older kernels.
+    // VMA rename — defense-in-depth (hideModuleMaps already did this for
+    // regions it found, but covers any segments it may have missed)
     prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME,
-          reinterpret_cast<void *>(base), sz, nullptr);
-
-    // dl_iterate_phdr is intercepted via GOT patching in anosdk_bypass.cpp
-    // (patched in libanogs.so GOT — no Dobby on libc, undetectable by AnoSDK).
+          reinterpret_cast<void *>(base), total_size, nullptr);
 
     LOGI("Self hidden: base=0x%lx size=0x%zx — ELF zeroed / VMA renamed",
-         base, sz);
+         base, total_size);
     return true;
 }
 

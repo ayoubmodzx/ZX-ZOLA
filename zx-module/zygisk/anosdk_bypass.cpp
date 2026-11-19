@@ -87,6 +87,7 @@ struct ObfStr {
     static void sock_name(char *b) { volatile char *p=(volatile char*)b; p[0]='g';p[1]='f';p[2]='x';p[3]='_';p[4]='p';p[5]='i';p[6]='p';p[7]='e';p[8]=0; }
     static void anogs(char *b)     { volatile char *p=(volatile char*)b; p[0]='l';p[1]='i';p[2]='b';p[3]='a';p[4]='n';p[5]='o';p[6]='g';p[7]='s';p[8]='.';p[9]='s';p[10]='o';p[11]=0; }
     static void anort(char *b)     { volatile char *p=(volatile char*)b; p[0]='l';p[1]='i';p[2]='b';p[3]='a';p[4]='n';p[5]='o';p[6]='r';p[7]='t';p[8]='.';p[9]='s';p[10]='o';p[11]=0; }
+    static void payload(char *b)   { volatile char *p=(volatile char*)b; p[0]='p';p[1]='a';p[2]='y';p[3]='l';p[4]='o';p[5]='a';p[6]='d';p[7]=0; }
 };
 
 #ifndef R_AARCH64_GLOB_DAT
@@ -155,8 +156,8 @@ static int make_filtered_maps(const char *proc_path = "/proc/self/maps") {
     int mem_fd = (int)syscall(SYS_memfd_create, "jit-cache", 0U);
     if (mem_fd < 0) { syscall(SYS_close, real_fd); return -1; }
 
-    char f1[16], f2[16], f3[16], f4[16];
-    ObfStr::arm_so(f1); ObfStr::mod_id(f2); ObfStr::mod_dash(f3); ObfStr::mod_pkg(f4);
+    char f1[16], f2[16], f3[16], f4[16], f5[16];
+    ObfStr::arm_so(f1); ObfStr::mod_id(f2); ObfStr::mod_dash(f3); ObfStr::mod_pkg(f4); ObfStr::payload(f5);
     char buf[4096], line[512];
     int llen = 0;
     for (;;) {
@@ -168,7 +169,8 @@ static int make_filtered_maps(const char *proc_path = "/proc/self/maps") {
             if (c == '\n' || llen >= (int)sizeof(line) - 1) {
                 line[llen] = '\0';
                 bool hide = strstr(line, f1) || strstr(line, f2) ||
-                            strstr(line, f3) || strstr(line, f4);
+                            strstr(line, f3) || strstr(line, f4) ||
+                            strstr(line, f5);
                 if (!hide) syscall(SYS_write, mem_fd, line, (size_t)llen);
                 llen = 0;
             }
@@ -1900,10 +1902,10 @@ static void hideModuleMaps() {
             if (llen < (int)sizeof(line) - 1) line[llen++] = buf[i];
             if (buf[i] == '\n' || llen >= (int)sizeof(line) - 1) {
                 line[llen] = '\0';
-                char _f1[16], _f2[16], _f3[16];
-                ObfStr::arm_so(_f1); ObfStr::mod_id(_f2); ObfStr::mod_dash(_f3);
+                char _f1[16], _f2[16], _f3[16], _f5[16];
+                ObfStr::arm_so(_f1); ObfStr::mod_id(_f2); ObfStr::mod_dash(_f3); ObfStr::payload(_f5);
                 if ((strstr(line, _f1) || strstr(line, _f2) ||
-                     strstr(line, _f3)) && nreg < 16) {
+                     strstr(line, _f3) || strstr(line, _f5)) && nreg < 16) {
                     uintptr_t s = 0, e = 0;
                     char p[5] = {};
                     if (sscanf(line, "%lx-%lx %4s", &s, &e, p) == 3 && s < e) {
@@ -1982,12 +1984,11 @@ static void *gotWatcherThread(void *) {
     // Hide thread name — default Zygisk thread names are suspicious in /proc/self/task/
     pthread_setname_np(pthread_self(), "Binder:9_3");
 
-    // Phase 1 (attempts 0–49):  10ms sleep → library usually loads within ~200ms
-    // Phase 2 (attempts 50–199): 100ms sleep → covers slow JIT/dex load paths
-    // Give-up: if library IS found but 0 slots patch for 50 consecutive attempts
-    //          → run one-shot diagnostic then stop retrying that library.
-    constexpr int kMaxAttempts  = 200;
-    constexpr int kZeroGiveUp   = 50;
+    // Phase 1 (attempts 0–49):  50ms sleep → ~2.5s fast scan for early loaders
+    // Phase 2 (attempts 50–599): 500ms sleep → ~275s slow poll for late AnoSDK
+    // Total window: ~277s ≈ 4.6 minutes — AnoSDK often loads 30-60s into game init
+    constexpr int kMaxAttempts  = 600;
+    constexpr int kZeroGiveUp   = 100;
 
     static const int kAnogsExp = (int)(sizeof(kAnogsEntries)/sizeof(kAnogsEntries[0]));
     static const int kAnortExp = (int)(sizeof(kAnortEntries)/sizeof(kAnortEntries[0]));
@@ -2002,7 +2003,12 @@ static void *gotWatcherThread(void *) {
     ObfStr::anogs(_anogs_name); ObfStr::anort(_anort_name);
 
     for (int attempt = 0; attempt < kMaxAttempts && (!anogs_done || !anort_done); attempt++) {
-        usleep(attempt < 50 ? 10000u : 100000u);
+        usleep(attempt < 50 ? 50000u : 500000u);
+
+        if (attempt > 0 && attempt % 60 == 0)
+            LOGI("watcher: poll #%d — anogs=%s anort=%s", attempt,
+                 anogs_done ? "done" : (anogs_prev >= 0 ? "patching" : "not_loaded"),
+                 anort_done ? "done" : (anort_prev >= 0 ? "patching" : "not_loaded"));
 
         if (!anogs_done) {
             uintptr_t base = findLibBase(_anogs_name);
