@@ -15,7 +15,23 @@ static constexpr const char *kFfPkgs[] = {
     nullptr
 };
 
-static constexpr const char *kPayloadPath = "/data/adb/modules/zx_zola_v2/payload.so";
+// Runtime path builder — keeps module path out of .rodata so AnoSDK memory
+// scanners can't pattern-match it in anonymous pages after hideModuleMaps.
+static void buildPayloadPath(char *buf) {
+    volatile char *p = (volatile char *)buf;
+    p[0]='/';p[1]='d';p[2]='a';p[3]='t';p[4]='a';p[5]='/';p[6]='a';p[7]='d';
+    p[8]='b';p[9]='/';p[10]='m';p[11]='o';p[12]='d';p[13]='u';p[14]='l';
+    p[15]='e';p[16]='s';p[17]='/';p[18]='z';p[19]='x';p[20]='_';p[21]='z';
+    p[22]='o';p[23]='l';p[24]='a';p[25]='_';p[26]='v';p[27]='2';p[28]='/';
+    p[29]='p';p[30]='a';p[31]='y';p[32]='l';p[33]='o';p[34]='a';p[35]='d';
+    p[36]='.';p[37]='s';p[38]='o';p[39]='\0';
+}
+
+static void buildInitSym(char *buf) {
+    volatile char *p = (volatile char *)buf;
+    p[0]='p';p[1]='a';p[2]='y';p[3]='l';p[4]='o';p[5]='a';p[6]='d';
+    p[7]='_';p[8]='i';p[9]='n';p[10]='i';p[11]='t';p[12]='\0';
+}
 
 typedef void (*payload_init_fn)(JNIEnv *env);
 
@@ -40,25 +56,31 @@ public:
         m_env->ReleaseStringUTFChars(args->nice_name, name);
 
         if (m_is_ff) {
-            LOGI("Free Fire — dlopen payload (zygote privileges)");
-            void *handle = dlopen(kPayloadPath, RTLD_NOW);
+            LOGI("target matched — loading runtime component");
+            char path[64];
+            buildPayloadPath(path);
+            void *handle = dlopen(path, RTLD_NOW);
+            memset(path, 0, sizeof(path));
             if (!handle) {
                 LOGE("dlopen failed: %s", dlerror());
                 return;
             }
-            m_payload_init = (payload_init_fn)dlsym(handle, "payload_init");
+            char sym[16];
+            buildInitSym(sym);
+            m_payload_init = (payload_init_fn)dlsym(handle, sym);
+            memset(sym, 0, sizeof(sym));
             if (!m_payload_init) {
-                LOGE("dlsym payload_init failed: %s", dlerror());
+                LOGE("dlsym init failed: %s", dlerror());
                 dlclose(handle);
                 return;
             }
-            LOGI("payload loaded, init ready");
+            LOGI("runtime component ready");
         }
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *args) override {
         if (!m_is_ff || !m_payload_init) return;
-        LOGI("postAppSpecialize — calling payload_init");
+        LOGI("postAppSpecialize — initializing");
         m_payload_init(m_env);
     }
 

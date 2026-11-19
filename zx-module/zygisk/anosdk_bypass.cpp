@@ -47,6 +47,18 @@
 #ifndef __NR_seccomp
 #define __NR_seccomp 277
 #endif
+#ifndef __NR_newfstatat
+#define __NR_newfstatat 79
+#endif
+#ifndef __NR_faccessat
+#define __NR_faccessat 48
+#endif
+#ifndef __NR_faccessat2
+#define __NR_faccessat2 439
+#endif
+#ifndef __NR_statx
+#define __NR_statx 291
+#endif
 #ifndef SECCOMP_SET_MODE_FILTER
 #define SECCOMP_SET_MODE_FILTER 1
 #endif
@@ -1808,6 +1820,46 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx) {
             result = safe_syscall(__NR_readlinkat, a0, a1, a2, a3);
             break;
         }
+        case __NR_newfstatat: {
+            // fstatat(dirfd, pathname, statbuf, flags)
+            if (a1) {
+                const char *path = (const char *)a1;
+                if (is_root_path(path)) {
+                    ++g_ano_svc_trapped;
+                    result = -ENOENT;
+                    break;
+                }
+            }
+            result = safe_syscall(nr, a0, a1, a2, a3);
+            break;
+        }
+        case __NR_faccessat:
+        case __NR_faccessat2: {
+            // faccessat(dirfd, pathname, mode, flags)
+            if (a1) {
+                const char *path = (const char *)a1;
+                if (is_root_path(path)) {
+                    ++g_ano_svc_trapped;
+                    result = -ENOENT;
+                    break;
+                }
+            }
+            result = safe_syscall(nr, a0, a1, a2, a3);
+            break;
+        }
+        case __NR_statx: {
+            // statx(dirfd, pathname, flags, mask, statxbuf)
+            if (a1) {
+                const char *path = (const char *)a1;
+                if (is_root_path(path)) {
+                    ++g_ano_svc_trapped;
+                    result = -ENOENT;
+                    break;
+                }
+            }
+            result = safe_syscall(nr, a0, a1, a2, a3, a4);
+            break;
+        }
         default:
             result = safe_syscall(nr, a0, a1, a2, a3, a4, a5);
             break;
@@ -1837,25 +1889,29 @@ static bool installSvcFilter() {
     uint32_t tr_lo  = (uint32_t)(s_trampoline_start & 0xFFFFFFFFULL);
     uint32_t tr_end = (uint32_t)(s_trampoline_end   & 0xFFFFFFFFULL);
 
-    // BPF: trap ALL openat/readlinkat EXCEPT when IP is in our trampoline page.
-    // No AnoSDK IP-range check — catches raw SVC from anywhere (anonymous mmap,
-    // JIT, copied code stubs).
+    // BPF: trap filesystem-probing syscalls EXCEPT when IP is in our trampoline.
+    // Covers raw SVC from anywhere (anonymous mmap, JIT, copied code stubs).
+    // Trapped: openat, readlinkat, newfstatat, faccessat, faccessat2, statx
     struct sock_filter filt[] = {
-        /* 0 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 4),
-        /* 1 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 11),
-        /* 2 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
-        /* 3 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     2, 0),
-        /* 4 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat, 1, 0),
-        /* 5 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* 0  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 4),
+        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 15),
+        /* 2  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
+        /* 3  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,      6, 0),
+        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat,  5, 0),
+        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat,  4, 0),
+        /* 6  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat,   3, 0),
+        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx,       2, 0),
+        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2,  1, 0),
+        /* 9  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         // ── Whitelist our trampoline page ──
-        /* 6 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
-        /* 7 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, tr_hi, 0, 4),
-        /* 8 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
-        /* 9 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_lo, 0, 2),
-        /*10 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_end, 1, 0),
-        /*11 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        /*12 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-        /*13 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /*10 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
+        /*11 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, tr_hi, 0, 4),
+        /*12 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
+        /*13 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_lo, 0, 2),
+        /*14 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_end, 1, 0),
+        /*15 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /*16 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        /*17 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
 
     struct sock_fprog prog = {
