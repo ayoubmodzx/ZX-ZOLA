@@ -100,22 +100,14 @@ bool MemoryGuard::hideSelf() {
     g_self_range.base = base;
     g_self_range.size = total_size;
 
-    // Zero the ELF header (first 0x1000 bytes) via /proc/self/mem.
-    // Removes ELF magic, program headers, and embedded path strings.
-    // hideModuleMaps already anonymized the VMA, but the ELF signature
-    // is still in memory — AnoSDK's memory scanner looks for it.
-    int fd = open("/proc/self/mem", O_RDWR);
-    if (fd >= 0) {
-        uint8_t zeros[0x1000] = {};
-        ssize_t written = pwrite(fd, zeros, sizeof(zeros), (off_t)base);
-        close(fd);
-        if (written > 0)
-            LOGI("ELF header zeroed at 0x%lx (%zd bytes)", base, (size_t)written);
-        else
-            LOGE("pwrite on /proc/self/mem failed");
-    } else {
-        LOGE("open(/proc/self/mem) failed");
-    }
+    // ELF header zeroing is now handled by hideModuleMaps() which runs
+    // before seccomp is installed (open /proc/self/mem works there).
+    // Verify it was zeroed — if not, the first bytes won't be 0x7f ELF.
+    auto *hdr = reinterpret_cast<volatile unsigned char *>(base);
+    if (hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F')
+        LOGE("ELF header NOT zeroed — hideModuleMaps may have missed us");
+    else
+        LOGI("ELF header confirmed zeroed at 0x%lx", base);
 
     // VMA rename — defense-in-depth (hideModuleMaps already did this for
     // regions it found, but covers any segments it may have missed)

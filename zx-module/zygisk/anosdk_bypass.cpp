@@ -1975,6 +1975,24 @@ static void hideModuleMaps() {
               regions[i].start, sz, vma_name);
     }
 
+    // Zero ELF headers in the first region of each module mapping.
+    // Runs BEFORE seccomp, so open(/proc/self/mem) succeeds.
+    // After this, AnoSDK's memory scanner can't find ELF magic in anonymous pages.
+    int mem_fd = open("/proc/self/mem", O_RDWR);
+    if (mem_fd >= 0) {
+        uint8_t zeros[0x1000] = {};
+        for (int i = 0; i < nreg; i++) {
+            auto *hdr = reinterpret_cast<unsigned char *>(regions[i].start);
+            if (hdr[0] == 0x7f && hdr[1] == 'E' && hdr[2] == 'L' && hdr[3] == 'F') {
+                size_t chunk = (regions[i].end - regions[i].start);
+                if (chunk > sizeof(zeros)) chunk = sizeof(zeros);
+                pwrite(mem_fd, zeros, chunk, (off_t)regions[i].start);
+                LOGI("[HIDE] ELF header zeroed at 0x%lx", regions[i].start);
+            }
+        }
+        close(mem_fd);
+    }
+
     LOGI("[HIDE] %d/%d module regions converted to anonymous", hidden, nreg);
 }
 
