@@ -1,4 +1,5 @@
 #include "feature_engine.hpp"
+#include "xstr.h"
 #include "hook_engine.hpp"
 #include <cstring>
 #include <cmath>
@@ -1330,7 +1331,7 @@ void FeatureEngine::applyAntiRecoil(bool enable) {
     if (!m_mth.recoilFormula || !m_mth.recoilFormula->methodPointer) return;
     if (enable && !s_orig_recoil) {
         HookEngine::get().hookMethod(m_mth.recoilFormula,
-            reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "AntiRecoil");
+            reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, X("AntiRecoil"));
     } else if (!enable && !s_no_spread && s_orig_recoil) {
         HookEngine::get().unhookMethod(m_mth.recoilFormula);
         s_orig_recoil = nullptr;
@@ -1346,7 +1347,7 @@ void FeatureEngine::applyNoSpread(bool enable) {
     if (m_mth.getScatterRate && m_mth.getScatterRate->methodPointer) {
         if (enable && !s_orig_scatter_rate) {
             HookEngine::get().hookMethod(m_mth.getScatterRate,
-                reinterpret_cast<void *>(hook_get_scatter_rate), &s_orig_scatter_rate, "NoSpread-ScatterRate");
+                reinterpret_cast<void *>(hook_get_scatter_rate), &s_orig_scatter_rate, X("NoSpread-ScatterRate"));
             LOGI("[SCATTER] GetScatterRate ready: ptr=%p", s_orig_scatter_rate);
         } else if (!enable && !s_anti_recoil && s_orig_scatter_rate) {
             HookEngine::get().unhookMethod(m_mth.getScatterRate);
@@ -1360,7 +1361,7 @@ void FeatureEngine::applyNoSpread(bool enable) {
     if (m_mth.setScatterMax && m_mth.setScatterMax->methodPointer) {
         if (enable && !s_orig_set_scatter_max) {
             HookEngine::get().hookMethod(m_mth.setScatterMax,
-                reinterpret_cast<void *>(hook_set_scatter_max), &s_orig_set_scatter_max, "NoSpread-Max");
+                reinterpret_cast<void *>(hook_set_scatter_max), &s_orig_set_scatter_max, X("NoSpread-Max"));
         } else if (!enable && !s_anti_recoil && s_orig_set_scatter_max) {
             HookEngine::get().unhookMethod(m_mth.setScatterMax);
             s_orig_set_scatter_max = nullptr;
@@ -1369,7 +1370,7 @@ void FeatureEngine::applyNoSpread(bool enable) {
     if (m_mth.setScatterNum && m_mth.setScatterNum->methodPointer) {
         if (enable && !s_orig_set_scatter_num) {
             HookEngine::get().hookMethod(m_mth.setScatterNum,
-                reinterpret_cast<void *>(hook_set_scatter_num), &s_orig_set_scatter_num, "NoSpread-Num");
+                reinterpret_cast<void *>(hook_set_scatter_num), &s_orig_set_scatter_num, X("NoSpread-Num"));
         } else if (!enable && !s_anti_recoil && s_orig_set_scatter_num) {
             HookEngine::get().unhookMethod(m_mth.setScatterNum);
             s_orig_set_scatter_num = nullptr;
@@ -1380,7 +1381,7 @@ void FeatureEngine::applyNoSpread(bool enable) {
     if (m_mth.recoilFormula && m_mth.recoilFormula->methodPointer) {
         if (enable && !s_orig_recoil) {
             HookEngine::get().hookMethod(m_mth.recoilFormula,
-                reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "NoSpread-Legacy");
+                reinterpret_cast<void *>(hook_recoil), &s_orig_recoil, "");
         } else if (!enable && !s_anti_recoil && s_orig_recoil) {
             HookEngine::get().unhookMethod(m_mth.recoilFormula);
             s_orig_recoil = nullptr;
@@ -1397,7 +1398,7 @@ void FeatureEngine::applyRapidFire(bool enable) {
     if (!m_mth.rateOfFire || !m_mth.rateOfFire->methodPointer) return;
     if (enable && !s_orig_rof) {
         HookEngine::get().hookMethod(m_mth.rateOfFire,
-            reinterpret_cast<void *>(hook_rof), &s_orig_rof, "RapidFire");
+            reinterpret_cast<void *>(hook_rof), &s_orig_rof, X("RapidFire"));
     } else if (!enable && s_orig_rof) {
         HookEngine::get().unhookMethod(m_mth.rateOfFire);
         s_orig_rof = nullptr;
@@ -1739,7 +1740,7 @@ static void installAimCenterBind(MethodInfo *mth) {
     if (!mth || !mth->methodPointer || s_orig_attackable_ctr) return;
     HookEngine::get().hookMethod(mth,
         reinterpret_cast<void *>(hook_get_attackable_center),
-        &s_orig_attackable_ctr, "AimCenter");
+        &s_orig_attackable_ctr, X("AimCenter"));
     LOGI("[AIM] GetAttackableCenterWS ready: ptr=%p", s_orig_attackable_ctr);
 }
 static void removeAimCenterBind(MethodInfo *mth) {
@@ -1813,13 +1814,13 @@ void FeatureEngine::applyAutoHeadshot(bool enable) {
         // Player.Update: populate s_local_player + enemy list for run_aimbot_core
         if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer && !s_orig_update) {
             HookEngine::get().hookMethod(m_mth.playerUpdate,
-                reinterpret_cast<void *>(hook_player_update), &s_orig_update, "PlayerUpdate-AHS");
+                reinterpret_cast<void *>(hook_player_update), &s_orig_update, X("PlayerUpdate-AHS"));
             LOGI("[HS] Player.Update ready for local+enemy tracking: ptr=%p", s_orig_update);
         }
         // UpdateAiming: per-frame aim-snap to head via run_aimbot_core
         if (m_mth.updateAiming && m_mth.updateAiming->methodPointer && !s_orig_update_aiming) {
             HookEngine::get().hookMethod(m_mth.updateAiming,
-                reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "AHS-UpdateAiming");
+                reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, X("AHS-UpdateAiming"));
             LOGI("[HS] UpdateAiming ready for aim-snap: ptr=%p", s_orig_update_aiming);
         }
     }
@@ -2027,7 +2028,7 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     if (m_mth.updateAiming && m_mth.updateAiming->methodPointer) {
         if (enable && !s_orig_update_aiming) {
             HookEngine::get().hookMethod(m_mth.updateAiming,
-                reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, "FullAimbot");
+                reinterpret_cast<void *>(hook_update_aiming), &s_orig_update_aiming, X("FullAimbot"));
             LOGI("[AIM] UpdateAiming ready: ptr=%p", s_orig_update_aiming);
         } else if (!enable && s_orig_update_aiming) {
             HookEngine::get().unhookMethod(m_mth.updateAiming);
@@ -2045,7 +2046,7 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer) {
         if (enable && !s_orig_update) {
             HookEngine::get().hookMethod(m_mth.playerUpdate,
-                reinterpret_cast<void *>(hook_player_update), &s_orig_update, "PlayerUpdate-Aimbot");
+                reinterpret_cast<void *>(hook_player_update), &s_orig_update, X("PlayerUpdate-Aimbot"));
             LOGI("[AIM] Player.Update ready for enemy tracking: ptr=%p", s_orig_update);
         } else if (!enable && s_orig_update && !s_esp) {
             HookEngine::get().unhookMethod(m_mth.playerUpdate);
@@ -2058,7 +2059,7 @@ void FeatureEngine::applyFullAimbot(bool enable) {
     if (m_mth.updateAimingADS && m_mth.updateAimingADS->methodPointer) {
         if (enable && !s_orig_update_aiming_ads) {
             HookEngine::get().hookMethod(m_mth.updateAimingADS,
-                reinterpret_cast<void *>(hook_update_aiming_ads), &s_orig_update_aiming_ads, "AimbotADS");
+                reinterpret_cast<void *>(hook_update_aiming_ads), &s_orig_update_aiming_ads, X("AimbotADS"));
             LOGI("[AIM] ODKFDOFOHLN ready: ptr=%p", s_orig_update_aiming_ads);
         } else if (!enable && s_orig_update_aiming_ads) {
             HookEngine::get().unhookMethod(m_mth.updateAimingADS);
@@ -2114,7 +2115,7 @@ void FeatureEngine::applySpeedHack(bool enable, float multiplier) {
     if (!m_mth.setSpeedScale || !m_mth.setSpeedScale->methodPointer) return;
     if (enable && !s_orig_speed) {
         HookEngine::get().hookMethod(m_mth.setSpeedScale,
-            reinterpret_cast<void *>(hook_speed), &s_orig_speed, "SpeedHack");
+            reinterpret_cast<void *>(hook_speed), &s_orig_speed, X("SpeedHack"));
     } else if (!enable && s_orig_speed) {
         HookEngine::get().unhookMethod(m_mth.setSpeedScale);
         s_orig_speed = nullptr;
@@ -2140,7 +2141,7 @@ void FeatureEngine::applyHighJump(bool enable) {
             if (m && m->methodPointer) {
                 m_mth.jumpMethod = m;
                 HookEngine::get().hookMethod(m,
-                    reinterpret_cast<void *>(hook_jump), &s_orig_jump, "HighJump");
+                    reinterpret_cast<void *>(hook_jump), &s_orig_jump, X("HighJump"));
                 LOGI("HighJump: ready via %s", kJumpNames[i]);
                 break;
             }
@@ -2153,7 +2154,7 @@ void FeatureEngine::applyHighJump(bool enable) {
                     if (m && m->methodPointer) {
                         m_mth.jumpMethod = m;
                         HookEngine::get().hookMethod(m,
-                            reinterpret_cast<void *>(hook_jump), &s_orig_jump, "HighJump");
+                            reinterpret_cast<void *>(hook_jump), &s_orig_jump, X("HighJump"));
                         LOGI("HighJump: ready via Player::%s", kJumpNames[i]);
                         break;
                     }
@@ -2185,7 +2186,7 @@ void FeatureEngine::applyVehicleSpeed(bool enable, float multiplier) {
             if (m && m->methodPointer) {
                 m_mth.vehicleAccel = m;
                 HookEngine::get().hookMethod(m,
-                    reinterpret_cast<void *>(hook_vehicle), &s_orig_vehicle, "VehicleSpeed");
+                    reinterpret_cast<void *>(hook_vehicle), &s_orig_vehicle, X("VehicleSpeed"));
                 LOGI("VehicleSpeed: ready via %s", kVehicleNames[i]);
                 break;
             }
@@ -2220,7 +2221,7 @@ void FeatureEngine::applyNoGrass(bool enable) {
     if (!m_mth.getGrassInst || !m_mth.getGrassInst->methodPointer) return;
     if (enable && !s_orig_grass) {
         HookEngine::get().hookMethod(m_mth.getGrassInst,
-            reinterpret_cast<void *>(hook_grass), &s_orig_grass, "NoGrass");
+            reinterpret_cast<void *>(hook_grass), &s_orig_grass, "");
     } else if (!enable && s_orig_grass) {
         HookEngine::get().unhookMethod(m_mth.getGrassInst);
         s_orig_grass = nullptr;
@@ -2255,7 +2256,7 @@ void FeatureEngine::applyAntiDamage(bool enable) {
     if (m_mth.takeDamage && m_mth.takeDamage->methodPointer) {
         if (enable && !s_orig_dmg)
             HookEngine::get().hookMethod(m_mth.takeDamage,
-                reinterpret_cast<void *>(hook_dmg), &s_orig_dmg, "AntiDamage");
+                reinterpret_cast<void *>(hook_dmg), &s_orig_dmg, X("AntiDamage"));
         else if (!enable && s_orig_dmg) {
             HookEngine::get().unhookMethod(m_mth.takeDamage);
             s_orig_dmg = nullptr;
@@ -2342,7 +2343,7 @@ void FeatureEngine::applyESP(bool enable) {
     if (m_mth.hudSetVisible && m_mth.hudSetVisible->methodPointer) {
         if (enable && !s_orig_hud_show)
             HookEngine::get().hookMethod(m_mth.hudSetVisible,
-                reinterpret_cast<void *>(hook_hud_set_visible), &s_orig_hud_show, "ESP-hud");
+                reinterpret_cast<void *>(hook_hud_set_visible), &s_orig_hud_show, "");
         else if (!enable && s_orig_hud_show) {
             HookEngine::get().unhookMethod(m_mth.hudSetVisible);
             s_orig_hud_show = nullptr;
@@ -2356,7 +2357,7 @@ void FeatureEngine::applyESP(bool enable) {
     if (m_mth.setOutlineVisible && m_mth.setOutlineVisible->methodPointer) {
         if (enable && !s_orig_set_outline_vis) {
             HookEngine::get().hookMethod(m_mth.setOutlineVisible,
-                reinterpret_cast<void *>(hook_set_outline_vis), &s_orig_set_outline_vis, "ESP-SetOutlineVis");
+                reinterpret_cast<void *>(hook_set_outline_vis), &s_orig_set_outline_vis, X("ESP-SetOutlineVis"));
             LOGI("[ESP-DIAG] Layer3 SetOutlineVisible SET ptr=%p", s_orig_set_outline_vis);
         } else if (!enable && s_orig_set_outline_vis) {
             HookEngine::get().unhookMethod(m_mth.setOutlineVisible);
@@ -2376,7 +2377,7 @@ void FeatureEngine::applyESP(bool enable) {
     if (m_mth.initOutline && m_mth.initOutline->methodPointer) {
         if (enable && !s_orig_init_outline) {
             HookEngine::get().hookMethod(m_mth.initOutline,
-                reinterpret_cast<void *>(hook_init_outline), &s_orig_init_outline, "ESP-InitOutline");
+                reinterpret_cast<void *>(hook_init_outline), &s_orig_init_outline, "");
             s_initoutline_ready_addr = m_mth.initOutline->methodPointer;
             LOGI("[ESP-DIAG] Layer4 InitOutline ready, ptr=%p ready_addr=%p",
                  s_orig_init_outline, s_initoutline_ready_addr);
@@ -2398,7 +2399,7 @@ void FeatureEngine::applyESP(bool enable) {
     if (m_mth.playerUpdate && m_mth.playerUpdate->methodPointer && hasOutlinePath) {
         if (enable && !s_orig_update) {
             HookEngine::get().hookMethod(m_mth.playerUpdate,
-                reinterpret_cast<void *>(hook_player_update), &s_orig_update, "ESP-UpdateTick");
+                reinterpret_cast<void *>(hook_player_update), &s_orig_update, X("ESP-UpdateTick"));
             LOGI("[ESP-DIAG] Layer5 Player.Update ready for proactive outline+renderQ");
         } else if (!enable && s_orig_update) {
             if (!s_tp_has_save && !s_tp_pending) {
@@ -2467,7 +2468,7 @@ void FeatureEngine::applyESP(bool enable) {
     if (m_mth.outlineJudge && m_mth.outlineJudge->methodPointer) {
         if (enable && !s_orig_outline_judge) {
             HookEngine::get().hookMethod(m_mth.outlineJudge,
-                reinterpret_cast<void *>(hook_outline_judge), &s_orig_outline_judge, "ESP-OutlineJudge");
+                reinterpret_cast<void *>(hook_outline_judge), &s_orig_outline_judge, X("ESP-OutlineJudge"));
             LOGI("[ESP-DIAG] Layer8 OutlineVisibleJudgeInUpDate SET ptr=%p", s_orig_outline_judge);
         } else if (!enable && s_orig_outline_judge) {
             HookEngine::get().unhookMethod(m_mth.outlineJudge);
@@ -2483,7 +2484,7 @@ void FeatureEngine::applyESP(bool enable) {
     if (m_mth.enableAvatarOutline && m_mth.enableAvatarOutline->methodPointer) {
         if (enable && !s_orig_avatar_outline) {
             HookEngine::get().hookMethod(m_mth.enableAvatarOutline,
-                reinterpret_cast<void *>(hook_avatar_outline), &s_orig_avatar_outline, "ESP-AvatarOutline");
+                reinterpret_cast<void *>(hook_avatar_outline), &s_orig_avatar_outline, X("ESP-AvatarOutline"));
             LOGI("[ESP-DIAG] Layer9 AvatarOutline.EnableOutline SET ptr=%p", s_orig_avatar_outline);
         } else if (!enable && s_orig_avatar_outline) {
             HookEngine::get().unhookMethod(m_mth.enableAvatarOutline);
@@ -2510,7 +2511,7 @@ void FeatureEngine::applyESP(bool enable) {
         if (enable && !s_orig_set_player_visible) {
             HookEngine::get().hookMethod(m_mth.setPlayerVisible,
                 reinterpret_cast<void *>(hook_set_player_visible),
-                &s_orig_set_player_visible, "ESP-SetPlayerVisible");
+                &s_orig_set_player_visible, X("ESP-SetPlayerVisible"));
             LOGI("[ESP-DIAG] Layer10 AvatarTrace.SetPlayerVisible SET ptr=%p",
                  s_orig_set_player_visible);
         } else if (!enable && s_orig_set_player_visible) {
@@ -2528,7 +2529,7 @@ void FeatureEngine::applyESP(bool enable) {
         if (enable && !s_orig_enable_renderer_outline) {
             HookEngine::get().hookMethod(m_mth.enableRendererOutline,
                 reinterpret_cast<void *>(hook_enable_renderer_outline),
-                &s_orig_enable_renderer_outline, "ESP-EnableRendererOutline");
+                &s_orig_enable_renderer_outline, X("ESP-EnableRendererOutline"));
             LOGI("[ESP-DIAG] Layer11 AvatarTrace.EnableRendererOutline SET ptr=%p",
                  s_orig_enable_renderer_outline);
         } else if (!enable && s_orig_enable_renderer_outline) {
