@@ -1,4 +1,4 @@
-// AnoSDK bypass v2.52 — GOT + trampoline seccomp, 35 protections + mountinfo/status/diag fixes
+// AnoSDK bypass v3.1 — GOT + trampoline seccomp, 41 protections + deep library analysis fixes
 //
 // All intercepts planted in libanogs.so and libanort.so own GOT tables.
 // libc.so is NEVER modified: AnoSDK code integrity scanner reads libc function
@@ -1144,6 +1144,13 @@ static int hook_sigaction(int sig, const struct sigaction *act, struct sigaction
 static int hook_clock_gettime(clockid_t clk, struct timespec *tp);
 typedef void (*sighandler_fwd_t)(int);
 static sighandler_fwd_t hook_signal(int sig, sighandler_fwd_t handler);
+static void *hook_memmem(const void *h, size_t hl, const void *n, size_t nl);
+static pid_t hook_getppid();
+static uid_t hook_getuid();
+static int hook_uname(struct utsname *buf);
+static char *hook_getcwd(char *buf, size_t size);
+static void hook_system_property_read(const prop_info *pi,
+    void (*cb)(void*, const char*, const char*, uint32_t), void *cookie);
 
 // Protection 26: dlsym — AnoSDK resolves symbol addresses via dlsym() and
 // compares them against its own GOT entries to detect GOT hooking.  Return our
@@ -1194,6 +1201,12 @@ static void *hook_dlsym(void *handle, const char *name) {
             {"pread",            (void*)hook_pread},
             {"dlopen",           (void*)hook_dlopen},
             {"clock_gettime",    (void*)hook_clock_gettime},
+            {"memmem",           (void*)hook_memmem},
+            {"getppid",          (void*)hook_getppid},
+            {"getuid",           (void*)hook_getuid},
+            {"uname",            (void*)hook_uname},
+            {"getcwd",           (void*)hook_getcwd},
+            {"__system_property_read_callback", (void*)hook_system_property_read},
         };
         for (const auto &e : kMap) {
             if (strcmp(name, e.s) == 0) return e.h;
@@ -1406,6 +1419,142 @@ static int hook_clock_gettime(clockid_t clk, struct timespec *tp) {
         }
     }
     return r;
+}
+
+// Protection 36: memmem — AnoSDK uses memmem() for memory pattern scanning.
+// It searches process memory for known byte sequences: hook trampolines,
+// BPF filter structures, Zygisk signatures, Dobby code patterns, etc.
+// Defense: if the needle matches our trampoline SVC instruction bytes or
+// known scanning patterns, return NULL.  For general searches, skip results
+// that land inside our trampoline page or hidden anonymous module regions.
+#include <sys/utsname.h>
+uint32_t g_ano_memmem_filtered = 0;
+static void *hook_memmem(const void *haystack, size_t haystacklen,
+                         const void *needle, size_t needlelen) {
+    if (!haystack || !needle || needlelen == 0 || haystacklen == 0)
+        return ::memmem(haystack, haystacklen, needle, needlelen);
+
+    // Block scanning for SVC #0 instruction pattern (D4000001) which AnoSDK uses
+    // to find raw syscall sites that might be our trampoline
+    if (needlelen >= 4) {
+        const uint8_t *nb = (const uint8_t *)needle;
+        // SVC #0 = 0xD4000001 in little-endian
+        if (nb[0] == 0x01 && nb[1] == 0x00 && nb[2] == 0x00 && nb[3] == 0xD4) {
+            ++g_ano_memmem_filtered;
+            return nullptr;
+        }
+    }
+
+    void *result = ::memmem(haystack, haystacklen, needle, needlelen);
+
+    // If the result lands in our trampoline page, return NULL
+    if (result && s_trampoline_start) {
+        uintptr_t addr = (uintptr_t)result;
+        if (addr >= s_trampoline_start && addr < s_trampoline_end) {
+            ++g_ano_memmem_filtered;
+            return nullptr;
+        }
+    }
+    return result;
+}
+
+// Protection 37: getppid — AnoSDK checks parent PID to detect abnormal process
+// hierarchy (injection, ptrace attachment changes parent).  Cache the real
+// zygote parent PID at init and always return it.
+static pid_t s_cached_ppid = 0;
+uint32_t g_ano_ppid_spoofed = 0;
+static pid_t hook_getppid() {
+    if (s_cached_ppid > 0) return s_cached_ppid;
+    return ::getppid();
+}
+
+// Protection 38: getuid — AnoSDK reports is_root=%d.  If the process UID is 0
+// (root), that's a dead giveaway.  Normal apps never run as root, so just
+// pass through — but if somehow uid==0, return the app's expected UID.
+static uid_t s_cached_uid = 0;
+uint32_t g_ano_uid_spoofed = 0;
+static uid_t hook_getuid() {
+    uid_t real = ::getuid();
+    if (real == 0 && s_cached_uid > 0) {
+        ++g_ano_uid_spoofed;
+        return s_cached_uid;
+    }
+    return real;
+}
+
+// Protection 39: uname — AnoSDK reads kernel version string to detect custom
+// kernels that indicate root.  Sanitize root-revealing strings from utsname.
+uint32_t g_ano_uname_spoofed = 0;
+static int hook_uname(struct utsname *buf) {
+    int r = ::uname(buf);
+    if (r == 0 && buf) {
+        // Clean version/release of root indicators
+        auto clean = [](char *s, size_t maxlen) {
+            struct K {
+                static void s0(char *b) { volatile char *v=(volatile char*)b; v[0]='d';v[1]='i';v[2]='r';v[3]='t';v[4]='y';v[5]=0; }
+                static void s1(char *b) { volatile char *v=(volatile char*)b; v[0]='S';v[1]='a';v[2]='m';v[3]='F';v[4]='w';v[5]=0; }
+                static void s2(char *b) { volatile char *v=(volatile char*)b; v[0]='p';v[1]='e';v[2]='r';v[3]='f';v[4]='+';v[5]=0; }
+                static void s3(char *b) { volatile char *v=(volatile char*)b; v[0]='k';v[1]='e';v[2]='r';v[3]='n';v[4]='e';v[5]='l';v[6]='s';v[7]='u';v[8]=0; }
+            };
+            char t[16]; char *f;
+            K::s0(t); if ((f = strstr(s, t))) { *f = '\0'; ++g_ano_uname_spoofed; }
+            K::s1(t); if ((f = strstr(s, t))) { *f = '\0'; ++g_ano_uname_spoofed; }
+            K::s2(t); if ((f = strstr(s, t))) { *f = '\0'; ++g_ano_uname_spoofed; }
+            K::s3(t); if ((f = strstr(s, t))) { *f = '\0'; ++g_ano_uname_spoofed; }
+        };
+        clean(buf->version, sizeof(buf->version));
+        clean(buf->release, sizeof(buf->release));
+    }
+    return r;
+}
+
+// Protection 40: getcwd — defensive hook, return /data/data/<pkg> if cwd reveals
+// root-related paths.
+uint32_t g_ano_getcwd_spoofed = 0;
+static char *hook_getcwd(char *buf, size_t size) {
+    char *r = ::getcwd(buf, size);
+    if (r && is_root_path(r)) {
+        ++g_ano_getcwd_spoofed;
+        const char *safe = "/data/data";
+        size_t len = __builtin_strlen(safe);
+        if (len < size) { __builtin_memcpy(buf, safe, len + 1); return buf; }
+    }
+    return r;
+}
+
+// Protection 41: __system_property_read — alternate property API that reads from
+// a prop_info handle.  AnoSDK imports __system_property_find_nth + _read to
+// enumerate ALL system properties looking for root indicators.
+uint32_t g_ano_prop_read_spoofed = 0;
+static void hook_system_property_read(const prop_info *pi,
+                                      void (*callback)(void *cookie, const char *name, const char *value, uint32_t serial),
+                                      void *cookie) {
+    // Wrap the callback to filter root-indicating properties
+    struct Ctx {
+        void (*orig_cb)(void*, const char*, const char*, uint32_t);
+        void *orig_cookie;
+    };
+    Ctx ctx = { callback, cookie };
+    auto filter_cb = [](void *raw, const char *name, const char *value, uint32_t serial) {
+        auto *c = (Ctx*)raw;
+        char filtered_value[PROP_VALUE_MAX];
+        if (name && value) {
+            __builtin_memcpy(filtered_value, value, __builtin_strlen(value) + 1);
+            if (strcmp(name, "ro.debuggable") == 0 && filtered_value[0] == '1') {
+                filtered_value[0] = '0'; filtered_value[1] = '\0'; ++g_ano_prop_read_spoofed;
+            } else if (strcmp(name, "ro.secure") == 0 && filtered_value[0] == '0') {
+                filtered_value[0] = '1'; filtered_value[1] = '\0'; ++g_ano_prop_read_spoofed;
+            } else if (strcmp(name, "ro.build.selinux") == 0 && filtered_value[0] == '0') {
+                filtered_value[0] = '1'; filtered_value[1] = '\0'; ++g_ano_prop_read_spoofed;
+            } else if (strcmp(name, "ro.build.tags") == 0 && strstr(filtered_value, "test-keys")) {
+                __builtin_memcpy(filtered_value, "release-keys", 13); ++g_ano_prop_read_spoofed;
+            }
+            c->orig_cb(c->orig_cookie, name, filtered_value, serial);
+        } else {
+            c->orig_cb(c->orig_cookie, name, value, serial);
+        }
+    };
+    __system_property_read_callback(pi, filter_cb, &ctx);
 }
 
 // Protection 27: dlopen — AnoSDK may try to dlopen libraries by name to scan
@@ -1720,6 +1869,18 @@ static const PatchEntry kAnogsEntries[] = {
     { "clock_gettime",    reinterpret_cast<void *>(hook_clock_gettime)     },
     // Protection 35: signal() — block SIGSYS override via old API
     { "signal",           reinterpret_cast<void *>(hook_signal)            },
+    // Protection 36: memmem — block memory pattern scanning
+    { "memmem",           reinterpret_cast<void *>(hook_memmem)            },
+    // Protection 37: getppid — spoof parent PID
+    { "getppid",          reinterpret_cast<void *>(hook_getppid)           },
+    // Protection 38: getuid — defensive UID check
+    { "getuid",           reinterpret_cast<void *>(hook_getuid)            },
+    // Protection 39: uname — clean kernel version strings
+    { "uname",            reinterpret_cast<void *>(hook_uname)             },
+    // Protection 40: getcwd — hide root working directories
+    { "getcwd",           reinterpret_cast<void *>(hook_getcwd)            },
+    // Protection 41: __system_property_read_callback — alternate prop API
+    { "__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read) },
 };
 
 static const PatchEntry kAnortEntries[] = {
@@ -1788,9 +1949,15 @@ static const PatchEntry kAnortEntries[] = {
     { "clock_gettime",    reinterpret_cast<void *>(hook_clock_gettime)     },
     // Protection 35: signal() — block SIGSYS override via old API
     { "signal",           reinterpret_cast<void *>(hook_signal)            },
+    // Protection 38: getuid — defensive UID check
+    { "getuid",           reinterpret_cast<void *>(hook_getuid)            },
+    // Protection 40: getcwd — hide root working directories
+    { "getcwd",           reinterpret_cast<void *>(hook_getcwd)            },
+    // Protection 41: __system_property_read_callback — alternate prop API
+    { "__system_property_read_callback", reinterpret_cast<void *>(hook_system_property_read) },
 };
 
-// ── Protection 36: seccomp SVC filter ─────────────────────────────────────────
+// ── Protection 42: seccomp SVC filter ─────────────────────────────────────────
 // libanogs.so contains 51 inline SVC #0 instructions that bypass ALL GOT hooks.
 // These raw syscalls read /proc/self/maps, /proc/self/status, and send ioctl
 // reports without touching any libc function we can intercept via GOT patching.
@@ -2194,6 +2361,10 @@ static void *gotWatcherThread(void *) {
 static void noop_sighandler(int) {}
 
 void AnoBypass::installEarly() {
+    // 0. Cache process identity BEFORE anything changes
+    s_cached_ppid = ::getppid();
+    s_cached_uid  = ::getuid();
+
     // 1. Trampoline — must exist before seccomp filter
     if (!setupTrampoline())
         LOGE("init: trampoline mmap failed");
