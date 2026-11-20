@@ -827,6 +827,25 @@ static long hook_tp_syscall(long nr, long a0, long a1, long a2, long a3, long a4
             if (num >= 0x10) { ++g_ano_ioctl_zeroed; __builtin_memset((void *)a2, 0, psz); }
         }
     }
+    if (nr == __NR_kill) {
+        pid_t target = (pid_t)a0; int sig = (int)a1;
+        if ((target == getpid() || target == 0) &&
+            (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM)) {
+            ++g_ano_kill_blocked; return 0;
+        }
+    }
+    if (nr == __NR_tgkill) {
+        if ((pid_t)a0 == getpid() &&
+            ((int)a2 == SIGABRT || (int)a2 == SIGKILL || (int)a2 == SIGTERM)) {
+            ++g_ano_kill_blocked; return 0;
+        }
+    }
+    if (nr == __NR_tkill) {
+        int sig = (int)a1;
+        if (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM) {
+            ++g_ano_kill_blocked; return 0;
+        }
+    }
     return syscall(nr, a0, a1, a2, a3, a4, a5);
 }
 
@@ -870,6 +889,25 @@ static long hook_syscall_got(long nr, long a0, long a1, long a2, long a3, long a
                        a0, req, num, psz, num < 0x10 ? "(HEARTBEAT)" : "(ZEROED)");
             dump_hex((const uint8_t *)a2, psz);
             if (num >= 0x10) { ++g_ano_ioctl_zeroed; __builtin_memset((void *)a2, 0, psz); }
+        }
+    }
+    if (nr == __NR_kill) {
+        pid_t target = (pid_t)a0; int sig = (int)a1;
+        if ((target == getpid() || target == 0) &&
+            (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM)) {
+            ++g_ano_kill_blocked; return 0;
+        }
+    }
+    if (nr == __NR_tgkill) {
+        if ((pid_t)a0 == getpid() &&
+            ((int)a2 == SIGABRT || (int)a2 == SIGKILL || (int)a2 == SIGTERM)) {
+            ++g_ano_kill_blocked; return 0;
+        }
+    }
+    if (nr == __NR_tkill) {
+        int sig = (int)a1;
+        if (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM) {
+            ++g_ano_kill_blocked; return 0;
         }
     }
     return syscall(nr, a0, a1, a2, a3, a4, a5);
@@ -2062,6 +2100,47 @@ static void sigsys_handler(int sig, siginfo_t *info, void *uctx) {
             result = safe_syscall(nr, a0, a1, a2, a3, a4);
             break;
         }
+        case __NR_kill: {
+            pid_t target = (pid_t)a0; int sig = (int)a1;
+            if ((target == getpid() || target == 0) &&
+                (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM)) {
+                ++g_ano_kill_blocked; ++g_ano_svc_trapped;
+                result = 0; break;
+            }
+            result = safe_syscall(__NR_kill, a0, a1);
+            break;
+        }
+        case __NR_tgkill: {
+            if ((pid_t)a0 == getpid() &&
+                ((int)a2 == SIGABRT || (int)a2 == SIGKILL || (int)a2 == SIGTERM)) {
+                ++g_ano_kill_blocked; ++g_ano_svc_trapped;
+                result = 0; break;
+            }
+            result = safe_syscall(__NR_tgkill, a0, a1, a2);
+            break;
+        }
+        case __NR_tkill: {
+            int sig = (int)a1;
+            if (sig == SIGABRT || sig == SIGKILL || sig == SIGTERM) {
+                ++g_ano_kill_blocked; ++g_ano_svc_trapped;
+                result = 0; break;
+            }
+            result = safe_syscall(__NR_tkill, a0, a1);
+            break;
+        }
+        case __NR_ioctl: {
+            unsigned long req = (unsigned long)a1;
+            unsigned long type = (req >> 8) & 0xFF;
+            unsigned long num = req & 0xFF;
+            bool is_system = type == 0x54 || type == 0x66 || type == 0x53 || type == 0x89 || type == 0x00;
+            if (!is_system && a2 != 0) {
+                size_t psz = (req >> 16) & 0x3FFF;
+                if (psz == 0) psz = 64; if (psz > 512) psz = 512;
+                if (num >= 0x10) { ++g_ano_ioctl_zeroed; ++g_ano_svc_trapped; __builtin_memset((void *)a2, 0, psz); }
+            }
+            result = safe_syscall(__NR_ioctl, a0, a1, a2);
+            break;
+        }
         default:
             result = safe_syscall(nr, a0, a1, a2, a3, a4, a5);
             break;
@@ -2091,29 +2170,34 @@ static bool installSvcFilter() {
     uint32_t tr_lo  = (uint32_t)(s_svc_page_start & 0xFFFFFFFFULL);
     uint32_t tr_end = (uint32_t)(s_svc_page_end   & 0xFFFFFFFFULL);
 
-    // BPF: trap filesystem-probing syscalls EXCEPT when IP is in our svc_page.
+    // BPF: trap detection syscalls EXCEPT when IP is in our svc_page.
     // Covers raw SVC from anywhere (anonymous mmap, JIT, copied code stubs).
-    // Trapped: openat, readlinkat, newfstatat, faccessat, faccessat2, statx
+    // Trapped: openat, readlinkat, newfstatat, faccessat, faccessat2, statx,
+    //          kill, tgkill, tkill, ioctl
     struct sock_filter filt[] = {
         /* 0  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 4),
-        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 15),
+        /* 1  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_AARCH64, 0, 19),
         /* 2  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 0),
-        /* 3  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,      6, 0),
-        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat,  5, 0),
-        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat,  4, 0),
-        /* 6  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat,   3, 0),
-        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx,       2, 0),
-        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2,  1, 0),
-        /* 9  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /* 3  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_openat,     10, 0),
+        /* 4  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_readlinkat,  9, 0),
+        /* 5  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_newfstatat,  8, 0),
+        /* 6  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat,   7, 0),
+        /* 7  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_statx,       6, 0),
+        /* 8  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_faccessat2,  5, 0),
+        /* 9  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_kill,        4, 0),
+        /*10  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_tgkill,      3, 0),
+        /*11  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_tkill,       2, 0),
+        /*12  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl,       1, 0),
+        /*13  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
         // ── Whitelist our svc_page page ──
-        /*10 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
-        /*11 */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, tr_hi, 0, 4),
-        /*12 */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
-        /*13 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_lo, 0, 2),
-        /*14 */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_end, 1, 0),
-        /*15 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-        /*16 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-        /*17 */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /*14  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 12),
+        /*15  */ BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, tr_hi, 0, 4),
+        /*16  */ BPF_STMT(BPF_LD | BPF_W | BPF_ABS, 8),
+        /*17  */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_lo, 0, 2),
+        /*18  */ BPF_JUMP(BPF_JMP | BPF_JGE | BPF_K, tr_end, 1, 0),
+        /*19  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+        /*20  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
+        /*21  */ BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
     };
 
     struct sock_fprog prog = {
