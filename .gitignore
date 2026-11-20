@@ -23,5 +23,6 @@ cmake-build-*/
 *.zip
 zx-module/zygisk/arm64-v8a/
 zx-module/build/
+zx-module/build-dbg/
 zx-app/app/.cxx/
 zx-app/app/src/main/jniLibs/
